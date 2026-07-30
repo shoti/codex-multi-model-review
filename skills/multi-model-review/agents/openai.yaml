@@ -1,0 +1,4 @@
+interface:
+  display_name: "Multi-Model Review"
+  short_description: "Capped reviews with mandatory confirmation"
+  default_prompt: "Use $multi-model-review to run capped task-scoped reviews, triage every finding and test gap, complete the repair and mandatory confirmation phases, and produce a commit-aware final gate."

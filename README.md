@@ -1,0 +1,361 @@
+# Codex Multi-Model Review
+
+[![CI](https://github.com/shoti/codex-multi-model-review/actions/workflows/ci.yml/badge.svg)](https://github.com/shoti/codex-multi-model-review/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Auditable, bounded multi-model code reviews for Codex.
+
+Codex remains the implementer and final verifier. External coding CLIs inspect
+an immutable repository snapshot in fresh, read-only sessions. Their findings
+become evidence-backed decisions, not automatic edits, and the final gate
+becomes invalid when the reviewed source changes.
+
+Claude Code is enabled by default. Antigravity and Kimi Code are optional and
+disabled until explicitly enabled.
+
+> This is an independent community project. It is not affiliated with or
+> endorsed by OpenAI, Anthropic, Google, Moonshot AI, or their affiliates.
+
+## Why
+
+Asking several models to “review this diff” does not create a reliable gate by
+itself. Reports can inspect moving code, repeat already-rejected findings,
+silently miss part of the task, consume unbounded credits, or become stale
+after the next edit.
+
+Codex Multi-Model Review turns that conversation into a durable workflow:
+
+- each reviewer starts fresh and does not see another reviewer's findings;
+- reviewers inspect the same private, immutable repository snapshot;
+- Codex verifies every finding against repository evidence;
+- repair rounds are bounded and followed by mandatory confirmation;
+- scope, paths, risks, profile, and task intent stay pinned across rounds;
+- provider failures, usage, decisions, and test gaps are persisted;
+- a final PASS is valid only while its source fingerprint remains fresh.
+
+```mermaid
+flowchart TD
+    A[Codex implementation<br/>and local verification]
+    B[Task contract<br/>scope · paths · risks · intent]
+    C[Private immutable snapshot<br/>secret scan · fingerprint]
+    D1[Claude Code CLI<br/>fresh read-only session]
+    D2[Antigravity CLI<br/>optional fresh read-only session]
+    D3[Kimi Code CLI<br/>optional experimental session]
+    E[Parsed findings<br/>and test gaps]
+    F[Codex evidence-backed triage]
+    G[Repair and focused tests]
+    H[Mandatory confirmation round]
+    I[Freshness-checked final gate<br/>PASS_CLEAN · PASS_WITH_FINDINGS · BLOCK]
+
+    A --> B
+    B --> C
+    C --> D1
+    C -. optional .-> D2
+    C -. optional .-> D3
+    D1 --> E
+    D2 --> E
+    D3 --> E
+    E --> F
+    F -->|accepted issue| G
+    G --> B
+    F -->|no source changes planned| H
+    H --> I
+```
+
+## Requirements
+
+- macOS or Linux. Native Windows is not currently supported.
+- Python 3.12 or newer.
+- Git.
+- A current Codex CLI with `codex plugin` support.
+- At least one installed and authenticated reviewer CLI.
+
+The runner has no third-party Python dependencies.
+
+| Reviewer | Default | Executable | Notes |
+|---|---:|---|---|
+| Claude Code | Enabled | `claude` | `sonnet`, medium effort, and a $1.25 maximum per review by default |
+| Antigravity | Disabled | `agy` | Requires authenticated model access and the bundled hard read-only agent |
+| Kimi Code | Disabled | `kimi` | Experimental adapter; default model is `k3-256k` |
+
+Provider CLIs are separate products with their own installation,
+authentication, terms, data handling, quotas, and billing.
+
+## Installation
+
+Add this GitHub repository as a Codex marketplace, then install the plugin:
+
+```bash
+codex plugin marketplace add shoti/codex-multi-model-review --ref main
+codex plugin add multi-model-review@codex-multi-model-review
+```
+
+Start a new Codex thread after installation so its skill and slash command are
+loaded.
+
+To update later:
+
+```bash
+codex plugin marketplace upgrade codex-multi-model-review
+codex plugin add multi-model-review@codex-multi-model-review
+```
+
+For local development:
+
+```bash
+git clone git@github.com:shoti/codex-multi-model-review.git
+cd codex-multi-model-review
+codex plugin marketplace add "$PWD"
+codex plugin add multi-model-review@codex-multi-model-review
+```
+
+The repository-root marketplace layout is exercised locally before release.
+See the official [Codex plugin packaging
+guide](https://developers.openai.com/plugins/build/plugins) for marketplace
+concepts and alternative layouts.
+
+## Quick start
+
+In a new Codex thread:
+
+> Use $multi-model-review to review my uncommitted changes. Limit the task to
+> `src/feature` and `tests/feature`, use the security profile, and keep optional
+> reviewers disabled.
+
+Or invoke the bundled command:
+
+```text
+/multi-model-review:multi-review uncommitted without-antigravity without-kimi
+```
+
+Codex will create the workflow, run the repair and triage loop, perform the
+mandatory confirmation, and return a freshness-checked final gate.
+
+Run static diagnostics before the first provider review:
+
+```bash
+python3 <plugin-root>/skills/multi-model-review/scripts/mm_review.py doctor
+```
+
+`mm-review` is an optional local PATH shortcut. The bundled Python command
+always works.
+
+## Workflow
+
+The normal Codex-driven flow is:
+
+1. Finish the implementation and focused local checks.
+2. Start one workflow for the user task.
+3. Run a repair review against explicit scope, paths, risks, and intent.
+4. Verify and disposition every finding and test gap.
+5. Fix accepted items and rerun focused tests.
+6. Repeat only when necessary, up to three repair rounds.
+7. Run one mandatory confirmation with no further source changes planned.
+8. Finalize and verify the freshness-checked gate.
+9. If authorized later, attest the unchanged reviewed snapshot to its commit.
+
+For the complete operational contract, see
+[SKILL.md](skills/multi-model-review/SKILL.md).
+
+### Scopes
+
+| Scope | Meaning |
+|---|---|
+| `--uncommitted` | Staged, unstaged, and untracked changes |
+| `--base <branch>` | Feature branch relative to a base, plus working-tree changes |
+| `--commit <sha>` | One checked-out commit |
+
+`--path` limits the changed paths, patch, fingerprint, and task contract. For
+review context, the immutable snapshot still contains the entire tracked Git
+tree at the selected revision. Read [Privacy and data handling](#privacy-and-data-handling)
+before reviewing a sensitive repository.
+
+### Risk labels and profiles
+
+Risk labels are repeatable:
+
+`auth`, `backfill`, `db-write`, `email-send`, `email-deliverability`,
+`external-api`, `migration`, `security`, and `trading`.
+
+Profiles are:
+
+`normal`, `security`, `data-change`, `external-api`, `trading`, and
+`email-deliverability`.
+
+These are generic review presets. They do not indicate that this repository
+contains applications or data in those domains.
+
+## Advanced manual example
+
+Codex normally operates these commands through the skill. For debugging or
+automation, the runner can be driven directly:
+
+```bash
+RUNNER="<plugin-root>/skills/multi-model-review/scripts/mm_review.py"
+
+python3 "$RUNNER" doctor
+python3 "$RUNNER" workflow start --name "harden session validation"
+
+python3 "$RUNNER" run \
+  --repo /path/to/repository \
+  --uncommitted \
+  --workflow-id <workflow-id> \
+  --phase repair \
+  --path src/session \
+  --path tests/session \
+  --risk auth \
+  --risk security \
+  --review-profile security \
+  --task "Reject expired sessions without changing valid-session behavior"
+```
+
+The run output identifies its artifact directory. Record each disposition:
+
+```bash
+python3 "$RUNNER" decide \
+  --run <run-directory> \
+  --finding claude-001 \
+  --decision rejected \
+  --evidence "The reported path is unreachable after validation." \
+  --verification "Focused session test passes."
+```
+
+When repair triage is complete, run the same contract with
+`--phase confirmation`, then:
+
+```bash
+python3 "$RUNNER" finalize \
+  --run <confirmation-run-directory> \
+  --codex-review "Final diff review found no remaining defect." \
+  --verification "Focused tests: passed"
+
+python3 "$RUNNER" verify --run <confirmation-run-directory>
+python3 "$RUNNER" workflow finalize <workflow-id>
+```
+
+## Command reference
+
+| Command | Purpose |
+|---|---|
+| `status` | Show reviewer configuration and readiness |
+| `doctor [--live]` | Check packaging, permissions, CLI contracts, and optional live access |
+| `enable` / `disable` | Persist reviewer availability |
+| `set-model` | Set a reviewer model |
+| `set-effort` | Set Claude reasoning effort |
+| `set-budget` | Set Claude's per-review USD cap |
+| `workflow start/status/finalize` | Manage a task across one or more repositories |
+| `run` | Execute one repair or confirmation round |
+| `decide` / `decide-batch` | Persist evidence-backed triage |
+| `finalize` | Produce a final gate |
+| `verify` | Confirm that the gate still matches current source |
+| `attest-commit` | Bind unchanged reviewed content to the checked-out commit |
+| `recover` | Mark an orphaned run failed after its process exits |
+
+Use `python3 .../mm_review.py <command> --help` for all flags.
+
+## Trust model
+
+| Control | What it provides | Boundary |
+|---|---|---|
+| Immutable snapshot | Reviewers do not inspect a changing checkout | The tracked repository tree is passed to every enabled provider CLI |
+| Read-only sessions | Reviewers receive read/search-only tool policies | Provider and CLI implementations remain external dependencies |
+| Independent prompts | Reviewers do not receive one another's findings | All reviewers receive the same task contract and source |
+| Secret screening | Blocks likely credentials, sensitive paths, external symlinks, and common secret patterns | It scans changed material heuristically, not every unchanged tracked file |
+| Evidence-backed triage | Codex records why every item was accepted, fixed, rejected, deferred, or uncertain | Model agreement is not evidence |
+| Freshness checks | Scoped source changes invalidate the final gate | A finalized confirmation is intentionally closed |
+| Approval boundary | Review results never authorize external actions | The user retains authority over commits, merges, deployments, migrations, and production changes |
+
+External symlinks always fail closed and cannot be waived. The broad sensitive
+path override should be used only after deliberately reviewing the entire
+snapshot.
+
+## Privacy and data handling
+
+The runner does not add a separate telemetry service, but enabled provider CLIs
+may transmit reviewed source to their providers under those providers' terms
+and account settings. Review only code you are authorized to share with every
+enabled provider.
+
+The snapshot contains the entire tracked Git tree at the reviewed revision,
+plus the task-scoped working-tree overlay. Path filters do not make unchanged
+tracked files private. Secret screening checks the patch and changed paths; an
+existing secret in an unchanged tracked file can still enter the snapshot.
+Inspect sensitive repositories before starting an external review.
+
+Persistent local state is stored under:
+
+- `~/.codex/review-runs/`;
+- `~/.config/multi-model-review/config.json`;
+- `~/.config/multi-model-review/provider-health.json`.
+
+Artifacts can contain patches, repository paths and origin, task prompts,
+reviewer responses, raw provider output, usage metadata, and triage evidence.
+They are created with private permissions on supported systems, but must not be
+committed, uploaded, or attached to public issues.
+
+Provider executables are resolved from `PATH`. Install trusted CLIs from their
+official distribution channels and verify which executable your shell selects.
+
+The built-in secret scan is defense in depth. It is not a substitute for a
+repository secret scanner or deliberate source review.
+
+## Cost controls
+
+Claude is enabled by default with a `$1.25` maximum per review invocation. A
+workflow permits up to three repair rounds and one confirmation, so a workflow
+that uses every round can permit up to `$5.00` of Claude budget per repository.
+Most workflows should converge earlier.
+
+`doctor --live` performs provider calls and gives its Claude probe a `$0.05`
+cap. Plain `doctor` does not run a review, but Antigravity readiness may call
+`agy models`. Antigravity and Kimi usage is governed by their accounts; the
+runner does not enforce an equivalent USD cap for them.
+
+Provider-reported cost and usage are recorded when available. A configured cap
+is a safety limit, not a prediction of the final bill.
+
+## Troubleshooting
+
+- **Cache/source mismatch:** update the marketplace, reinstall the plugin, and
+  start a new thread.
+- **Provider CLI missing:** install the provider's official CLI and authenticate
+  it, then rerun `doctor`.
+- **Antigravity agent missing or changed:** run
+  `mm-review install-antigravity-agent`.
+- **Quota cooldown:** wait for the reported reset or disable that provider.
+- **Interrupted run:** after confirming its process exited, use
+  `mm-review recover --run <run-directory>`.
+- **Stale final gate:** start a new workflow against the changed source.
+- **Review contract drift:** keep scope, paths, risks, profile, and task text
+  identical within one workflow.
+- **Sensitive material blocked:** remove it from scope or use only the narrow,
+  exact-match waiver after review. External symlinks cannot be overridden.
+- **Malformed provider output:** inspect the redacted error artifact, update the
+  provider CLI if needed, and rerun a fresh review.
+- **`mm-review` is not on PATH:** invoke the bundled Python script directly.
+- **Updated plugin is not visible:** start a new Codex thread after reinstall.
+
+## Limitations
+
+- External reviewers can miss defects or report false positives.
+- This workflow is not a formal proof or a replacement for tests, security
+  assessment, or human approval.
+- Provider CLI flags and output formats can change; `doctor` fails closed when
+  required contracts are unavailable.
+- Windows is not supported natively because the runner uses POSIX file locks,
+  permissions, signals, and process groups.
+- Source is sent to every enabled reviewer provider.
+- Kimi support relies on an experimental CLI flag and may change.
+- A later scoped edit requires a new workflow after confirmation.
+- Commits, pushes, merges, deployments, migrations, backfills, messages, and
+  live transactions remain outside the plugin's authority.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the dependency-free development
+workflow and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
+## License
+
+Released under the [MIT License](LICENSE).

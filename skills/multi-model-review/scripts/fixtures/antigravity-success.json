@@ -1,0 +1,9 @@
+{
+  "duration_seconds": 1.25,
+  "num_turns": 1,
+  "response": "# Verdict\nPASS_CLEAN\n\n# Findings\nNone.\n\n# Test gaps\nNone.\n",
+  "status": "SUCCESS",
+  "usage": {
+    "total_tokens": 160
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "name": "multi-model-review",
+  "version": "0.1.0",
+  "description": "Run capped task-scoped reviews with locked Codex triage, bounded repair rounds, mandatory confirmation, and commit-aware final gates.",
+  "author": {
+    "name": "Shoti",
+    "url": "https://github.com/shoti"
+  },
+  "homepage": "https://github.com/shoti/codex-multi-model-review",
+  "repository": "https://github.com/shoti/codex-multi-model-review",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "codex",
+    "claude",
+    "gemini",
+    "kimi"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Multi-Model Review",
+    "shortDescription": "Auditable multi-model review",
+    "longDescription": "Codex implements and verifies. Capped Claude, optional Antigravity, and optional Kimi independently inspect immutable repository snapshots in read-only sessions. The workflow pins task scope, bounds repairs, requires final confirmation, records typed provider failures and active status, locks triage, and verifies commit-aware freshness.",
+    "developerName": "Shoti",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read-only external reviews",
+      "Auditable finding triage",
+      "Freshness-checked final gates"
+    ],
+    "defaultPrompt": [
+      "Review my task-scoped changes with capped Claude, decide every finding and test gap, then complete a mandatory confirmation gate.",
+      "Run an independent Claude review with locked triage and verify the resulting commit.",
+      "Do a usage-audited multi-repository final review before merge."
+    ]
+  }
+}
