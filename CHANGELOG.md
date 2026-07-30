@@ -9,6 +9,8 @@ All notable user-visible changes are documented here. This project follows
 
 - Clarified the reviewer report contract so inspection-budget limitations are
   recorded in Notes instead of producing an empty `PASS_WITH_FINDINGS`.
+- Recognize the first root commit as content-equivalent to a reviewed unborn
+  working tree when paths and file contents match exactly.
 
 ## 0.1.0 - 2026-07-30
 

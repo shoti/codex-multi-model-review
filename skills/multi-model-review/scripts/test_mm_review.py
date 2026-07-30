@@ -491,6 +491,164 @@ class RunnerUnitTests(unittest.TestCase):
                 round_number=4,
             )
 
+    def test_initial_commit_is_equivalent_to_reviewed_unborn_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            run_dir = root / "run"
+            repo.mkdir()
+            run_dir.mkdir()
+            run(["git", "init", "-q"], cwd=repo)
+            run(
+                ["git", "config", "user.email", "review-test@example.invalid"],
+                cwd=repo,
+            )
+            run(["git", "config", "user.name", "Review Test"], cwd=repo)
+            (repo / "release.txt").write_text(
+                "reviewed initial content\n",
+                encoding="utf-8",
+            )
+            scope = MM.Scope(
+                "uncommitted",
+                None,
+                "staged, unstaged, and untracked changes",
+            )
+            paths = MM.changed_paths(repo, scope)
+            source_fingerprint = MM.fingerprint(repo, scope, paths, ())
+            metadata = {
+                "repository": {
+                    "root": str(repo),
+                    "head": None,
+                },
+                "scope": {
+                    "kind": scope.kind,
+                    "value": scope.value,
+                    "label": scope.label,
+                },
+                "path_filters": [],
+                "paths": paths,
+                "result_content_fingerprint": MM.content_fingerprint(repo, paths),
+            }
+
+            run(["git", "add", "release.txt"], cwd=repo)
+            run(["git", "commit", "-qm", "initial"], cwd=repo)
+            freshness = MM.freshness_status(
+                run_dir,
+                metadata,
+                source_fingerprint,
+            )
+
+            self.assertTrue(freshness["fresh"])
+            self.assertEqual(freshness["mode"], "committed-equivalent")
+            self.assertEqual(
+                freshness["commit"],
+                run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip(),
+            )
+
+    def test_initial_commit_equivalence_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def prepare_case(
+                name: str,
+            ) -> tuple[Path, Path, dict[str, object], str]:
+                repo = root / name
+                run_dir = root / f"{name}-run"
+                repo.mkdir()
+                run_dir.mkdir()
+                run(["git", "init", "-q"], cwd=repo)
+                run(
+                    [
+                        "git",
+                        "config",
+                        "user.email",
+                        "review-test@example.invalid",
+                    ],
+                    cwd=repo,
+                )
+                run(["git", "config", "user.name", "Review Test"], cwd=repo)
+                (repo / "release.txt").write_text(
+                    "reviewed initial content\n",
+                    encoding="utf-8",
+                )
+                scope = MM.Scope(
+                    "uncommitted",
+                    None,
+                    "staged, unstaged, and untracked changes",
+                )
+                paths = MM.changed_paths(repo, scope)
+                source_fingerprint = MM.fingerprint(repo, scope, paths, ())
+                metadata: dict[str, object] = {
+                    "repository": {
+                        "root": str(repo),
+                        "head": None,
+                    },
+                    "scope": {
+                        "kind": scope.kind,
+                        "value": scope.value,
+                        "label": scope.label,
+                    },
+                    "path_filters": [],
+                    "paths": paths,
+                    "result_content_fingerprint": MM.content_fingerprint(
+                        repo, paths
+                    ),
+                }
+                return repo, run_dir, metadata, source_fingerprint
+
+            repo, run_dir, metadata, source_fingerprint = prepare_case(
+                "path-mismatch"
+            )
+            (repo / "extra.txt").write_text("not reviewed\n", encoding="utf-8")
+            run(["git", "add", "--all"], cwd=repo)
+            run(["git", "commit", "-qm", "initial"], cwd=repo)
+            self.assertFalse(
+                MM.freshness_status(
+                    run_dir, metadata, source_fingerprint
+                )["fresh"]
+            )
+
+            repo, run_dir, metadata, source_fingerprint = prepare_case(
+                "content-mismatch"
+            )
+            (repo / "release.txt").write_text(
+                "tampered after review\n",
+                encoding="utf-8",
+            )
+            run(["git", "add", "--all"], cwd=repo)
+            run(["git", "commit", "-qm", "initial"], cwd=repo)
+            self.assertFalse(
+                MM.freshness_status(
+                    run_dir, metadata, source_fingerprint
+                )["fresh"]
+            )
+
+            repo, run_dir, metadata, source_fingerprint = prepare_case(
+                "dirty-worktree"
+            )
+            run(["git", "add", "--all"], cwd=repo)
+            run(["git", "commit", "-qm", "initial"], cwd=repo)
+            (repo / "later.txt").write_text("unreviewed\n", encoding="utf-8")
+            self.assertFalse(
+                MM.freshness_status(
+                    run_dir, metadata, source_fingerprint
+                )["fresh"]
+            )
+
+            repo, run_dir, metadata, source_fingerprint = prepare_case(
+                "non-root-head"
+            )
+            run(["git", "add", "--all"], cwd=repo)
+            run(["git", "commit", "-qm", "initial"], cwd=repo)
+            (repo / "second.txt").write_text("second commit\n", encoding="utf-8")
+            run(["git", "add", "--all"], cwd=repo)
+            run(["git", "commit", "-qm", "second"], cwd=repo)
+            self.assertFalse(
+                MM.freshness_status(
+                    run_dir, metadata, source_fingerprint
+                )["fresh"]
+            )
+
     def test_accepted_prior_item_requires_resolution_before_next_round(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)

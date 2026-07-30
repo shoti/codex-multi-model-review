@@ -1900,13 +1900,6 @@ def freshness_status(
         if scope.kind == "uncommitted"
         else scope.value
     )
-    if not isinstance(base, str) or not base:
-        return {
-            "fresh": False,
-            "mode": "stale",
-            "current_fingerprint": current,
-            "commit": None,
-        }
     head_result = run_command(
         ["git", "rev-parse", "--verify", "HEAD"], cwd=repo, check=False
     )
@@ -1918,14 +1911,43 @@ def freshness_status(
             "commit": None,
         }
     head = head_result.stdout.strip()
+    task_worktree_paths = changed_paths(
+        repo, Scope("uncommitted", None, "current working tree"), filters
+    )
+    expected_content = metadata.get("result_content_fingerprint")
+
+    if not isinstance(base, str) or not base:
+        is_initial_commit = first_parent(repo, head) is None
+        committed_paths = (
+            changed_paths(
+                repo,
+                Scope("commit", head, f"initial commit {head}"),
+                filters,
+            )
+            if is_initial_commit
+            else []
+        )
+        equivalent = (
+            is_initial_commit
+            and not task_worktree_paths
+            and committed_paths == reviewed_paths
+            and isinstance(expected_content, str)
+            and content_fingerprint(repo, reviewed_paths) == expected_content
+        )
+        return {
+            "fresh": equivalent,
+            "mode": "committed-equivalent" if equivalent else "stale",
+            "current_fingerprint": (
+                expected_fingerprint if equivalent else current
+            ),
+            "commit": head,
+        }
+
     is_descendant = run_command(
         ["git", "merge-base", "--is-ancestor", base, head],
         cwd=repo,
         check=False,
     ).returncode == 0
-    task_worktree_paths = changed_paths(
-        repo, Scope("uncommitted", None, "current working tree"), filters
-    )
     committed_paths = (
         git_changed_paths_between(repo, base, head, filters)
         if is_descendant
@@ -1943,7 +1965,6 @@ def freshness_status(
             "commit": head,
         }
 
-    expected_content = metadata.get("result_content_fingerprint")
     if isinstance(expected_content, str):
         equivalent = content_fingerprint(repo, reviewed_paths) == expected_content
     else:
