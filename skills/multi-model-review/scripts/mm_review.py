@@ -27,12 +27,20 @@ import threading
 import uuid
 from typing import Any, Sequence
 
+from review_contract import (
+    CLAUDE_REVIEW_SCHEMA,
+    parse_review_report,
+    parsed_report_is_invalid,
+    render_structured_review,
+)
+
 
 CONFIG_DIR = Path.home() / ".config" / "multi-model-review"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 PROVIDER_HEALTH_PATH = CONFIG_DIR / "provider-health.json"
 RUNS_DIR = Path.home() / ".codex" / "review-runs"
 WORKFLOWS_DIR = RUNS_DIR / "workflows"
+SENSITIVE_SCANS_DIR = RUNS_DIR / "sensitive-scans"
 SKILL_DIR = Path(__file__).resolve().parent.parent
 KIMI_AGENT_PATH = SKILL_DIR / "references" / "kimi-reviewer.md"
 ANTIGRAVITY_AGENT_PATH = SKILL_DIR / "references" / "antigravity-agent.md"
@@ -55,6 +63,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "antigravity": {"enabled": False, "model": "auto"},
     "kimi": {"enabled": False, "model": "k3-256k"},
+    "workflow": {"max_budget_usd": 5.0},
 }
 PROVIDERS = ("claude", "antigravity", "kimi")
 PROVIDER_BINARIES = {
@@ -64,7 +73,7 @@ PROVIDER_BINARIES = {
 }
 LEGACY_PROVIDER_ALIASES = {"gemini": "antigravity"}
 PROVIDER_CHOICES = (*PROVIDERS, *LEGACY_PROVIDER_ALIASES)
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MAX_REPAIR_ROUNDS = 3
 RUN_PHASES = ("repair", "confirmation")
 REVIEW_PROFILES = {
@@ -78,7 +87,10 @@ REVIEW_PROFILES = {
 CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 DEFAULT_TIMEOUT_MINUTES = 15
 DOCTOR_TIMEOUT_SECONDS = 90
+DOCTOR_CLAUDE_BUDGET_USD = 0.10
 DEFAULT_QUOTA_COOLDOWN_MINUTES = 60
+MIN_CLAUDE_REVIEW_BUDGET_USD = 0.05
+DEFAULT_ANALYTICS_DAYS = 7
 
 SENSITIVE_EXACT_NAMES = {
     ".env",
@@ -277,17 +289,28 @@ def safe_write_json(path: Path, value: dict[str, Any]) -> None:
 
 
 @contextmanager
-def exclusive_file_lock(target: Path) -> Any:
-    """Serialize read-modify-write transactions across runner processes."""
-    lock_path = target.with_name(f".{target.name}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+def exclusive_file_locks(targets: Sequence[Path]) -> Any:
+    """Lock one or more state files in stable order across runner processes."""
+    descriptors: list[int] = []
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        for target in sorted(set(targets), key=str):
+            lock_path = target.with_name(f".{target.name}.lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            descriptors.append(descriptor)
         yield
     finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
+        for descriptor in reversed(descriptors):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
+@contextmanager
+def exclusive_file_lock(target: Path) -> Any:
+    """Serialize a read-modify-write transaction across runner processes."""
+    with exclusive_file_locks((target,)):
+        yield
 
 
 def run_command(
@@ -340,6 +363,9 @@ def load_config() -> dict[str, Any]:
         provider_config = loaded.get(provider)
         if isinstance(provider_config, dict):
             config[provider].update(provider_config)
+    workflow_config = loaded.get("workflow")
+    if isinstance(workflow_config, dict):
+        config["workflow"].update(workflow_config)
     legacy_gemini = loaded.get("gemini")
     if "antigravity" not in loaded and isinstance(legacy_gemini, dict):
         config["antigravity"].update(legacy_gemini)
@@ -357,6 +383,15 @@ def load_config() -> dict[str, Any]:
     ):
         raise ReviewError(
             f"Claude max_budget_usd in {CONFIG_PATH} must be a positive number."
+        )
+    workflow_budget = config["workflow"].get("max_budget_usd")
+    if (
+        not isinstance(workflow_budget, (int, float))
+        or not math.isfinite(float(workflow_budget))
+        or workflow_budget <= 0
+    ):
+        raise ReviewError(
+            f"Workflow max_budget_usd in {CONFIG_PATH} must be a positive number."
         )
     return config
 
@@ -421,11 +456,19 @@ def classify_provider_failure(
         )
     ):
         return "authentication"
-    if any(
-        marker in combined
-        for marker in ("model not found", "unknown model", "invalid model")
-    ):
-        return "model"
+    direct_model_error = re.search(
+        r"\b(?:model not found|unknown model|invalid model)\b", combined
+    )
+    quoted_model_error = any(
+        re.search(
+            r"\bmodel\s+[\"'][^\"']+[\"']\s+(?:is\s+)?"
+            r"(?:not configured|not found|unknown|invalid)\b",
+            line,
+        )
+        for line in combined.splitlines()
+    )
+    if direct_model_error or quoted_model_error:
+        return "model_not_configured"
     if returncode == 0 and not stdout.strip():
         return "empty_response"
     return "provider_error"
@@ -465,9 +508,30 @@ def record_provider_failure(
     if not category:
         return
     health = provider_health()
+    sanitized = sanitized_failure_text(detail)
+    lines = [line.strip() for line in sanitized.splitlines() if line.strip()]
+    preferred = next(
+        (
+            line
+            for line in lines
+            if any(
+                marker in line.lower()
+                for marker in (
+                    "error",
+                    "quota",
+                    "rate limit",
+                    "not configured",
+                    "not authenticated",
+                    "unauthorized",
+                    "timed out",
+                )
+            )
+        ),
+        lines[0] if lines else category,
+    )
     value = {
         "category": category,
-        "detail": sanitized_failure_text(detail).splitlines()[0][:240],
+        "detail": preferred[:240],
         "observed_at": utc_now(),
     }
     if category == "quota":
@@ -854,7 +918,7 @@ def secret_assignment_key(line: str) -> str | None:
 def sensitive_content_findings(
     repo: Path, paths: Sequence[str], patch: str
 ) -> list[SensitiveFinding]:
-    sources: list[tuple[str, str]] = [("change.patch", patch)]
+    sources: list[tuple[str, str]] = []
     for relative_path in paths:
         path = repo / relative_path
         if not path.is_file() or path.is_symlink():
@@ -868,6 +932,16 @@ def sensitive_content_findings(
             sources.append(
                 (relative_path, content.decode("utf-8", errors="replace"))
             )
+
+    # Current file contents already cover added/context lines. Scan only deleted
+    # patch lines so removed credentials are still blocked without reporting the
+    # same current fixture once under its source path and again under change.patch.
+    deleted_patch = "\n".join(
+        line[1:] if line.startswith("-") and not line.startswith("---") else ""
+        for line in patch.splitlines()
+    )
+    if deleted_patch.strip():
+        sources.append(("change.patch", deleted_patch))
 
     findings: dict[str, SensitiveFinding] = {}
     for relative_path, text in sources:
@@ -904,6 +978,80 @@ def sensitive_content_findings(
                     key=secret_assignment_key(line),
                 )
     return [findings[key] for key in sorted(findings)]
+
+
+def sensitive_scan_path(token: str) -> Path:
+    if not re.fullmatch(r"scan-[a-f0-9]{32}", token):
+        raise ReviewError("Invalid sensitive scan token format.")
+    return SENSITIVE_SCANS_DIR / f"{token}.json"
+
+
+def create_sensitive_scan_token(
+    *,
+    repository: dict[str, Any],
+    scope: Scope,
+    path_filters: Sequence[str],
+    paths: Sequence[str],
+    source_fingerprint: str,
+    findings: Sequence[SensitiveFinding],
+) -> str:
+    token = f"scan-{uuid.uuid4().hex}"
+    safe_write_json(
+        sensitive_scan_path(token),
+        {
+            "schema_version": SCHEMA_VERSION,
+            "token": token,
+            "created_at": utc_now(),
+            "consumed_at": None,
+            "repository_id": repository.get("id"),
+            "repository_root": repository.get("root"),
+            "scope": dataclasses.asdict(scope),
+            "path_filters": list(path_filters),
+            "paths": list(paths),
+            "source_fingerprint": source_fingerprint,
+            "allowed_sensitive_findings": [
+                finding.identifier for finding in findings
+            ],
+        },
+    )
+    return token
+
+
+def validate_sensitive_scan_token(
+    token: str,
+    *,
+    repository: dict[str, Any],
+    scope: Scope,
+    path_filters: Sequence[str],
+    paths: Sequence[str],
+    source_fingerprint: str,
+) -> tuple[Path, dict[str, Any]]:
+    path = sensitive_scan_path(token)
+    if not path.exists():
+        raise ReviewError(f"Unknown sensitive scan token: {token}.")
+    value = read_json(path)
+    if value.get("consumed_at"):
+        raise ReviewError(f"Sensitive scan token was already consumed: {token}.")
+    expected = {
+        "repository_id": repository.get("id"),
+        "repository_root": repository.get("root"),
+        "scope": dataclasses.asdict(scope),
+        "path_filters": list(path_filters),
+        "paths": list(paths),
+        "source_fingerprint": source_fingerprint,
+    }
+    mismatches = [key for key, item in expected.items() if value.get(key) != item]
+    if mismatches:
+        raise ReviewError(
+            "Sensitive scan token does not match the current snapshot: "
+            + ", ".join(mismatches)
+        )
+    return path, value
+
+
+def consume_sensitive_scan_token(path: Path, value: dict[str, Any]) -> None:
+    value["consumed_at"] = utc_now()
+    safe_write_json(path, value)
 
 
 def update_digest_with_paths(
@@ -1066,6 +1214,20 @@ def create_snapshot(
         else:
             shutil.copy2(source, target, follow_symlinks=False)
     return snapshot_dir
+
+
+def clear_ephemeral_snapshot(run_dir: Path) -> None:
+    """Remove only the private snapshot that resume is about to recreate."""
+    snapshot_dir = run_dir / "snapshot"
+    try:
+        if snapshot_dir.is_symlink() or snapshot_dir.is_file():
+            snapshot_dir.unlink()
+        elif snapshot_dir.exists():
+            shutil.rmtree(snapshot_dir)
+    except OSError as exc:
+        raise ReviewError(
+            f"Cannot remove stale review snapshot {snapshot_dir}: {exc}"
+        ) from exc
 
 
 def external_snapshot_symlinks(snapshot_dir: Path) -> list[str]:
@@ -1270,6 +1432,8 @@ def reviewer_definitions(
                     "-p",
                     "--output-format",
                     "json",
+                    "--json-schema",
+                    json.dumps(CLAUDE_REVIEW_SCHEMA, separators=(",", ":")),
                     "--model",
                     model,
                     "--effort",
@@ -1348,14 +1512,18 @@ def reviewer_definitions(
                 f"{reviewer.name} is in quota cooldown until {blocked_until}; "
                 "the runner will not spend another attempt before then."
             )
-        if reviewer.name == "antigravity":
-            readiness = provider_readiness("antigravity")
+        if reviewer.name in {"antigravity", "kimi"}:
+            readiness = provider_readiness(reviewer.name, reviewer.model)
             if not readiness.ready:
                 raise ReviewError(
-                    "Antigravity is enabled but not ready: "
+                    f"{reviewer.name.title()} is enabled but not ready: "
                     f"{readiness.detail}."
                 )
-            if reviewer.model != "auto" and reviewer.model not in readiness.models:
+            if (
+                reviewer.name == "antigravity"
+                and reviewer.model != "auto"
+                and reviewer.model not in readiness.models
+            ):
                 available = ", ".join(readiness.models) or "none reported"
                 raise ReviewError(
                     f"Antigravity model {reviewer.model!r} is unavailable. "
@@ -1459,6 +1627,7 @@ def invoke_reviewer(
 
     usage: dict[str, Any] | None = None
     provider_reported_error = False
+    provider_failure_detail: str | None = None
     malformed_provider_response = False
     empty_success_response = False
     if timed_out:
@@ -1498,9 +1667,21 @@ def invoke_reviewer(
         if isinstance(payload, dict):
             result_key = "result" if reviewer.name == "claude" else "response"
             result = payload.get(result_key)
-            if isinstance(result, str):
-                report = result
             if reviewer.name == "claude":
+                structured = payload.get("structured_output")
+                if isinstance(structured, dict):
+                    try:
+                        report = render_structured_review(structured)
+                    except (KeyError, TypeError, ValueError):
+                        malformed_provider_response = True
+                        report = result if isinstance(result, str) else ""
+                    else:
+                        safe_write(
+                            run_dir / "claude.structured.json",
+                            json.dumps(structured, indent=2, sort_keys=True) + "\n",
+                        )
+                elif isinstance(result, str):
+                    report = result
                 usage = {
                     key: payload[key]
                     for key in (
@@ -1514,12 +1695,15 @@ def invoke_reviewer(
                     if key in payload
                 } or None
                 provider_reported_error = bool(payload.get("is_error"))
+                if provider_reported_error and isinstance(result, str):
+                    provider_failure_detail = result
                 empty_success_response = (
                     not provider_reported_error
-                    and isinstance(result, str)
-                    and not result.strip()
+                    and not report.strip()
                 )
             else:
+                if isinstance(result, str):
+                    report = result
                 usage = {
                     key: payload[key]
                     for key in ("duration_seconds", "num_turns", "usage")
@@ -1539,6 +1723,9 @@ def invoke_reviewer(
                     or not isinstance(result, str)
                     or not result.strip()
                 )
+                provider_error = payload.get("error")
+                if provider_status_error and isinstance(provider_error, str):
+                    provider_failure_detail = provider_error
             safe_write(
                 run_dir / f"{reviewer.name}.raw.json",
                 json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -1567,7 +1754,7 @@ def invoke_reviewer(
         record_provider_failure(
             reviewer.name,
             failure_category,
-            sanitized_failure_text(stdout, stderr),
+            sanitized_failure_text(provider_failure_detail or stdout, stderr),
         )
     else:
         clear_provider_failure(reviewer.name)
@@ -1583,152 +1770,6 @@ def invoke_reviewer(
         usage,
         failure_category,
     )
-
-
-def markdown_section(report: str, heading: str) -> str:
-    match = re.search(
-        rf"(?im)^#\s+{re.escape(heading)}\s*$", report
-    )
-    if not match:
-        return ""
-    start = match.end()
-    next_heading = re.search(r"(?m)^#\s+", report[start:])
-    end = start + next_heading.start() if next_heading else len(report)
-    return report[start:end].strip()
-
-
-def parse_severity_items(
-    reviewer: str,
-    section: str,
-    *,
-    identifier_kind: str,
-) -> list[dict[str, Any]]:
-    heading_pattern = re.compile(
-        r"(?im)^##\s+\[(blocker|high|medium|low)\]\s+(.+?)\s*$"
-    )
-    matches = list(heading_pattern.finditer(section))
-    items: list[dict[str, Any]] = []
-    for offset, match in enumerate(matches):
-        end = (
-            matches[offset + 1].start()
-            if offset + 1 < len(matches)
-            else len(section)
-        )
-        body = section[match.end() : end].strip()
-        location_match = re.search(
-            r"(?im)^-\s*Location:\s*(.+?)\s*$", body
-        )
-        suffix = offset + 1
-        identifier = (
-            f"{reviewer}-{suffix:03d}"
-            if identifier_kind == "finding"
-            else f"{reviewer}-test-{suffix:03d}"
-        )
-        items.append(
-            {
-                "id": identifier,
-                "kind": identifier_kind,
-                "reviewer": reviewer,
-                "severity": match.group(1).lower(),
-                "title": match.group(2).strip(),
-                "location": (
-                    location_match.group(1).strip() if location_match else None
-                ),
-                "report_excerpt": body[:2_000],
-            }
-        )
-    return items
-
-
-def parse_bullet_test_gaps(
-    reviewer: str, section: str, *, risk_profiled: bool
-) -> list[dict[str, Any]]:
-    if not section or section.strip().lower() in {"none", "none."}:
-        return []
-    bullets: list[str] = []
-    current: list[str] = []
-    for line in section.splitlines():
-        if line.startswith("- "):
-            if current:
-                bullets.append(" ".join(current).strip())
-            current = [line[2:].strip()]
-        elif current and line.strip():
-            current.append(line.strip())
-    if current:
-        bullets.append(" ".join(current).strip())
-    return [
-        {
-            "id": f"{reviewer}-test-{index:03d}",
-            "kind": "test_gap",
-            "reviewer": reviewer,
-            "severity": "medium" if risk_profiled else "low",
-            "title": bullet,
-            "location": None,
-            "report_excerpt": bullet[:2_000],
-        }
-        for index, bullet in enumerate(bullets, start=1)
-        if bullet and bullet.lower() not in {"none", "none."}
-    ]
-
-
-def parse_review_report(
-    reviewer: str, report: str, *, risk_profiled: bool = False
-) -> dict[str, Any]:
-    verdict_match = re.search(
-        r"(?im)^#\s+Verdict\s*\n+\s*"
-        r"(PASS_CLEAN|PASS_WITH_FINDINGS|PASS|BLOCK)\b",
-        report,
-    )
-    verdict = verdict_match.group(1).upper() if verdict_match else "UNKNOWN"
-    if verdict == "PASS":
-        verdict = "PASS_CLEAN"
-
-    findings = parse_severity_items(
-        reviewer,
-        markdown_section(report, "Findings"),
-        identifier_kind="finding",
-    )
-    test_gap_section = markdown_section(report, "Test gaps")
-    test_gaps = parse_severity_items(
-        reviewer, test_gap_section, identifier_kind="test_gap"
-    )
-    invalid_test_gap_severities = [
-        item["id"]
-        for item in test_gaps
-        if item["severity"] in {"blocker", "high"}
-    ]
-    if not risk_profiled:
-        for item in test_gaps:
-            if item["severity"] == "medium":
-                item["reported_severity"] = "medium"
-                item["severity"] = "low"
-                item["severity_adjustment"] = (
-                    "Downgraded because no changed risk profile was selected."
-                )
-    if not test_gaps:
-        test_gaps = parse_bullet_test_gaps(
-            reviewer, test_gap_section, risk_profiled=risk_profiled
-        )
-    counts = {
-        severity: sum(
-            finding["severity"] == severity for finding in findings
-        )
-        for severity in SEVERITY_ORDER
-    }
-    test_gap_counts = {
-        severity: sum(
-            item["severity"] == severity for item in test_gaps
-        )
-        for severity in SEVERITY_ORDER
-    }
-    return {
-        "verdict": verdict,
-        "finding_counts": counts,
-        "findings": findings,
-        "test_gap_counts": test_gap_counts,
-        "test_gaps": test_gaps,
-        "invalid_test_gap_severities": invalid_test_gap_severities,
-    }
 
 
 def repository_metadata(repo: Path) -> dict[str, Any]:
@@ -1785,6 +1826,24 @@ def update_metadata(run_dir: Path, **updates: Any) -> dict[str, Any]:
     metadata = read_json(path) if path.exists() else {}
     metadata.update(updates)
     safe_write_json(path, metadata)
+    return metadata
+
+
+def update_terminal_error(
+    run_dir: Path,
+    *,
+    error_type: str,
+    message: str,
+    **updates: Any,
+) -> dict[str, Any]:
+    """Record the command failure without overwriting a typed root cause."""
+    metadata_path = run_dir / "metadata.json"
+    metadata = read_json(metadata_path) if metadata_path.exists() else {}
+    if not isinstance(metadata.get("failure"), dict):
+        metadata["failure"] = {"type": error_type, "message": message}
+    metadata["terminal_error"] = {"type": error_type, "message": message}
+    metadata.update(updates)
+    safe_write_json(metadata_path, metadata)
     return metadata
 
 
@@ -2088,10 +2147,11 @@ def workflow_id() -> str:
     return f"wf-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
-def workflow_policy() -> dict[str, Any]:
+def workflow_policy(max_budget_usd: float = 5.0) -> dict[str, Any]:
     return {
         "max_repair_rounds": MAX_REPAIR_ROUNDS,
         "confirmation_required": True,
+        "max_budget_usd": max_budget_usd,
     }
 
 
@@ -2099,7 +2159,35 @@ def workflow_path(identifier: str) -> Path:
     return WORKFLOWS_DIR / f"{identifier}.json"
 
 
-def create_workflow(identifier: str, *, name: str | None = None) -> None:
+def require_active_workflow(identifier: str) -> dict[str, Any]:
+    path = workflow_path(identifier)
+    if not path.exists():
+        raise ReviewError(
+            f"Unknown workflow {identifier}. Create it with "
+            "`mm-review workflow start`."
+        )
+    workflow = read_json(path)
+    if workflow.get("status") == "superseded":
+        successor = workflow.get("superseded_by")
+        direction = (
+            f" Use successor workflow {successor}."
+            if successor
+            else " Create or select its successor workflow."
+        )
+        raise ReviewError(
+            f"Workflow {identifier} is superseded and cannot accept new "
+            f"reviews.{direction}"
+        )
+    return workflow
+
+
+def create_workflow(
+    identifier: str,
+    *,
+    name: str | None = None,
+    max_budget_usd: float = 5.0,
+    supersedes: Sequence[str] = (),
+) -> None:
     safe_write_json(
         workflow_path(identifier),
         {
@@ -2107,7 +2195,8 @@ def create_workflow(identifier: str, *, name: str | None = None) -> None:
             "workflow_id": identifier,
             "name": name,
             "created_at": utc_now(),
-            "policy": workflow_policy(),
+            "policy": workflow_policy(max_budget_usd),
+            "supersedes": list(supersedes),
         },
     )
 
@@ -2122,6 +2211,132 @@ def workflow_requires_confirmation(identifier: str) -> bool:
         isinstance(policy, dict)
         and policy.get("confirmation_required")
     )
+
+
+def workflow_budget_limit(identifier: str) -> float | None:
+    path = workflow_path(identifier)
+    if not path.exists():
+        return None
+    policy = read_json(path).get("policy")
+    if not isinstance(policy, dict):
+        return None
+    value = policy.get("max_budget_usd")
+    if isinstance(value, (int, float)) and math.isfinite(float(value)) and value > 0:
+        return float(value)
+    return None
+
+
+def workflow_spend(identifier: str) -> float:
+    return float(
+        workflow_metrics(workflow_runs(identifier)).get("reported_cost_usd") or 0
+    )
+
+
+def _adjust_workflow_budget(
+    reviewers: Sequence[Reviewer],
+    *,
+    identifier: str,
+    limit: float,
+    spent: float,
+    reserved: float,
+) -> tuple[list[Reviewer], dict[str, float], float]:
+    remaining = max(0.0, limit - spent - reserved)
+    adjusted: list[Reviewer] = []
+    reserved_for_run = 0.0
+    for reviewer in reviewers:
+        if reviewer.name != "claude":
+            adjusted.append(reviewer)
+            continue
+        if remaining < MIN_CLAUDE_REVIEW_BUDGET_USD:
+            raise ReviewError(
+                f"Workflow {identifier} exhausted its ${limit:.2f} budget "
+                f"(${spent:.2f} reported, ${reserved:.2f} reserved). Start or "
+                "supersede into a workflow with a larger explicit budget before "
+                "another paid review."
+            )
+        command = list(reviewer.command)
+        budget_index = command.index("--max-budget-usd") + 1
+        requested = float(command[budget_index])
+        reserved_for_run = round(min(requested, remaining), 6)
+        command[budget_index] = str(reserved_for_run)
+        adjusted.append(dataclasses.replace(reviewer, command=tuple(command)))
+    return adjusted, {
+        "max_budget_usd": round(limit, 6),
+        "spent_before_run_usd": round(spent, 6),
+        "reserved_before_run_usd": round(reserved, 6),
+        "remaining_before_run_usd": round(remaining, 6),
+        "reserved_for_run_usd": reserved_for_run,
+    }, reserved_for_run
+
+
+def apply_workflow_budget(
+    reviewers: Sequence[Reviewer],
+    identifier: str,
+    *,
+    reservation_id: str | None = None,
+) -> tuple[list[Reviewer], dict[str, float] | None]:
+    if reservation_id is None:
+        limit = workflow_budget_limit(identifier)
+        if limit is None:
+            return list(reviewers), None
+        adjusted, status, _ = _adjust_workflow_budget(
+            reviewers,
+            identifier=identifier,
+            limit=limit,
+            spent=workflow_spend(identifier),
+            reserved=0.0,
+        )
+        return adjusted, status
+
+    path = workflow_path(identifier)
+    with exclusive_file_lock(path):
+        workflow = require_active_workflow(identifier)
+        policy = workflow.get("policy")
+        limit_value = policy.get("max_budget_usd") if isinstance(policy, dict) else None
+        if not isinstance(limit_value, (int, float)):
+            return list(reviewers), None
+        limit = float(limit_value)
+        reservations = workflow.get("budget_reservations")
+        if not isinstance(reservations, dict):
+            reservations = {}
+        reservations.pop(reservation_id, None)
+        reserved = sum(
+            float(item.get("max_budget_usd") or 0)
+            for item in reservations.values()
+            if isinstance(item, dict)
+        )
+        adjusted, status, reserved_for_run = _adjust_workflow_budget(
+            reviewers,
+            identifier=identifier,
+            limit=limit,
+            spent=workflow_spend(identifier),
+            reserved=reserved,
+        )
+        if reserved_for_run:
+            reservations[reservation_id] = {
+                "max_budget_usd": reserved_for_run,
+                "reserved_at": utc_now(),
+                "runner_pid": os.getpid(),
+            }
+            workflow["budget_reservations"] = reservations
+            safe_write_json(path, workflow)
+        return adjusted, status
+
+
+def release_workflow_budget_reservation(
+    identifier: str, reservation_id: str
+) -> None:
+    path = workflow_path(identifier)
+    if not path.exists():
+        return
+    with exclusive_file_lock(path):
+        workflow = read_json(path)
+        reservations = workflow.get("budget_reservations")
+        if not isinstance(reservations, dict) or reservation_id not in reservations:
+            return
+        reservations.pop(reservation_id, None)
+        workflow["budget_reservations"] = reservations
+        safe_write_json(path, workflow)
 
 
 def validate_workflow_phase(
@@ -2165,7 +2380,9 @@ def validate_workflow_phase(
         )
     if completed_confirmations:
         raise ReviewError(
-            "This repository already has a completed confirmation round."
+            "This repository already has a completed confirmation round. "
+            f"Create a linked successor with `mm-review workflow supersede "
+            f"{identifier} --reason \"source changed after confirmation\"`."
         )
     if phase == "repair":
         if len(completed_repairs) >= MAX_REPAIR_ROUNDS:
@@ -2226,16 +2443,84 @@ def validate_review_contract(
     if mismatches:
         raise ReviewError(
             "Review contract drifted from the first completed repair for this "
-            "repository. Start a new workflow to change: "
+            "repository. Create a linked successor with `mm-review workflow "
+            f"supersede {identifier} --reason \"review contract changed\"` "
+            "to change: "
             + ", ".join(mismatches)
         )
 
 
 def workflow_start_command(args: argparse.Namespace) -> int:
     os.umask(0o077)
+    config = load_config()
     identifier = workflow_id()
-    create_workflow(identifier, name=args.name)
+    max_budget_usd = (
+        args.max_budget_usd
+        if args.max_budget_usd is not None
+        else float(config["workflow"]["max_budget_usd"])
+    )
+    if not math.isfinite(max_budget_usd) or max_budget_usd <= 0:
+        raise ReviewError("Workflow budget must be a positive USD amount.")
+    create_workflow(
+        identifier,
+        name=args.name,
+        max_budget_usd=max_budget_usd,
+    )
     print(identifier)
+    return 0
+
+
+def workflow_supersede_command(args: argparse.Namespace) -> int:
+    old_path = workflow_path(args.workflow_id)
+    if len(args.reason) > MAX_NOTE_CHARS:
+        raise ReviewError(
+            f"--reason must be at most {MAX_NOTE_CHARS} characters."
+        )
+    replacement = args.by or workflow_id()
+    if replacement == args.workflow_id:
+        raise ReviewError("A workflow cannot supersede itself.")
+    replacement_path = workflow_path(replacement)
+    with exclusive_file_locks((old_path, replacement_path)):
+        if not old_path.exists():
+            raise ReviewError(f"Unknown workflow {args.workflow_id}.")
+        old = read_json(old_path)
+        if old.get("superseded_by"):
+            raise ReviewError(
+                f"Workflow {args.workflow_id} is already superseded by "
+                f"{old['superseded_by']}."
+            )
+        policy = old.get("policy") if isinstance(old.get("policy"), dict) else {}
+        max_budget_usd = float(policy.get("max_budget_usd") or 5.0)
+        if args.by:
+            if not replacement_path.exists():
+                raise ReviewError(
+                    f"Replacement workflow does not exist: {replacement}."
+                )
+            replacement_document = read_json(replacement_path)
+            supersedes = replacement_document.get("supersedes")
+            if not isinstance(supersedes, list):
+                supersedes = []
+            if args.workflow_id not in supersedes:
+                supersedes.append(args.workflow_id)
+            replacement_document["supersedes"] = sorted(set(supersedes))
+            safe_write_json(replacement_path, replacement_document)
+        else:
+            create_workflow(
+                replacement,
+                name=args.name or old.get("name"),
+                max_budget_usd=max_budget_usd,
+                supersedes=(args.workflow_id,),
+            )
+        old.update(
+            {
+                "status": "superseded",
+                "superseded_at": utc_now(),
+                "superseded_by": replacement,
+                "supersede_reason": args.reason,
+            }
+        )
+        safe_write_json(old_path, old)
+    print(replacement)
     return 0
 
 
@@ -2345,6 +2630,7 @@ def workflow_metrics(
         "run_count": len(runs),
         "completed_runs": 0,
         "failed_runs": 0,
+        "partial_runs": 0,
         "running_runs": 0,
         "reviewer_invocations": 0,
         "successful_reviewer_invocations": 0,
@@ -2367,6 +2653,8 @@ def workflow_metrics(
             metrics["completed_runs"] += 1
         elif metadata.get("status") == "failed":
             metrics["failed_runs"] += 1
+        elif metadata.get("status") == "partial":
+            metrics["partial_runs"] += 1
         elif metadata.get("status") == "running":
             metrics["running_runs"] += 1
         reviewers = metadata.get("reviewers")
@@ -2377,6 +2665,7 @@ def workflow_metrics(
                 metrics["reviewer_invocations"] += 1
                 succeeded = (
                     int(reviewer.get("exit_code") or 0) == 0
+                    and reviewer.get("report_contract_valid", True) is not False
                     and reviewer.get("verdict")
                     in {"PASS_CLEAN", "PASS_WITH_FINDINGS", "BLOCK"}
                 )
@@ -2426,7 +2715,110 @@ def workflow_metrics(
     return metrics
 
 
+def analytics_report(since_days: int) -> dict[str, Any]:
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=since_days)
+    runs: list[tuple[Path, dict[str, Any]]] = []
+    for run_dir, metadata in all_run_metadata():
+        created_at = metadata.get("created_at")
+        try:
+            created = dt.datetime.fromisoformat(str(created_at))
+        except ValueError:
+            continue
+        if created >= cutoff:
+            runs.append((run_dir, metadata))
+    metrics = workflow_metrics(runs)
+    providers: dict[str, dict[str, Any]] = {}
+    failure_types: dict[str, int] = {}
+    contract_valid_runs = 0
+    partial_runs = 0
+    for _, metadata in runs:
+        if metadata.get("status") == "completed":
+            contract_valid_runs += 1
+        failure = metadata.get("failure")
+        if isinstance(failure, dict):
+            failure_type = str(failure.get("type") or "unknown")
+            failure_types[failure_type] = failure_types.get(failure_type, 0) + 1
+            secondary_invalid = failure.get("invalid_reports")
+            if (
+                failure_type != "invalid_report"
+                and isinstance(secondary_invalid, list)
+                and secondary_invalid
+            ):
+                failure_types["invalid_report"] = (
+                    failure_types.get("invalid_report", 0) + 1
+                )
+            if failure_type == "reviewer_failure" and isinstance(
+                metadata.get("reviewers"), dict
+            ):
+                if any(
+                    isinstance(item, dict) and item.get("exit_code") == 0
+                    for item in metadata["reviewers"].values()
+                ):
+                    partial_runs += 1
+        reviewers = metadata.get("reviewers")
+        if not isinstance(reviewers, dict):
+            continue
+        for name, reviewer in reviewers.items():
+            if not isinstance(reviewer, dict) or "exit_code" not in reviewer:
+                continue
+            summary = providers.setdefault(
+                str(name),
+                {"invocations": 0, "successful": 0, "failed": 0, "cost_usd": 0.0},
+            )
+            summary["invocations"] += 1
+            if reviewer.get("exit_code") == 0:
+                summary["successful"] += 1
+            else:
+                summary["failed"] += 1
+            usage = reviewer.get("usage")
+            if isinstance(usage, dict):
+                summary["cost_usd"] += float(usage.get("total_cost_usd") or 0)
+    for summary in providers.values():
+        summary["cost_usd"] = round(summary["cost_usd"], 6)
+    workflow_ids = sorted(
+        {
+            str(metadata.get("workflow_id"))
+            for _, metadata in runs
+            if metadata.get("workflow_id")
+        }
+    )
+    finalized = 0
+    superseded = 0
+    for identifier in workflow_ids:
+        if (WORKFLOWS_DIR / f"{identifier}.final.json").exists():
+            finalized += 1
+        path = workflow_path(identifier)
+        if path.exists() and read_json(path).get("status") == "superseded":
+            superseded += 1
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": utc_now(),
+        "since_days": since_days,
+        "run_attempts": len(runs),
+        "contract_valid_runs": contract_valid_runs,
+        "partial_runs": partial_runs,
+        "workflow_count": len(workflow_ids),
+        "finalized_workflows": finalized,
+        "superseded_workflows": superseded,
+        "failure_types": dict(sorted(failure_types.items())),
+        "providers": dict(sorted(providers.items())),
+        "metrics": metrics,
+    }
+
+
+def analytics_command(args: argparse.Namespace) -> int:
+    if args.since_days < 1:
+        raise ReviewError("--since-days must be at least 1.")
+    print(json.dumps(analytics_report(args.since_days), indent=2))
+    return 0
+
+
 def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
+    workflow_document = (
+        read_json(workflow_path(identifier))
+        if workflow_path(identifier).exists()
+        else {}
+    )
     all_runs = workflow_runs(identifier)
     latest_runs = latest_workflow_runs(identifier)
     if not all_runs:
@@ -2459,6 +2851,8 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
     ]
     requires_confirmation = workflow_requires_confirmation(identifier)
     ready = bool(latest_runs) and not history_issues and not active_runs
+    if workflow_document.get("status") == "superseded":
+        ready = False
     for run_dir, metadata in latest_runs:
         final_path = run_dir / "final.json"
         state = "not-finalized"
@@ -2501,9 +2895,11 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
         )
     return {
         "workflow_id": identifier,
+        "workflow": workflow_document,
         "ready": ready,
+        "state": workflow_document.get("status", "active"),
         "checked_at": utc_now(),
-        "policy": workflow_policy() if requires_confirmation else None,
+        "policy": workflow_document.get("policy") if requires_confirmation else None,
         "active_runs": active_runs,
         "history_complete": not history_issues,
         "history_issues": history_issues,
@@ -2556,7 +2952,53 @@ def canonical_provider(provider: str) -> str:
     return LEGACY_PROVIDER_ALIASES.get(provider, provider)
 
 
-def provider_readiness(provider: str) -> ProviderReadiness:
+def kimi_provider_readiness(command: str, model: str | None) -> ProviderReadiness:
+    try:
+        completed = subprocess.run(
+            [command, "provider", "list", "--json"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+    except OSError as exc:
+        return ProviderReadiness(False, f"readiness probe failed: {type(exc).__name__}")
+    except subprocess.TimeoutExpired:
+        return ProviderReadiness(False, "readiness probe timed out")
+    if completed.returncode != 0:
+        detail = sanitized_failure_text(completed.stderr, completed.stdout)
+        summary = next(
+            (line for line in detail.splitlines() if line.strip()),
+            "provider query failed",
+        )
+        return ProviderReadiness(False, summary[:240])
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return ProviderReadiness(False, "provider query returned invalid JSON")
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, dict) or not models:
+        return ProviderReadiness(
+            False, "no Kimi providers or model aliases are configured"
+        )
+    available = tuple(sorted(str(name) for name in models))
+    if model and model not in models:
+        return ProviderReadiness(
+            False,
+            f"model alias {model!r} is not configured; available: "
+            + ", ".join(available),
+            available,
+        )
+    return ProviderReadiness(
+        True,
+        f"configured; {len(available)} model aliases available",
+        available,
+    )
+
+
+def provider_readiness(
+    provider: str, model: str | None = None
+) -> ProviderReadiness:
     provider = canonical_provider(provider)
     command = PROVIDER_BINARIES[provider]
     path = shutil.which(command)
@@ -2574,6 +3016,12 @@ def provider_readiness(provider: str) -> ProviderReadiness:
         suffix = (
             f"; last failure={last_failure.get('category', 'unknown')} at "
             f"{last_failure.get('observed_at', 'unknown time')}"
+        )
+    if provider == "kimi":
+        readiness = kimi_provider_readiness(command, model)
+        return dataclasses.replace(
+            readiness,
+            detail=readiness.detail + suffix,
         )
     if provider != "antigravity":
         return ProviderReadiness(
@@ -2629,7 +3077,7 @@ def status_command(_: argparse.Namespace) -> int:
                 f"max_budget_usd={config[provider].get('max_budget_usd')}"
             )
         command = PROVIDER_BINARIES[provider]
-        readiness = provider_readiness(provider)
+        readiness = provider_readiness(provider, str(model))
         print(
             f"{provider}: {state}, model={model}{policy}, "
             f"CLI={version_of(command)}, "
@@ -2637,6 +3085,10 @@ def status_command(_: argparse.Namespace) -> int:
         )
         if config[provider]["enabled"] and not readiness.ready:
             ready = False
+    print(
+        "workflow: "
+        f"max_budget_usd={config['workflow'].get('max_budget_usd')}"
+    )
     print(f"Review artifacts: {RUNS_DIR}")
     return 0 if ready else 3
 
@@ -2650,7 +3102,9 @@ def toggle_command(args: argparse.Namespace) -> int:
     write_config(config)
     print(f"{provider} {args.action}d in {CONFIG_PATH}")
     if args.action == "enable":
-        readiness = provider_readiness(provider)
+        readiness = provider_readiness(
+            provider, str(config[provider]["model"])
+        )
         if not readiness.ready:
             print(f"Warning: {provider} is not ready: {readiness.detail}.")
     return 0
@@ -2680,6 +3134,16 @@ def set_budget_command(args: argparse.Namespace) -> int:
     config["claude"]["max_budget_usd"] = args.usd
     write_config(config)
     print(f"claude max budget set to ${args.usd:.2f} in {CONFIG_PATH}")
+    return 0
+
+
+def set_workflow_budget_command(args: argparse.Namespace) -> int:
+    if not math.isfinite(args.usd) or args.usd <= 0:
+        raise ReviewError("Workflow budget must be a positive USD amount.")
+    config = load_config()
+    config["workflow"]["max_budget_usd"] = args.usd
+    write_config(config)
+    print(f"workflow max budget set to ${args.usd:.2f} in {CONFIG_PATH}")
     return 0
 
 
@@ -2766,6 +3230,7 @@ def claude_cli_contract() -> tuple[bool, str]:
     required = {
         "--effort",
         "--max-budget-usd",
+        "--json-schema",
         "--permission-mode",
         "--tools",
         "--safe-mode",
@@ -2794,7 +3259,13 @@ def claude_cli_contract() -> tuple[bool, str]:
 
 def private_storage_permissions() -> tuple[bool, str]:
     checked: list[str] = []
-    for path in (CONFIG_DIR, CONFIG_PATH, RUNS_DIR, WORKFLOWS_DIR):
+    for path in (
+        CONFIG_DIR,
+        CONFIG_PATH,
+        RUNS_DIR,
+        WORKFLOWS_DIR,
+        SENSITIVE_SCANS_DIR,
+    ):
         if not path.exists():
             continue
         try:
@@ -2835,7 +3306,9 @@ def doctor_command(args: argparse.Namespace) -> int:
         }
     )
     for provider in PROVIDERS:
-        readiness = provider_readiness(provider)
+        readiness = provider_readiness(
+            provider, str(config[provider]["model"])
+        )
         checks.append(
             {
                 "name": f"{provider}_static_readiness",
@@ -2870,7 +3343,7 @@ def doctor_command(args: argparse.Namespace) -> int:
                         "--claude-effort",
                         "low",
                         "--claude-max-budget-usd",
-                        "0.05",
+                        str(DOCTOR_CLAUDE_BUDGET_USD),
                     ]
                 )
                 try:
@@ -3351,6 +3824,428 @@ def attest_commit_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def sensitive_scan_command(args: argparse.Namespace) -> int:
+    os.umask(0o077)
+    repo = resolve_repo(args.repo)
+    scope = resolve_scope(args, repo)
+    path_filters = normalize_path_filters(repo, args.path)
+    paths = changed_paths(repo, scope, path_filters)
+    patch = render_patch(repo, scope, path_filters)
+    if not paths and not patch.strip():
+        raise ReviewError(f"No changes found for {scope.label}.")
+    repository = repository_metadata(repo)
+    source_fingerprint = fingerprint(repo, scope, paths, path_filters)
+    blocked_paths = sorted(
+        {
+            path
+            for path in paths
+            if is_sensitive_path(path) or (repo / path).is_symlink()
+        }
+    )
+    with tempfile.TemporaryDirectory(prefix="mm-review-scan-") as temporary:
+        scan_dir = Path(temporary)
+        snapshot_dir = create_snapshot(repo, scope, paths, scan_dir)
+        current_paths = changed_paths(repo, scope, path_filters)
+        current_fingerprint = fingerprint(
+            repo, scope, current_paths, path_filters
+        )
+        if paths != current_paths or source_fingerprint != current_fingerprint:
+            raise ReviewError(
+                "The review scope changed during sensitive preflight; rerun "
+                "against a stable tree."
+            )
+        external_symlinks = external_snapshot_symlinks(snapshot_dir)
+        findings = sensitive_content_findings(snapshot_dir, paths, patch)
+    token = None
+    if args.approve_findings and findings and not blocked_paths and not external_symlinks:
+        token = create_sensitive_scan_token(
+            repository=repository,
+            scope=scope,
+            path_filters=path_filters,
+            paths=paths,
+            source_fingerprint=source_fingerprint,
+            findings=findings,
+        )
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "repository": repository,
+        "scope": dataclasses.asdict(scope),
+        "path_filters": list(path_filters),
+        "paths": paths,
+        "source_fingerprint": source_fingerprint,
+        "blocked_paths": blocked_paths,
+        "external_symlinks": external_symlinks,
+        "sensitive_findings": [
+            dataclasses.asdict(finding) for finding in findings
+        ],
+        "approved_token": token,
+    }
+    print(json.dumps(result, indent=2))
+    if blocked_paths or external_symlinks:
+        return 3
+    if findings and not token:
+        return 3
+    return 0
+
+
+def persist_review_results(
+    *,
+    run_dir: Path,
+    metadata: dict[str, Any],
+    reviewers: Sequence[Reviewer],
+    results: Sequence[ReviewResult],
+) -> tuple[list[str], list[str]]:
+    definitions = {reviewer.name: reviewer for reviewer in reviewers}
+    reviewer_metadata = metadata.get("reviewers")
+    if not isinstance(reviewer_metadata, dict):
+        reviewer_metadata = {}
+    result_by_name = {result.name: result for result in results}
+    for name, result in result_by_name.items():
+        definition = definitions[name]
+        report = result.report_path.read_text(encoding="utf-8")
+        parsed = parse_review_report(
+            name, report, risk_profiled=bool(metadata.get("risks"))
+        )
+        reviewer_metadata[name] = {
+            "model": definition.model,
+            "cli_version": definition.cli_version,
+            "started_at": result.started_at,
+            "completed_at": result.completed_at,
+            "duration_seconds": round(result.duration_seconds, 3),
+            "exit_code": result.returncode,
+            "timed_out": result.timed_out,
+            "failure_category": result.failure_category,
+            "report": result.report_path.name,
+            "report_sha256": sha256_text(report),
+            "stderr": result.error_path.name,
+            "usage": result.usage,
+            "verdict": parsed["verdict"],
+            "finding_counts": parsed["finding_counts"],
+            "test_gap_counts": parsed["test_gap_counts"],
+        }
+
+    parsed_reviews: dict[str, Any] = {}
+    invalid_reports: list[str] = []
+    failed_reviewers: list[str] = []
+    all_findings: list[dict[str, Any]] = []
+    all_test_gaps: list[dict[str, Any]] = []
+    for name, item in reviewer_metadata.items():
+        if not isinstance(item, dict) or "exit_code" not in item:
+            continue
+        report_path = run_dir / str(item.get("report") or f"{name}.md")
+        report = report_path.read_text(encoding="utf-8") if report_path.exists() else ""
+        parsed = parse_review_report(
+            str(name), report, risk_profiled=bool(metadata.get("risks"))
+        )
+        parsed_reviews[str(name)] = parsed
+        if int(item.get("exit_code") or 0) != 0:
+            item["report_contract_valid"] = False
+            failed_reviewers.append(str(name))
+            continue
+        invalid = parsed_report_is_invalid(parsed)
+        item["report_contract_valid"] = not invalid
+        if invalid:
+            invalid_reports.append(str(name))
+        all_findings.extend(parsed["findings"])
+        all_test_gaps.extend(parsed["test_gaps"])
+
+    attach_prior_matches(
+        [*all_findings, *all_test_gaps],
+        workflow_identifier=str(metadata["workflow_id"]),
+        repository_id=str(metadata["repository"]["id"]),
+        current_run_id=str(metadata["run_id"]),
+    )
+    previous_by_id: dict[tuple[str, str], dict[str, Any]] = {}
+    triage_path = run_dir / "triage.json"
+    if triage_path.exists():
+        for item in triage_items(read_json(triage_path)):
+            previous_by_id[(str(item.get("reviewer")), str(item.get("id")))] = item
+
+    def triage_entry(item: dict[str, Any]) -> dict[str, Any]:
+        previous = previous_by_id.get(
+            (str(item.get("reviewer")), str(item.get("id")))
+        )
+        if previous:
+            return {**item, **{key: value for key, value in previous.items() if key not in item}}
+        return {
+            **item,
+            "decision": "pending",
+            "evidence": None,
+            "action": None,
+            "verification": None,
+        }
+
+    safe_write_json(
+        run_dir / "review-summary.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": metadata["run_id"],
+            "reviews": parsed_reviews,
+        },
+    )
+    safe_write_json(
+        triage_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": metadata["run_id"],
+            "created_at": (
+                read_json(triage_path).get("created_at")
+                if triage_path.exists()
+                else utc_now()
+            ),
+            "updated_at": utc_now(),
+            "findings": [triage_entry(item) for item in all_findings],
+            "test_gaps": [triage_entry(item) for item in all_test_gaps],
+        },
+    )
+    completed_at = dt.datetime.now(dt.timezone.utc)
+    started_at = dt.datetime.fromisoformat(
+        str(metadata.get("started_at") or metadata["created_at"])
+    )
+    usable_successes = [
+        name
+        for name, parsed in parsed_reviews.items()
+        if name not in failed_reviewers
+        and name not in invalid_reports
+        and parsed["verdict"] != "UNKNOWN"
+    ]
+    status = "completed"
+    failure: dict[str, Any] | None = None
+    if failed_reviewers:
+        status = "partial" if usable_successes else "failed"
+        failure = {
+            "type": "reviewer_failure",
+            "reviewers": sorted(failed_reviewers),
+            "categories": {
+                name: reviewer_metadata[name].get("failure_category")
+                for name in failed_reviewers
+            },
+            "successful_reviewers": sorted(usable_successes),
+        }
+        if invalid_reports:
+            failure["invalid_reports"] = sorted(invalid_reports)
+    elif invalid_reports:
+        status = "failed"
+        failure = {
+            "type": "invalid_report",
+            "reviewers": sorted(invalid_reports),
+        }
+    metadata.update(
+        {
+            "status": status,
+            "completed_at": completed_at.isoformat(),
+            "duration_seconds": round(
+                (completed_at - started_at).total_seconds(), 3
+            ),
+            "reviewers": reviewer_metadata,
+        }
+    )
+    if failure:
+        metadata["failure"] = failure
+    else:
+        metadata.pop("failure", None)
+        metadata.pop("terminal_error", None)
+    safe_write_json(run_dir / "metadata.json", metadata)
+    return sorted(failed_reviewers), sorted(invalid_reports)
+
+
+def resume_review_command(args: argparse.Namespace) -> int:
+    os.umask(0o077)
+    run_dir = resolve_run_dir(args.run)
+    with exclusive_file_lock(run_dir / "resume"):
+        return resume_review_locked(run_dir)
+
+
+def resume_review_locked(run_dir: Path) -> int:
+    metadata = read_json(run_dir / "metadata.json")
+    resume_terminal_status = (
+        "partial" if metadata.get("status") == "partial" else "failed"
+    )
+    if metadata.get("status") not in {"partial", "failed"}:
+        raise ReviewError("Only a partial or failed reviewer run can be resumed.")
+    failure = metadata.get("failure")
+    if not isinstance(failure, dict) or failure.get("type") != "reviewer_failure":
+        raise ReviewError("This run did not fail because a reviewer invocation failed.")
+    require_active_workflow(str(metadata.get("workflow_id")))
+    reviewer_metadata = metadata.get("reviewers")
+    if not isinstance(reviewer_metadata, dict):
+        raise ReviewError("The run has no reviewer invocation metadata to resume.")
+    failed_names = sorted(
+        str(name)
+        for name, item in reviewer_metadata.items()
+        if isinstance(item, dict) and int(item.get("exit_code") or 0) != 0
+    )
+    if not failed_names:
+        raise ReviewError("The run has no failed reviewers to resume.")
+    repository = metadata.get("repository")
+    scope_value = metadata.get("scope")
+    if not isinstance(repository, dict) or not isinstance(scope_value, dict):
+        raise ReviewError("The run has incomplete repository or scope metadata.")
+    repo = resolve_repo(str(repository.get("root")))
+    scope = Scope(
+        str(scope_value.get("kind")),
+        scope_value.get("value"),
+        str(scope_value.get("label")),
+    )
+    path_filters = tuple(str(item) for item in metadata.get("path_filters", []))
+    paths = [str(item) for item in metadata.get("paths", [])]
+    current_paths = changed_paths(repo, scope, path_filters)
+    current_fingerprint = fingerprint(repo, scope, current_paths, path_filters)
+    if current_paths != paths or current_fingerprint != metadata.get("source_fingerprint"):
+        raise ReviewError(
+            "Cannot resume because the task-scoped source no longer matches the "
+            "partial run. Start a new workflow round."
+        )
+    for other_dir, other in workflow_runs(str(metadata["workflow_id"])):
+        if other_dir == run_dir or other.get("status") != "completed":
+            continue
+        other_repo = other.get("repository")
+        if (
+            isinstance(other_repo, dict)
+            and str(other_repo.get("id")) == str(repository.get("id"))
+            and str(other.get("created_at", "")) > str(metadata.get("created_at", ""))
+        ):
+            raise ReviewError(
+                "A later completed run already exists for this repository and "
+                "workflow; the partial run cannot be resumed."
+            )
+
+    command = ["run", "--repo", str(repo)]
+    for provider in PROVIDERS:
+        command.append(
+            f"--with-{provider}" if provider in failed_names else f"--without-{provider}"
+        )
+    policy = metadata.get("review_policy")
+    if not isinstance(policy, dict):
+        policy = {}
+    claude = reviewer_metadata.get("claude")
+    if "claude" in failed_names and isinstance(claude, dict):
+        command.extend(["--claude-model", str(claude.get("model") or "sonnet")])
+        command.extend(
+            ["--claude-effort", str(policy.get("claude_effort") or "medium")]
+        )
+        command.extend(
+            [
+                "--claude-max-budget-usd",
+                str(policy.get("claude_max_budget_usd") or 1.25),
+            ]
+        )
+    antigravity = reviewer_metadata.get("antigravity")
+    if "antigravity" in failed_names and isinstance(antigravity, dict):
+        command.extend(
+            ["--antigravity-model", str(antigravity.get("model") or "auto")]
+        )
+    kimi = reviewer_metadata.get("kimi")
+    if "kimi" in failed_names and isinstance(kimi, dict):
+        command.extend(["--kimi-model", str(kimi.get("model") or "k3-256k")])
+    review_args = build_parser().parse_args(command)
+    reviewers = reviewer_definitions(review_args, load_config())
+    reviewers, budget = apply_workflow_budget(
+        reviewers,
+        str(metadata["workflow_id"]),
+        reservation_id=str(metadata["run_id"]),
+    )
+
+    snapshot_dir = run_dir / "snapshot"
+    try:
+        clear_ephemeral_snapshot(run_dir)
+        snapshot_dir = create_snapshot(repo, scope, paths, run_dir)
+        if external_snapshot_symlinks(snapshot_dir):
+            raise ReviewError(
+                "Cannot resume because the recreated snapshot has an external symlink."
+            )
+        patch = (run_dir / "change.patch").read_text(encoding="utf-8")
+        content_findings = sensitive_content_findings(snapshot_dir, paths, patch)
+        known_ids = {item.identifier for item in content_findings}
+        allowed_ids = set(metadata.get("allowed_sensitive_findings", []))
+        if known_ids - allowed_ids and not metadata.get("sensitive_override"):
+            raise ReviewError(
+                "Cannot resume because the recreated snapshot has unapproved "
+                "sensitive findings. Run a fresh sensitive preflight."
+            )
+        metadata.update(
+            {
+                "status": "running",
+                "resumed_at": utc_now(),
+                "heartbeat_at": utc_now(),
+                "runner_pid": os.getpid(),
+                "workflow_budget": budget,
+            }
+        )
+        metadata.pop("terminal_error", None)
+        safe_write_json(run_dir / "metadata.json", metadata)
+        prompt = (run_dir / "prompt.md").read_text(encoding="utf-8")
+        process_registry = ReviewerProcessRegistry()
+        timeout_seconds = int(policy.get("timeout_minutes") or DEFAULT_TIMEOUT_MINUTES) * 60
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(reviewers)
+        ) as executor:
+            futures = [
+                executor.submit(
+                    invoke_reviewer,
+                    reviewer,
+                    repo=snapshot_dir,
+                    prompt=prompt,
+                    run_dir=run_dir,
+                    timeout_seconds=timeout_seconds,
+                    process_registry=process_registry,
+                )
+                for reviewer in reviewers
+            ]
+            results = [future.result() for future in futures]
+        after_paths = changed_paths(repo, scope, path_filters)
+        after = fingerprint(repo, scope, after_paths, path_filters)
+        if after_paths != paths or after != current_fingerprint:
+            raise ReviewError(
+                "The task-scoped source changed while failed reviewers were resumed."
+            )
+        failures, invalid_reports = persist_review_results(
+            run_dir=run_dir,
+            metadata=metadata,
+            reviewers=reviewers,
+            results=results,
+        )
+        if failures:
+            raise ReviewError(
+                "Resumed reviewers still failed: " + ", ".join(failures)
+            )
+        if invalid_reports:
+            raise ReviewError(
+                "Resumed reviewer output failed the report contract: "
+                + ", ".join(invalid_reports)
+            )
+        print(f"Review resumed and completed: {run_dir}")
+        return 0
+    except ReviewError as exc:
+        current_status = read_json(run_dir / "metadata.json").get("status")
+        update_terminal_error(
+            run_dir,
+            error_type=type(exc).__name__,
+            message=str(exc),
+            status=(
+                "partial"
+                if current_status == "partial" or resume_terminal_status == "partial"
+                else "failed"
+            ),
+            completed_at=utc_now(),
+        )
+        raise
+    except Exception as exc:
+        update_terminal_error(
+            run_dir,
+            error_type=type(exc).__name__,
+            message=str(exc),
+            status=resume_terminal_status,
+            completed_at=utc_now(),
+        )
+        raise
+    finally:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+        release_workflow_budget_reservation(
+            str(metadata["workflow_id"]), str(metadata["run_id"])
+        )
+
+
 def run_review_command(args: argparse.Namespace) -> int:
     os.umask(0o077)
     config = load_config()
@@ -3365,13 +4260,12 @@ def run_review_command(args: argparse.Namespace) -> int:
     repository = repository_metadata(repo)
     selected_workflow = args.workflow_id or workflow_id()
     if args.workflow_id:
-        if not workflow_path(selected_workflow).exists():
-            raise ReviewError(
-                f"Unknown workflow {selected_workflow}. Create it with "
-                "`mm-review workflow start`."
-            )
+        require_active_workflow(selected_workflow)
     else:
-        create_workflow(selected_workflow)
+        create_workflow(
+            selected_workflow,
+            max_budget_usd=float(config["workflow"]["max_budget_usd"]),
+        )
     existing_rounds = [
         int(metadata.get("round", 0))
         for _, metadata in workflow_runs(selected_workflow)
@@ -3405,12 +4299,24 @@ def run_review_command(args: argparse.Namespace) -> int:
         "patch_sha256": sha256_text(patch),
         "sensitive_override": bool(args.allow_sensitive_paths),
         "allowed_sensitive_findings": sorted(set(args.allow_sensitive_finding)),
+        "sensitive_scan_token": args.sensitive_scan_token,
     }
     safe_write_json(run_dir / "metadata.json", metadata)
 
     snapshot_dir = run_dir / "snapshot"
+    scan_token_path: Path | None = None
+    scan_token_value: dict[str, Any] | None = None
     try:
         before = fingerprint(repo, scope, paths, path_filters)
+        if args.sensitive_scan_token:
+            scan_token_path, scan_token_value = validate_sensitive_scan_token(
+                args.sensitive_scan_token,
+                repository=repository,
+                scope=scope,
+                path_filters=path_filters,
+                paths=paths,
+                source_fingerprint=before,
+            )
         validate_workflow_phase(
             selected_workflow,
             str(repository["id"]),
@@ -3445,6 +4351,9 @@ def run_review_command(args: argparse.Namespace) -> int:
             )
 
         reviewers = reviewer_definitions(args, config)
+        reviewers, workflow_budget = apply_workflow_budget(
+            reviewers, selected_workflow, reservation_id=run_id
+        )
         snapshot_dir = create_snapshot(repo, scope, paths, run_dir)
         snapshot_paths = changed_paths(repo, scope, path_filters)
         snapshot_source_fingerprint = fingerprint(
@@ -3458,7 +4367,12 @@ def run_review_command(args: argparse.Namespace) -> int:
 
         external_symlinks = external_snapshot_symlinks(snapshot_dir)
         content_findings = sensitive_content_findings(snapshot_dir, paths, patch)
-        allowed_ids = set(args.allow_sensitive_finding)
+        token_allowed_ids = set(
+            scan_token_value.get("allowed_sensitive_findings", [])
+            if scan_token_value
+            else []
+        )
+        allowed_ids = set(args.allow_sensitive_finding) | token_allowed_ids
         known_ids = {item.identifier for item in content_findings}
         unknown_ids = sorted(allowed_ids - known_ids)
         if unknown_ids:
@@ -3472,6 +4386,7 @@ def run_review_command(args: argparse.Namespace) -> int:
         metadata["sensitive_findings"] = [
             dataclasses.asdict(item) for item in content_findings
         ]
+        metadata["allowed_sensitive_findings"] = sorted(allowed_ids)
         if external_symlinks:
             details = [
                 f"- external symlink: {path}" for path in external_symlinks
@@ -3546,6 +4461,7 @@ def run_review_command(args: argparse.Namespace) -> int:
                         else config["claude"].get("max_budget_usd", 1.25)
                     ),
                 },
+                "workflow_budget": workflow_budget,
                 "reviewers": {
                     reviewer.name: {
                         "model": reviewer.model,
@@ -3556,6 +4472,8 @@ def run_review_command(args: argparse.Namespace) -> int:
             }
         )
         safe_write_json(run_dir / "metadata.json", metadata)
+        if scan_token_path and scan_token_value:
+            consume_sensitive_scan_token(scan_token_path, scan_token_value)
 
         print(
             f"Running {', '.join(reviewer.name for reviewer in reviewers)} "
@@ -3620,134 +4538,13 @@ def run_review_command(args: argparse.Namespace) -> int:
                 "rollback was attempted."
             )
 
-        parsed_reviews: dict[str, Any] = {}
-        result_metadata: dict[str, Any] = {}
-        failures = [result for result in results if result.returncode != 0]
-        invalid_reports: list[str] = []
-        all_findings: list[dict[str, Any]] = []
-        all_test_gaps: list[dict[str, Any]] = []
-        for result in results:
-            report = result.report_path.read_text(encoding="utf-8")
-            parsed = parse_review_report(
-                result.name, report, risk_profiled=bool(args.risk)
-            )
-            if parsed["verdict"] == "UNKNOWN":
-                invalid_reports.append(result.name)
-            if parsed["invalid_test_gap_severities"]:
-                invalid_reports.append(result.name)
-            if (
-                parsed["verdict"] == "PASS_CLEAN"
-                and (parsed["findings"] or parsed["test_gaps"])
-            ):
-                invalid_reports.append(result.name)
-            if (
-                parsed["verdict"] == "PASS_WITH_FINDINGS"
-                and not (parsed["findings"] or parsed["test_gaps"])
-            ):
-                invalid_reports.append(result.name)
-            if parsed["verdict"] == "BLOCK" and not any(
-                finding["severity"] in {"blocker", "high"}
-                for finding in parsed["findings"]
-            ):
-                invalid_reports.append(result.name)
-            parsed_reviews[result.name] = parsed
-            all_findings.extend(parsed["findings"])
-            all_test_gaps.extend(parsed["test_gaps"])
-            result_metadata[result.name] = {
-                "model": next(
-                    reviewer.model
-                    for reviewer in reviewers
-                    if reviewer.name == result.name
-                ),
-                "cli_version": next(
-                    reviewer.cli_version
-                    for reviewer in reviewers
-                    if reviewer.name == result.name
-                ),
-                "started_at": result.started_at,
-                "completed_at": result.completed_at,
-                "duration_seconds": round(result.duration_seconds, 3),
-                "exit_code": result.returncode,
-                "timed_out": result.timed_out,
-                "failure_category": result.failure_category,
-                "report": result.report_path.name,
-                "report_sha256": sha256_text(report),
-                "stderr": result.error_path.name,
-                "usage": result.usage,
-                "verdict": parsed["verdict"],
-                "finding_counts": parsed["finding_counts"],
-                "test_gap_counts": parsed["test_gap_counts"],
-            }
-
-        attach_prior_matches(
-            [*all_findings, *all_test_gaps],
-            workflow_identifier=selected_workflow,
-            repository_id=str(repository["id"]),
-            current_run_id=run_id,
+        failures, invalid_reports = persist_review_results(
+            run_dir=run_dir,
+            metadata=metadata,
+            reviewers=reviewers,
+            results=results,
         )
-        safe_write_json(
-            run_dir / "review-summary.json",
-            {
-                "schema_version": SCHEMA_VERSION,
-                "run_id": run_id,
-                "reviews": parsed_reviews,
-            },
-        )
-        safe_write_json(
-            run_dir / "triage.json",
-            {
-                "schema_version": SCHEMA_VERSION,
-                "run_id": run_id,
-                "created_at": utc_now(),
-                "updated_at": utc_now(),
-                "findings": [
-                    {
-                        **finding,
-                        "decision": "pending",
-                        "evidence": None,
-                        "action": None,
-                        "verification": None,
-                    }
-                    for finding in all_findings
-                ],
-                "test_gaps": [
-                    {
-                        **test_gap,
-                        "decision": "pending",
-                        "evidence": None,
-                        "action": None,
-                        "verification": None,
-                    }
-                    for test_gap in all_test_gaps
-                ],
-            },
-        )
-        completed_at = dt.datetime.now(dt.timezone.utc)
-        started_at = dt.datetime.fromisoformat(str(metadata["started_at"]))
-        metadata.update(
-            {
-                "status": "completed" if not failures and not invalid_reports else "failed",
-                "completed_at": completed_at.isoformat(),
-                "duration_seconds": round(
-                    (completed_at - started_at).total_seconds(), 3
-                ),
-                "reviewers": result_metadata,
-            }
-        )
-        if failures:
-            metadata["failure"] = {
-                "type": "reviewer_failure",
-                "reviewers": [item.name for item in failures],
-                "categories": {
-                    item.name: item.failure_category for item in failures
-                },
-            }
-        elif invalid_reports:
-            metadata["failure"] = {
-                "type": "invalid_report",
-                "reviewers": sorted(set(invalid_reports)),
-            }
-        safe_write_json(run_dir / "metadata.json", metadata)
+        parsed_reviews = read_json(run_dir / "review-summary.json")["reviews"]
 
         print(f"Review artifacts: {run_dir}")
         print(
@@ -3769,7 +4566,9 @@ def run_review_command(args: argparse.Namespace) -> int:
                 print(f"  private stderr={result.error_path}")
         if failures:
             raise ReviewError(
-                "One or more reviewers failed. Successful reports were preserved."
+                "One or more reviewers failed. Successful reports were preserved; "
+                f"retry only the failed providers with `mm-review resume --run "
+                f"{run_dir}` after readiness is restored."
             )
         if invalid_reports:
             raise ReviewError(
@@ -3797,28 +4596,28 @@ def run_review_command(args: argparse.Namespace) -> int:
         )
         raise
     except ReviewError as exc:
-        update_metadata(
+        current_status = read_json(run_dir / "metadata.json").get("status")
+        update_terminal_error(
             run_dir,
-            status="failed",
+            error_type=type(exc).__name__,
+            message=str(exc),
+            status=("partial" if current_status == "partial" else "failed"),
             completed_at=utc_now(),
             duration_seconds=elapsed_since(
                 str(metadata.get("started_at") or metadata.get("created_at"))
             ),
-            failure={"type": type(exc).__name__, "message": str(exc)},
         )
         raise
     except Exception as exc:
-        update_metadata(
+        update_terminal_error(
             run_dir,
+            error_type=type(exc).__name__,
+            message="Unexpected internal runner failure.",
             status="failed",
             completed_at=utc_now(),
             duration_seconds=elapsed_since(
                 str(metadata.get("started_at") or metadata.get("created_at"))
             ),
-            failure={
-                "type": type(exc).__name__,
-                "message": "Unexpected internal runner failure.",
-            },
         )
         raise ReviewError(
             f"Unexpected runner failure; private diagnostics are in {run_dir}: "
@@ -3826,6 +4625,7 @@ def run_review_command(args: argparse.Namespace) -> int:
         ) from exc
     finally:
         shutil.rmtree(snapshot_dir, ignore_errors=True)
+        release_workflow_budget_reservation(selected_workflow, run_id)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3870,6 +4670,16 @@ def build_parser() -> argparse.ArgumentParser:
         "set-budget", help="Set Claude's per-review maximum budget in USD"
     )
     set_budget.add_argument("usd", type=float)
+    set_workflow_budget = subparsers.add_parser(
+        "set-workflow-budget", help="Set the default cumulative workflow budget"
+    )
+    set_workflow_budget.add_argument("usd", type=float)
+    analytics = subparsers.add_parser(
+        "analytics", help="Summarize recent review outcomes, failures, and spend"
+    )
+    analytics.add_argument(
+        "--since-days", type=int, default=DEFAULT_ANALYTICS_DAYS
+    )
 
     workflow = subparsers.add_parser(
         "workflow", help="Manage a review workflow spanning one or more repositories"
@@ -3881,6 +4691,7 @@ def build_parser() -> argparse.ArgumentParser:
         "start", help="Create and print a workflow ID"
     )
     workflow_start.add_argument("--name", help="Optional human-readable task name")
+    workflow_start.add_argument("--max-budget-usd", type=float)
     workflow_status_parser = workflow_subparsers.add_parser(
         "status", help="Check latest finalized round for each repository"
     )
@@ -3889,6 +4700,32 @@ def build_parser() -> argparse.ArgumentParser:
         "finalize", help="Write a final workflow PASS if every repository is ready"
     )
     workflow_finalize_parser.add_argument("workflow_id")
+    workflow_supersede_parser = workflow_subparsers.add_parser(
+        "supersede", help="Link a closed or changed workflow to its successor"
+    )
+    workflow_supersede_parser.add_argument("workflow_id")
+    workflow_supersede_parser.add_argument("--reason", required=True)
+    workflow_supersede_parser.add_argument("--name")
+    workflow_supersede_parser.add_argument(
+        "--by", help="Existing successor workflow; otherwise create one"
+    )
+
+    scan_parser = subparsers.add_parser(
+        "scan", help="Run secret/symlink preflight without creating a review run"
+    )
+    scan_parser.add_argument(
+        "--repo", default=".", help="Path inside the target Git repository"
+    )
+    scan_scope = scan_parser.add_mutually_exclusive_group()
+    scan_scope.add_argument("--uncommitted", action="store_true")
+    scan_scope.add_argument("--base")
+    scan_scope.add_argument("--commit")
+    scan_parser.add_argument("--path", action="append", default=[])
+    scan_parser.add_argument(
+        "--approve-findings",
+        action="store_true",
+        help="Create a one-shot exact-fingerprint approval token",
+    )
 
     run_parser = subparsers.add_parser("run", help="Run a review round")
     run_parser.add_argument(
@@ -3997,6 +4834,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Allow one exact redacted secret-scan finding ID; repeat as needed",
     )
+    run_parser.add_argument(
+        "--sensitive-scan-token",
+        help="Consume one exact-fingerprint token created by `mm-review scan`",
+    )
+
+    resume = subparsers.add_parser(
+        "resume", help="Retry only failed reviewers for a fresh partial run"
+    )
+    resume.add_argument("--run", required=True, help="Partial review run directory")
 
     decide = subparsers.add_parser(
         "decide", help="Record Codex's evidence-backed disposition for one finding"
@@ -4085,6 +4931,10 @@ def main() -> int:
             return set_effort_command(args)
         if args.command == "set-budget":
             return set_budget_command(args)
+        if args.command == "set-workflow-budget":
+            return set_workflow_budget_command(args)
+        if args.command == "analytics":
+            return analytics_command(args)
         if args.command == "workflow":
             if args.workflow_command == "start":
                 return workflow_start_command(args)
@@ -4092,6 +4942,12 @@ def main() -> int:
                 return workflow_status_command(args)
             if args.workflow_command == "finalize":
                 return workflow_finalize_command(args)
+            if args.workflow_command == "supersede":
+                return workflow_supersede_command(args)
+        if args.command == "scan":
+            return sensitive_scan_command(args)
+        if args.command == "resume":
+            return resume_review_command(args)
         if args.command == "decide":
             for field in ("evidence", "action", "verification"):
                 value = getattr(args, field, None)

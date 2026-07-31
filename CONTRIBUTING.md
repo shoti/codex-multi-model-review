@@ -20,7 +20,9 @@ Clone the repository and run the checks:
 ```bash
 git clone https://github.com/shoti/codex-multi-model-review.git
 cd codex-multi-model-review
-python3 -m py_compile skills/multi-model-review/scripts/mm_review.py
+python3 -m py_compile \
+  skills/multi-model-review/scripts/mm_review.py \
+  skills/multi-model-review/scripts/review_contract.py
 python3 skills/multi-model-review/scripts/test_mm_review.py
 git diff --check
 ```
@@ -50,7 +52,8 @@ The following are deliberate safety properties:
 - Repair rounds are bounded and followed by a mandatory confirmation.
 - Source fingerprints make stale final gates fail closed.
 - Credentials and likely secret material are blocked before provider review.
-- Claude reviews have a configured spend cap; other providers are opt-in.
+- Claude reviews have both per-call and cumulative workflow spend caps; other
+  providers are opt-in.
 
 Changes that weaken an invariant need explicit rationale, tests, and a migration
 story for existing review artifacts.
