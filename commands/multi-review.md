@@ -43,17 +43,22 @@ repository. Do not stop after collecting reviewer reports.
 ## Plan
 
 State repositories, path filters, scope, risk profiles, and enabled reviewers.
-Create one workflow ID for the task. Claude, Antigravity, and Kimi receive fresh
-independent read-only sessions when enabled. Codex remains implementer, finding
-verifier, and final gate.
+Create one workflow ID for the task with a deliberate cumulative Claude budget.
+Claude, Antigravity, and Kimi receive fresh independent read-only sessions when
+enabled. Codex remains implementer, finding verifier, and final gate.
 
 ## Commands
 
-1. Run `mm-review workflow start`, then run `--phase repair` in each affected
+1. Run `mm-review workflow start --max-budget-usd <cap>`, then run
+   `--phase repair` in each affected
    repository with the same workflow ID, explicit `--path` filters, task
    intent, risks, review profile, and any provider override. Round numbering is
    automatic.
+   If secret screening reports intentional test material, inspect it using
+   `mm-review scan` with the same scope and paths, then use its one-shot token.
 2. Read every reviewer report completely.
+   If a run is `partial`, keep the source unchanged and use `mm-review resume`
+   so only failed reviewers are retried.
 3. Independently trace every finding and test gap against the actual code path.
    Record every result with `mm-review decide` or one atomic
    `mm-review decide-batch`; model agreement alone is not evidence.
@@ -66,8 +71,9 @@ verifier, and final gate.
    it stale; run another repair if needed.
 7. After at most three repairs, run one `--phase confirmation` with no planned
    source changes. Only that confirmation can be finalized. If scoped source
-   changes after confirmation, start a new workflow. Keep scope, path filters,
-   risks, review profile, and task text identical within one workflow.
+   changes after confirmation, explicitly use `workflow supersede` and review
+   under its successor. Keep scope, path filters, risks, review profile, and
+   task text identical within one workflow.
 
 Never allow an external reviewer to edit the working tree. Do not commit, push,
 open a PR, deploy, or change production state without separate authorization.

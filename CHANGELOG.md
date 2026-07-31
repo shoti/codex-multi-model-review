@@ -5,8 +5,38 @@ All notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- Resume partial runs against their original immutable snapshot without
+  reinvoking successful reviewers.
+- Enforce a configurable cumulative Claude budget across every workflow.
+- Add explicit successor workflow lineage for intentional post-confirmation or
+  contract changes.
+- Add fingerprint-bound, one-shot approvals for inspected secret-scan findings.
+- Add local evidence analytics for workflows, providers, failures, spend, and
+  decisions.
+- Validate the configured Kimi model alias before a review starts.
+
+### Security
+
+- Require Claude's JSON-schema report contract and normalize contradictory
+  clean verdicts fail-closed.
+- Preserve typed provider failures when terminal handling records an error.
+- Avoid duplicate secret findings from overlapping patch and source scans while
+  retaining coverage for deleted lines.
+- Reject new runs and resumes under superseded workflows, and preserve partial
+  state when an unexpected exception interrupts resume.
+- Reserve workflow budget atomically across concurrent runs, recreate stale
+  ephemeral snapshots on resume, narrow model-error classification, and retain
+  simultaneous provider and report-contract failures in analytics.
+- Serialize workflow supersession with budget reservation and release so
+  lineage changes cannot lose concurrent accounting updates.
+- Serialize overlapping resume attempts for one artifact across snapshot,
+  provider, and evidence writes.
+
 ### Changed
 
+- Extracted the reviewer report contract and parser into a focused module.
 - Clarified the reviewer report contract so inspection-budget limitations are
   recorded in Notes instead of producing an empty `PASS_WITH_FINDINGS`.
 - Recognize the first root commit as content-equivalent to a reviewed unborn

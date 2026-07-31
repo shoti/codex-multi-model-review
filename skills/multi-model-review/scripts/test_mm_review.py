@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -278,6 +279,13 @@ class RunnerUnitTests(unittest.TestCase):
         config["antigravity"]["enabled"] = False
         config["kimi"]["enabled"] = False
         seen_repositories: list[tuple[bool, list[Path]]] = []
+        seen_budgets: list[float | None] = []
+
+        def reviewer_definitions(
+            args: argparse.Namespace, _config: dict[str, object]
+        ) -> list[MM.Reviewer]:
+            seen_budgets.append(args.claude_max_budget_usd)
+            return [reviewer]
 
         def invoke(
             reviewer: MM.Reviewer,
@@ -343,7 +351,7 @@ class RunnerUnitTests(unittest.TestCase):
             mock.patch.object(
                 MM,
                 "reviewer_definitions",
-                return_value=[reviewer],
+                side_effect=reviewer_definitions,
             ),
             mock.patch.object(MM, "invoke_reviewer", side_effect=invoke),
             redirect_stdout(output),
@@ -355,12 +363,14 @@ class RunnerUnitTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(len(seen_repositories), 1)
         self.assertEqual(seen_repositories[0], (True, []))
+        self.assertEqual(seen_budgets, [MM.DOCTOR_CLAUDE_BUDGET_USD])
 
     def test_claude_cli_contract_checks_required_flags(self) -> None:
         help_text = " ".join(
             (
                 "--effort",
                 "--max-budget-usd",
+                "--json-schema",
                 "--permission-mode",
                 "--tools",
                 "--safe-mode",
@@ -1335,7 +1345,9 @@ None.
         config["antigravity"]["enabled"] = True
         config["kimi"]["enabled"] = False
 
-        def readiness(provider: str) -> MM.ProviderReadiness:
+        def readiness(
+            provider: str, _model: str | None = None
+        ) -> MM.ProviderReadiness:
             if provider == "antigravity":
                 return MM.ProviderReadiness(False, "not authenticated")
             return MM.ProviderReadiness(True, "available")
@@ -1691,7 +1703,738 @@ None.
             self.assertEqual(updated["test_gaps"][0]["decision"], "covered")
 
 
+    def test_kimi_readiness_requires_the_configured_model_alias(self) -> None:
+        payload = json.dumps(
+            {"providers": {"moonshot": {}}, "models": {"k3-256k": {}}}
+        )
+        with (
+            mock.patch.object(MM.shutil, "which", return_value="/fake/kimi"),
+            mock.patch.object(
+                MM.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    ["kimi", "provider", "list", "--json"],
+                    0,
+                    stdout=payload,
+                    stderr="",
+                ),
+            ),
+        ):
+            ready = MM.provider_readiness("kimi", "k3-256k")
+            missing = MM.provider_readiness("kimi", "k3")
+        self.assertTrue(ready.ready)
+        self.assertFalse(missing.ready)
+        self.assertIn("not configured", missing.detail)
+        self.assertEqual(missing.models, ("k3-256k",))
+
+    def test_kimi_model_failure_is_typed_and_records_meaningful_line(self) -> None:
+        detail = (
+            "kimi version 0.30.0\n"
+            'error: failed to run prompt: Model "k3" is not configured in config.toml.\n'
+        )
+        category = MM.classify_provider_failure(
+            returncode=1,
+            timed_out=False,
+            stdout="",
+            stderr=detail,
+        )
+        self.assertEqual(category, "model_not_configured")
+        MM.record_provider_failure("kimi", category, detail)
+        recorded = MM.read_json(MM.PROVIDER_HEALTH_PATH)["kimi"]
+        self.assertEqual(recorded["category"], "model_not_configured")
+        self.assertIn("not configured", recorded["detail"])
+        self.assertNotEqual(recorded["detail"], "kimi version 0.30.0")
+        unrelated = MM.classify_provider_failure(
+            returncode=1,
+            timed_out=False,
+            stdout='selected model "k3"\nerror: invalid file path',
+            stderr="",
+        )
+        self.assertEqual(unrelated, "provider_error")
+
+    def test_claude_structured_output_is_rendered_and_audited(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_claude = root / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import json
+                    print(json.dumps({
+                        "result": "fallback",
+                        "structured_output": {
+                            "verdict": "PASS_WITH_FINDINGS",
+                            "findings": [{
+                                "severity": "medium",
+                                "title": "Reachable defect",
+                                "location": "src/a.py:1",
+                                "trigger": "input",
+                                "evidence": "trace",
+                                "impact": "wrong result",
+                                "smallest_fix": "guard",
+                                "confidence": "high"
+                            }],
+                            "test_gaps": [],
+                            "notes": ["Static review"]
+                        },
+                        "total_cost_usd": 0.01
+                    }))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            reviewer = MM.Reviewer(
+                "claude", (str(fake_claude),), {}, "sonnet", "fake"
+            )
+            result = MM.invoke_reviewer(
+                reviewer,
+                repo=root,
+                prompt="Review.",
+                run_dir=root,
+                timeout_seconds=10,
+            )
+            report = result.report_path.read_text(encoding="utf-8")
+            structured = MM.read_json(root / "claude.structured.json")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("## [medium] Reachable defect", report)
+        self.assertEqual(structured["verdict"], "PASS_WITH_FINDINGS")
+
+    def test_claude_provider_error_records_the_provider_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_claude = root / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import json
+                    print(json.dumps({
+                        "is_error": True,
+                        "result": "Review budget was exhausted before completion.",
+                        "total_cost_usd": 0.06
+                    }))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            reviewer = MM.Reviewer(
+                "claude", (str(fake_claude),), {}, "sonnet", "fake"
+            )
+            with mock.patch.object(MM, "record_provider_failure") as record:
+                result = MM.invoke_reviewer(
+                    reviewer,
+                    repo=root,
+                    prompt="Review.",
+                    run_dir=root,
+                    timeout_seconds=10,
+                )
+        self.assertEqual(result.returncode, 1)
+        record.assert_called_once_with(
+            "claude",
+            "provider_error",
+            "Review budget was exhausted before completion.",
+        )
+
+    def test_pass_clean_with_items_is_safely_downgraded(self) -> None:
+        parsed = MM.parse_review_report(
+            "claude",
+            """# Verdict
+PASS_CLEAN
+
+# Findings
+None.
+
+# Test gaps
+## [low] Missing assertion
+- Needed test: assert the branch
+- Risk: regression
+""",
+        )
+        self.assertEqual(parsed["declared_verdict"], "PASS_CLEAN")
+        self.assertEqual(parsed["verdict"], "PASS_WITH_FINDINGS")
+        self.assertTrue(parsed["normalizations"])
+
+    def test_terminal_error_preserves_typed_root_cause(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "failure": {
+                        "type": "reviewer_failure",
+                        "reviewers": ["kimi"],
+                    }
+                },
+            )
+            MM.update_terminal_error(
+                run_dir,
+                error_type="ReviewError",
+                message="reviewer failed",
+                status="partial",
+            )
+            metadata = MM.read_json(run_dir / "metadata.json")
+        self.assertEqual(metadata["failure"]["type"], "reviewer_failure")
+        self.assertEqual(metadata["terminal_error"]["type"], "ReviewError")
+        self.assertEqual(metadata["status"], "partial")
+
+    def test_workflow_budget_caps_claude_and_blocks_when_exhausted(self) -> None:
+        reviewer = MM.Reviewer(
+            "claude",
+            ("claude", "--max-budget-usd", "1.25"),
+            {},
+            "sonnet",
+            "fake",
+        )
+        with (
+            mock.patch.object(MM, "workflow_budget_limit", return_value=1.0),
+            mock.patch.object(MM, "workflow_spend", return_value=0.7),
+        ):
+            adjusted, status = MM.apply_workflow_budget([reviewer], "wf-test")
+        self.assertEqual(adjusted[0].command[-1], "0.3")
+        self.assertEqual(status["remaining_before_run_usd"], 0.3)
+        with (
+            mock.patch.object(MM, "workflow_budget_limit", return_value=1.0),
+            mock.patch.object(MM, "workflow_spend", return_value=0.99),
+            self.assertRaisesRegex(MM.ReviewError, "exhausted"),
+        ):
+            MM.apply_workflow_budget([reviewer], "wf-test")
+
+    def test_workflow_budget_reservations_are_atomic(self) -> None:
+        reviewer = MM.Reviewer(
+            "claude",
+            ("claude", "--max-budget-usd", "1.25"),
+            {},
+            "sonnet",
+            "fake",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "workflow_spend", return_value=0.0),
+            ):
+                MM.create_workflow("wf-budget", max_budget_usd=2.0)
+                first, first_status = MM.apply_workflow_budget(
+                    [reviewer], "wf-budget", reservation_id="run-1"
+                )
+                second, second_status = MM.apply_workflow_budget(
+                    [reviewer], "wf-budget", reservation_id="run-2"
+                )
+                document = MM.read_json(workflows / "wf-budget.json")
+                first_budget = float(first[0].command[-1])
+                second_budget = float(second[0].command[-1])
+                self.assertEqual(first_budget + second_budget, 2.0)
+                self.assertEqual(first_status["reserved_before_run_usd"], 0.0)
+                self.assertEqual(second_status["reserved_before_run_usd"], 1.25)
+                self.assertEqual(len(document["budget_reservations"]), 2)
+                MM.release_workflow_budget_reservation("wf-budget", "run-1")
+                MM.release_workflow_budget_reservation("wf-budget", "run-2")
+                released = MM.read_json(workflows / "wf-budget.json")
+        self.assertEqual(released["budget_reservations"], {})
+
+    def test_mixed_reviewer_and_contract_failures_are_both_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            failed_report = run_dir / "kimi.md"
+            invalid_report = run_dir / "claude.md"
+            failed_error = run_dir / "kimi.stderr.log"
+            invalid_error = run_dir / "claude.stderr.log"
+            failed_report.write_text("", encoding="utf-8")
+            failed_error.write_text("provider failed", encoding="utf-8")
+            invalid_report.write_text(
+                "# Verdict\nBLOCK\n\n# Findings\nNone.\n\n"
+                "# Test gaps\nNone.\n",
+                encoding="utf-8",
+            )
+            invalid_error.write_text("", encoding="utf-8")
+            now = MM.utc_now()
+            metadata = {
+                "run_id": "run-mixed",
+                "workflow_id": "wf-mixed",
+                "repository": {"id": "repo-1"},
+                "created_at": now,
+                "started_at": now,
+                "risks": ["security"],
+            }
+            reviewers = [
+                MM.Reviewer("kimi", ("kimi",), {}, "k3", "fake"),
+                MM.Reviewer("claude", ("claude",), {}, "sonnet", "fake"),
+            ]
+            results = [
+                MM.ReviewResult(
+                    "kimi",
+                    1,
+                    failed_report,
+                    failed_error,
+                    now,
+                    now,
+                    0.1,
+                    False,
+                    None,
+                    "provider_error",
+                ),
+                MM.ReviewResult(
+                    "claude",
+                    0,
+                    invalid_report,
+                    invalid_error,
+                    now,
+                    now,
+                    0.1,
+                    False,
+                    None,
+                    None,
+                ),
+            ]
+            with mock.patch.object(MM, "workflow_runs", return_value=[]):
+                failures, invalid = MM.persist_review_results(
+                    run_dir=run_dir,
+                    metadata=metadata,
+                    reviewers=reviewers,
+                    results=results,
+                )
+            persisted = MM.read_json(run_dir / "metadata.json")
+        self.assertEqual(failures, ["kimi"])
+        self.assertEqual(invalid, ["claude"])
+        self.assertEqual(persisted["failure"]["type"], "reviewer_failure")
+        self.assertEqual(persisted["failure"]["invalid_reports"], ["claude"])
+
+    def test_workflow_supersede_links_both_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            with mock.patch.object(MM, "WORKFLOWS_DIR", workflows):
+                MM.create_workflow("wf-old", name="Old", max_budget_usd=7.0)
+                args = MM.build_parser().parse_args(
+                    [
+                        "workflow",
+                        "supersede",
+                        "wf-old",
+                        "--reason",
+                        "source changed after confirmation",
+                    ]
+                )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    MM.workflow_supersede_command(args)
+                replacement = output.getvalue().strip()
+                old = MM.read_json(workflows / "wf-old.json")
+                new = MM.read_json(workflows / f"{replacement}.json")
+        self.assertEqual(old["superseded_by"], replacement)
+        self.assertEqual(old["status"], "superseded")
+        self.assertEqual(new["supersedes"], ["wf-old"])
+        self.assertEqual(new["policy"]["max_budget_usd"], 7.0)
+
+    def test_workflow_supersede_waits_for_budget_writer_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            errors: list[Exception] = []
+            started = threading.Event()
+            finished = threading.Event()
+            with mock.patch.object(MM, "WORKFLOWS_DIR", workflows):
+                MM.create_workflow("wf-old")
+                MM.create_workflow("wf-new")
+                args = MM.build_parser().parse_args(
+                    [
+                        "workflow",
+                        "supersede",
+                        "wf-old",
+                        "--by",
+                        "wf-new",
+                        "--reason",
+                        "contract changed",
+                    ]
+                )
+
+                def supersede() -> None:
+                    started.set()
+                    try:
+                        MM.workflow_supersede_command(args)
+                    except Exception as exc:  # pragma: no cover - asserted below
+                        errors.append(exc)
+                    finally:
+                        finished.set()
+
+                old_path = workflows / "wf-old.json"
+                with MM.exclusive_file_lock(old_path):
+                    worker = threading.Thread(target=supersede)
+                    worker.start()
+                    self.assertTrue(started.wait(timeout=1))
+                    document = MM.read_json(old_path)
+                    document["budget_reservations"] = {
+                        "run-1": {"max_budget_usd": 1.25}
+                    }
+                    MM.safe_write_json(old_path, document)
+                    self.assertFalse(finished.wait(timeout=0.05))
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+                superseded = MM.read_json(old_path)
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            superseded["budget_reservations"],
+            {"run-1": {"max_budget_usd": 1.25}},
+        )
+
+    def test_run_rejects_a_superseded_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            workflows = root / "workflows"
+            runs = root / "runs"
+            repo.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            with mock.patch.object(MM, "WORKFLOWS_DIR", workflows):
+                MM.create_workflow("wf-old")
+                document = MM.read_json(workflows / "wf-old.json")
+                document.update(
+                    {"status": "superseded", "superseded_by": "wf-new"}
+                )
+                MM.safe_write_json(workflows / "wf-old.json", document)
+                args = MM.build_parser().parse_args(
+                    [
+                        "run",
+                        "--repo",
+                        str(repo),
+                        "--workflow-id",
+                        "wf-old",
+                        "--path",
+                        "src",
+                    ]
+                )
+                with (
+                    mock.patch.object(MM, "RUNS_DIR", runs),
+                    mock.patch.object(
+                        MM,
+                        "load_config",
+                        return_value=json.loads(json.dumps(MM.DEFAULT_CONFIG)),
+                    ),
+                    self.assertRaisesRegex(
+                        MM.ReviewError, "successor workflow wf-new"
+                    ),
+                ):
+                    MM.run_review_command(args)
+
+    def test_unexpected_resume_error_preserves_partial_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            snapshot = root / "snapshot"
+            repo = root / "repo"
+            run_dir.mkdir()
+            snapshot.mkdir()
+            repo.mkdir()
+            now = MM.utc_now()
+            MM.safe_write(run_dir / "change.patch", "")
+            MM.safe_write(run_dir / "prompt.md", "review")
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "run_id": "run-resume",
+                    "status": "partial",
+                    "failure": {
+                        "type": "reviewer_failure",
+                        "reviewers": ["kimi"],
+                        "successful_reviewers": ["claude"],
+                    },
+                    "reviewers": {
+                        "claude": {"exit_code": 0},
+                        "kimi": {"exit_code": 1, "model": "k3-256k"},
+                    },
+                    "repository": {"root": str(repo), "id": "repo-1"},
+                    "scope": {
+                        "kind": "uncommitted",
+                        "value": None,
+                        "label": "changes",
+                    },
+                    "path_filters": [],
+                    "paths": ["src/a.py"],
+                    "source_fingerprint": "fingerprint",
+                    "workflow_id": "wf-active",
+                    "review_policy": {"timeout_minutes": 1},
+                    "created_at": now,
+                    "started_at": now,
+                },
+            )
+            reviewer = MM.Reviewer(
+                "kimi", ("kimi",), {}, "k3-256k", "fake"
+            )
+            args = MM.build_parser().parse_args(
+                ["resume", "--run", str(run_dir)]
+            )
+            with (
+                mock.patch.object(MM, "require_active_workflow"),
+                mock.patch.object(MM, "resolve_repo", return_value=repo),
+                mock.patch.object(
+                    MM, "changed_paths", return_value=["src/a.py"]
+                ),
+                mock.patch.object(MM, "fingerprint", return_value="fingerprint"),
+                mock.patch.object(MM, "workflow_runs", return_value=[]),
+                mock.patch.object(
+                    MM, "reviewer_definitions", return_value=[reviewer]
+                ),
+                mock.patch.object(
+                    MM, "load_config", return_value=MM.DEFAULT_CONFIG
+                ),
+                mock.patch.object(
+                    MM,
+                    "apply_workflow_budget",
+                    return_value=([reviewer], None),
+                ),
+                mock.patch.object(MM, "create_snapshot", return_value=snapshot),
+                mock.patch.object(
+                    MM, "external_snapshot_symlinks", return_value=[]
+                ),
+                mock.patch.object(
+                    MM, "sensitive_content_findings", return_value=[]
+                ),
+                mock.patch.object(
+                    MM,
+                    "invoke_reviewer",
+                    side_effect=RuntimeError("unexpected resume failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "unexpected resume failure"),
+            ):
+                MM.resume_review_command(args)
+            metadata = MM.read_json(run_dir / "metadata.json")
+        self.assertEqual(metadata["status"], "partial")
+        self.assertEqual(metadata["failure"]["type"], "reviewer_failure")
+        self.assertEqual(metadata["terminal_error"]["type"], "RuntimeError")
+
+    def test_concurrent_resume_commands_do_not_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            MM.safe_write_json(run_dir / "metadata.json", {"status": "partial"})
+            args = MM.build_parser().parse_args(
+                ["resume", "--run", str(run_dir)]
+            )
+            state_lock = threading.Lock()
+            first_started = threading.Event()
+            release_first = threading.Event()
+            active = 0
+            maximum_active = 0
+            calls = 0
+
+            def locked(_run_dir: Path) -> int:
+                nonlocal active, maximum_active, calls
+                with state_lock:
+                    calls += 1
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                    call_number = calls
+                if call_number == 1:
+                    first_started.set()
+                    self.assertTrue(release_first.wait(timeout=2))
+                with state_lock:
+                    active -= 1
+                return 0
+
+            with mock.patch.object(MM, "resume_review_locked", side_effect=locked):
+                first = threading.Thread(target=MM.resume_review_command, args=(args,))
+                second = threading.Thread(target=MM.resume_review_command, args=(args,))
+                first.start()
+                self.assertTrue(first_started.wait(timeout=1))
+                second.start()
+                second.join(timeout=0.05)
+                self.assertTrue(second.is_alive())
+                release_first.set()
+                first.join(timeout=2)
+                second.join(timeout=2)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(calls, 2)
+        self.assertEqual(maximum_active, 1)
+
+    def test_sensitive_scan_deduplicates_added_patch_content_and_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scans = root / "scans"
+            source = root / "fixture.py"
+            source.write_text(
+                'apiKey = "credential-value-123456"\n', encoding="utf-8"
+            )
+            patch = '+apiKey = "credential-value-123456"\n'
+            findings = MM.sensitive_content_findings(
+                root, ["fixture.py"], patch
+            )
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].path, "fixture.py")
+            repository = {"id": "repo-1", "root": str(root)}
+            scope = MM.Scope("uncommitted", None, "changes")
+            with mock.patch.object(MM, "SENSITIVE_SCANS_DIR", scans):
+                token = MM.create_sensitive_scan_token(
+                    repository=repository,
+                    scope=scope,
+                    path_filters=(),
+                    paths=["fixture.py"],
+                    source_fingerprint="abc",
+                    findings=findings,
+                )
+                path, value = MM.validate_sensitive_scan_token(
+                    token,
+                    repository=repository,
+                    scope=scope,
+                    path_filters=(),
+                    paths=["fixture.py"],
+                    source_fingerprint="abc",
+                )
+                MM.consume_sensitive_scan_token(path, value)
+                with self.assertRaisesRegex(MM.ReviewError, "already consumed"):
+                    MM.validate_sensitive_scan_token(
+                        token,
+                        repository=repository,
+                        scope=scope,
+                        path_filters=(),
+                        paths=["fixture.py"],
+                        source_fingerprint="abc",
+                    )
+
+    def test_analytics_separates_partial_runs_and_typed_failures(self) -> None:
+        now = MM.utc_now()
+        runs = [
+            (
+                Path("/tmp/run"),
+                {
+                    "created_at": now,
+                    "status": "partial",
+                    "workflow_id": "wf-one",
+                    "failure": {
+                        "type": "reviewer_failure",
+                        "invalid_reports": ["antigravity"],
+                    },
+                    "reviewers": {
+                        "claude": {
+                            "exit_code": 0,
+                            "verdict": "PASS_CLEAN",
+                            "report_contract_valid": True,
+                            "duration_seconds": 1,
+                            "usage": {"total_cost_usd": 0.2},
+                        },
+                        "kimi": {"exit_code": 1, "duration_seconds": 0.1},
+                    },
+                },
+            )
+        ]
+        with (
+            mock.patch.object(MM, "all_run_metadata", return_value=runs),
+            mock.patch.object(MM, "workflow_path", return_value=Path("/missing")),
+            mock.patch.object(MM, "WORKFLOWS_DIR", Path("/missing")),
+        ):
+            report = MM.analytics_report(7)
+        self.assertEqual(report["partial_runs"], 1)
+        self.assertEqual(
+            report["failure_types"],
+            {"invalid_report": 1, "reviewer_failure": 1},
+        )
+        self.assertEqual(report["providers"]["claude"]["cost_usd"], 0.2)
+
+
 class RunnerEndToEndTests(unittest.TestCase):
+    def test_scan_token_flows_through_cli_and_is_consumed_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            repo = root / "repo"
+            bin_dir = root / "bin"
+            invocation_count = root / "claude-count"
+            home.mkdir()
+            repo.mkdir()
+            bin_dir.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "secret-fixture.py").write_text(
+                'apiKey = "credential-value-123456"\n', encoding="utf-8"
+            )
+            fake_claude = bin_dir / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/usr/bin/env python3
+                    import json
+                    import pathlib
+                    import sys
+                    if "--version" in sys.argv:
+                        print("fake-claude 1.0")
+                        raise SystemExit(0)
+                    count_path = pathlib.Path({str(invocation_count)!r})
+                    count = int(count_path.read_text()) if count_path.exists() else 0
+                    count_path.write_text(str(count + 1))
+                    sys.stdin.read()
+                    print(json.dumps({{
+                        "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n",
+                        "total_cost_usd": 0.01
+                    }}))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            base = [sys.executable, str(SCRIPT_PATH)]
+            scan = run(
+                [
+                    *base,
+                    "scan",
+                    "--repo",
+                    str(repo),
+                    "--path",
+                    "src",
+                    "--approve-findings",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            token = json.loads(scan.stdout)["approved_token"]
+            self.assertIsInstance(token, str)
+            reviewed = run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--path",
+                    "src",
+                    "--task",
+                    "Review the safe credential fixture.",
+                    "--without-antigravity",
+                    "--without-kimi",
+                    "--sensitive-scan-token",
+                    token,
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            self.assertIn("PASS_CLEAN", reviewed.stdout)
+            reused = run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--path",
+                    "src",
+                    "--task",
+                    "Review the safe credential fixture.",
+                    "--without-antigravity",
+                    "--without-kimi",
+                    "--sensitive-scan-token",
+                    token,
+                ],
+                cwd=repo,
+                env=environment,
+                check=False,
+            )
+            count = invocation_count.read_text(encoding="utf-8")
+        self.assertEqual(reused.returncode, 2)
+        self.assertIn("already consumed", reused.stderr)
+        self.assertEqual(count, "1")
+
     def test_run_triage_finalize_and_freshness(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1761,7 +2504,7 @@ class RunnerEndToEndTests(unittest.TestCase):
             self.assertEqual(len(metadata_paths), 1)
             run_dir = metadata_paths[0].parent
             metadata = json.loads(metadata_paths[0].read_text(encoding="utf-8"))
-            self.assertEqual(metadata["schema_version"], 4)
+            self.assertEqual(metadata["schema_version"], MM.SCHEMA_VERSION)
             self.assertEqual(metadata["status"], "completed")
             self.assertEqual(metadata["phase"], "repair")
             self.assertEqual(metadata["paths"], ["src/feature.py"])
@@ -2053,6 +2796,132 @@ class RunnerEndToEndTests(unittest.TestCase):
             self.assertTrue(
                 all(item["status"] == "failed" for item in failed_metadata)
             )
+
+    def test_partial_run_resumes_only_failed_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            repo = root / "repo"
+            bin_dir = root / "bin"
+            home.mkdir()
+            repo.mkdir()
+            bin_dir.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            claude_count = root / "claude-count"
+            kimi_marker = root / "kimi-marker"
+            fake_claude = bin_dir / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/usr/bin/env python3
+                    import json
+                    import pathlib
+                    import sys
+                    if "--version" in sys.argv:
+                        print("fake-claude 1.0")
+                        raise SystemExit(0)
+                    path = pathlib.Path({str(claude_count)!r})
+                    count = int(path.read_text() or "0") if path.exists() else 0
+                    path.write_text(str(count + 1))
+                    print(json.dumps({{
+                        "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n",
+                        "total_cost_usd": 0.01
+                    }}))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            fake_kimi = bin_dir / "kimi"
+            fake_kimi.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/usr/bin/env python3
+                    import json
+                    import pathlib
+                    import sys
+                    if "--version" in sys.argv:
+                        print("fake-kimi 1.0")
+                        raise SystemExit(0)
+                    if sys.argv[1:4] == ["provider", "list", "--json"]:
+                        print(json.dumps({{"providers": {{"fake": {{}}}}, "models": {{"k3-256k": {{}}}}}}))
+                        raise SystemExit(0)
+                    marker = pathlib.Path({str(kimi_marker)!r})
+                    if not marker.exists():
+                        marker.write_text("failed")
+                        print('error: Model "k3-256k" temporarily unavailable', file=sys.stderr)
+                        raise SystemExit(1)
+                    print("# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_kimi.chmod(0o755)
+            config_dir = home / ".config" / "multi-model-review"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "antigravity": {"enabled": False},
+                        "kimi": {"enabled": True, "model": "k3-256k"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            base = [sys.executable, str(SCRIPT_PATH)]
+            initial = run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--path",
+                    "src",
+                    "--task",
+                    "Review resume behavior.",
+                ],
+                cwd=repo,
+                env=environment,
+                check=False,
+            )
+            self.assertEqual(initial.returncode, 2, initial.stderr)
+            metadata_path = next(
+                (home / ".codex" / "review-runs").glob("*/*/metadata.json")
+            )
+            run_dir = metadata_path.parent
+            partial = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                partial["status"],
+                "partial",
+                (
+                    f"stderr={initial.stderr}; failure_type="
+                    f"{partial.get('failure', {}).get('type')}; reviewer_exits="
+                    f"{[(name, item.get('exit_code')) for name, item in partial.get('reviewers', {}).items()]}"
+                ),
+            )
+            self.assertEqual(partial["failure"]["type"], "reviewer_failure")
+            stale_snapshot = run_dir / "snapshot"
+            stale_snapshot.mkdir()
+            (stale_snapshot / "left-behind.txt").write_text(
+                "ephemeral", encoding="utf-8"
+            )
+            resumed = run(
+                [*base, "resume", "--run", str(run_dir)],
+                cwd=repo,
+                env=environment,
+            )
+            self.assertIn("resumed and completed", resumed.stdout)
+            completed = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(completed["reviewers"]["kimi"]["exit_code"], 0)
+            self.assertEqual(claude_count.read_text(encoding="utf-8"), "1")
 
 
 if __name__ == "__main__":

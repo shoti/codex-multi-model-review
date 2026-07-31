@@ -32,6 +32,8 @@ Codex Multi-Model Review turns that conversation into a durable workflow:
 - repair rounds are bounded and followed by mandatory confirmation;
 - scope, paths, risks, profile, and task intent stay pinned across rounds;
 - provider failures, usage, decisions, and test gaps are persisted;
+- Claude output is schema-constrained and partial provider failures are resumable;
+- cumulative Claude spend is capped across the whole workflow, not only per call;
 - a final PASS is valid only while its source fingerprint remains fresh.
 
 ```mermaid
@@ -77,7 +79,7 @@ The runner has no third-party Python dependencies.
 |---|---:|---|---|
 | Claude Code | Enabled | `claude` | `sonnet`, medium effort, and a $1.25 maximum per review by default |
 | Antigravity | Disabled | `agy` | Requires authenticated model access and the bundled hard read-only agent |
-| Kimi Code | Disabled | `kimi` | Experimental adapter; default model is `k3-256k` |
+| Kimi Code | Disabled | `kimi` | Experimental adapter; validates that the configured model alias is available |
 
 Provider CLIs are separate products with their own installation,
 authentication, terms, data handling, quotas, and billing.
@@ -146,7 +148,8 @@ always works.
 The normal Codex-driven flow is:
 
 1. Finish the implementation and focused local checks.
-2. Start one workflow for the user task.
+2. Start one workflow for the user task, with an explicit cumulative budget when
+   the default `$5.00` cap is not appropriate.
 3. Run a repair review against explicit scope, paths, risks, and intent.
 4. Verify and disposition every finding and test gap.
 5. Fix accepted items and rerun focused tests.
@@ -154,6 +157,17 @@ The normal Codex-driven flow is:
 7. Run one mandatory confirmation with no further source changes planned.
 8. Finalize and verify the freshness-checked gate.
 9. If authorized later, attest the unchanged reviewed snapshot to its commit.
+
+If one provider fails after another provider has produced a valid report, the
+run is preserved as `partial`. Resume that exact immutable snapshot instead of
+paying the successful provider again. If the task contract must change after a
+confirmation, explicitly supersede the closed workflow so the lineage remains
+auditable.
+
+Resume holds a run-specific lock for the complete transaction. Overlapping
+attempts against one artifact serialize; after the first succeeds, the next
+observes that the run is already complete instead of sharing its snapshot or
+overwriting its evidence.
 
 For the complete operational contract, see
 [SKILL.md](skills/multi-model-review/SKILL.md).
@@ -195,7 +209,9 @@ automation, the runner can be driven directly:
 RUNNER="<plugin-root>/skills/multi-model-review/scripts/mm_review.py"
 
 python3 "$RUNNER" doctor
-python3 "$RUNNER" workflow start --name "harden session validation"
+python3 "$RUNNER" workflow start \
+  --name "harden session validation" \
+  --max-budget-usd 5
 
 python3 "$RUNNER" run \
   --repo /path/to/repository \
@@ -221,6 +237,13 @@ python3 "$RUNNER" decide \
   --verification "Focused session test passes."
 ```
 
+If the run is partial, retry only its failed reviewers without changing the
+source:
+
+```bash
+python3 "$RUNNER" resume --run <partial-run-directory>
+```
+
 When repair triage is complete, run the same contract with
 `--phase confirmation`, then:
 
@@ -244,13 +267,17 @@ python3 "$RUNNER" workflow finalize <workflow-id>
 | `set-model` | Set a reviewer model |
 | `set-effort` | Set Claude reasoning effort |
 | `set-budget` | Set Claude's per-review USD cap |
-| `workflow start/status/finalize` | Manage a task across one or more repositories |
+| `set-workflow-budget` | Set the default cumulative Claude USD cap for new workflows |
+| `workflow start/status/supersede/finalize` | Manage task lineage across one or more repositories |
+| `scan` | Issue a one-shot fingerprint-bound approval after inspecting secret findings |
 | `run` | Execute one repair or confirmation round |
+| `resume` | Retry only failed reviewers from an unchanged partial run |
 | `decide` / `decide-batch` | Persist evidence-backed triage |
 | `finalize` | Produce a final gate |
 | `verify` | Confirm that the gate still matches current source |
 | `attest-commit` | Bind unchanged reviewed content to the checked-out commit |
 | `recover` | Mark an orphaned run failed after its process exits |
+| `analytics` | Summarize local workflow, provider, failure, spend, and decision evidence |
 
 Use `python3 .../mm_review.py <command> --help` for all flags.
 
@@ -270,6 +297,12 @@ External symlinks always fail closed and cannot be waived. The broad sensitive
 path override should be used only after deliberately reviewing the entire
 snapshot.
 
+When a changed line matches a secret rule but is intentionally safe test data,
+run `scan --approve-findings` against the exact scope and paths first. The
+resulting token is one-shot and bound to the repository, task paths, findings,
+and source fingerprint. It cannot approve later edits, a broader review, a
+sensitive path, or an external symlink.
+
 ## Privacy and data handling
 
 The runner does not add a separate telemetry service, but enabled provider CLIs
@@ -286,6 +319,7 @@ Inspect sensitive repositories before starting an external review.
 Persistent local state is stored under:
 
 - `~/.codex/review-runs/`;
+- `~/.codex/review-runs/sensitive-scans/` for one-shot scan approvals;
 - `~/.config/multi-model-review/config.json`;
 - `~/.config/multi-model-review/provider-health.json`.
 
@@ -302,12 +336,21 @@ repository secret scanner or deliberate source review.
 
 ## Cost controls
 
-Claude is enabled by default with a `$1.25` maximum per review invocation. A
-workflow permits up to three repair rounds and one confirmation, so a workflow
-that uses every round can permit up to `$5.00` of Claude budget per repository.
-Most workflows should converge earlier.
+Claude is enabled by default with a `$1.25` maximum per review invocation and a
+`$5.00` cumulative maximum per workflow. Before every call, the runner reduces
+the next Claude cap to the smaller of the per-review limit and the workflow's
+remaining budget. Each run atomically reserves its maximum under the workflow
+lock, so concurrent repositories cannot reserve the same dollars. It fails
+closed when less than `$0.05` remains. Most workflows should converge well
+before the limit.
 
-`doctor --live` performs provider calls and gives its Claude probe a `$0.05`
+The reservation is released after provider results and reported usage are
+persisted. If the runner process is forcibly killed, its reservation remains
+conservatively unavailable rather than silently permitting overspend; inspect
+and recover the interrupted run before deciding whether to supersede the
+workflow with a new explicit budget.
+
+`doctor --live` performs provider calls and gives its Claude probe a `$0.10`
 cap. Plain `doctor` does not run a review, but Antigravity readiness may call
 `agy models`. Antigravity and Kimi usage is governed by their accounts; the
 runner does not enforce an equivalent USD cap for them.
@@ -326,11 +369,19 @@ is a safety limit, not a prediction of the final bill.
 - **Quota cooldown:** wait for the reported reset or disable that provider.
 - **Interrupted run:** after confirming its process exited, use
   `mm-review recover --run <run-directory>`.
-- **Stale final gate:** start a new workflow against the changed source.
+- **Partial run:** keep the source unchanged and use
+  `mm-review resume --run <run-directory>`; only failed reviewers run again.
+- **Stale final gate or changed confirmation contract:** use
+  `mm-review workflow supersede <workflow-id> --reason "<why>"`, then review
+  under the reported successor workflow.
 - **Review contract drift:** keep scope, paths, risks, profile, and task text
-  identical within one workflow.
-- **Sensitive material blocked:** remove it from scope or use only the narrow,
-  exact-match waiver after review. External symlinks cannot be overridden.
+  identical within one workflow, or explicitly supersede it.
+- **Sensitive material blocked:** remove it from scope, or run
+  `mm-review scan ... --approve-findings` and pass the returned token to the
+  exact review after inspecting every redacted finding. External symlinks and
+  sensitive paths cannot be approved this way.
+- **Kimi model unavailable:** choose an alias reported by
+  `kimi provider list --json`, or leave Kimi disabled.
 - **Malformed provider output:** inspect the redacted error artifact, update the
   provider CLI if needed, and rerun a fresh review.
 - **`mm-review` is not on PATH:** invoke the bundled Python script directly.
@@ -346,7 +397,7 @@ is a safety limit, not a prediction of the final bill.
 - Windows is not supported natively because the runner uses POSIX file locks,
   permissions, signals, and process groups.
 - Source is sent to every enabled reviewer provider.
-- Kimi support relies on an experimental CLI flag and may change.
+- Kimi support relies on an experimental CLI and may change.
 - A later scoped edit requires a new workflow after confirmation.
 - Commits, pushes, merges, deployments, migrations, backfills, messages, and
   live transactions remain outside the plugin's authority.
