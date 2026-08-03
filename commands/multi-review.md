@@ -34,6 +34,8 @@ repository. Do not stop after collecting reviewer reports.
    If a crashed process leaves an orphaned running artifact, verify the recorded
    process is gone and use `mm-review recover --run <run-dir>`.
 6. Derive task-specific `--path` filters so unrelated dirty files are excluded.
+   Inspect the runner's excluded-path notice and add any changed dependency the
+   reviewed behavior needs.
 7. Select applicable risks and a review profile. Risks include auth, backfill,
    db-write, email-send, email-deliverability, external-api, migration,
    security, and trading.
@@ -58,7 +60,9 @@ enabled. Codex remains implementer, finding verifier, and final gate.
    `mm-review scan` with the same scope and paths, then use its one-shot token.
 2. Read every reviewer report completely.
    If a run is `partial`, keep the source unchanged and use `mm-review resume`
-   so only failed reviewers are retried.
+   so only failed reviewers are retried. If Claude exhausted its budget, pass
+   an explicit one-resume `--claude-max-budget-usd` and/or lower
+   `--claude-effort`; do not repeat the same cap blindly.
 3. Independently trace every finding and test gap against the actual code path.
    Record every result with `mm-review decide` or one atomic
    `mm-review decide-batch`; model agreement alone is not evidence.
@@ -69,11 +73,11 @@ enabled. Codex remains implementer, finding verifier, and final gate.
    verification (or an accepted test gap to `covered`). Confirm the repair has
    no pending, accepted, or uncertain decisions. Any scoped source change makes
    it stale; run another repair if needed.
-7. After at most three repairs, run one `--phase confirmation` with no planned
-   source changes. Only that confirmation can be finalized. If scoped source
-   changes after confirmation, explicitly use `workflow supersede` and review
-   under its successor. Keep scope, path filters, risks, review profile, and
-   task text identical within one workflow.
+7. After at most three repairs, run one `--phase confirmation
+   --reuse-contract` with no planned source changes. Only that confirmation can
+   be finalized. If scoped source changes after confirmation, explicitly use
+   `workflow supersede` and review under its successor. Keep scope, path
+   filters, risks, review profile, and task text identical within one workflow.
 
 Never allow an external reviewer to edit the working tree. Do not commit, push,
 open a PR, deploy, or change production state without separate authorization.

@@ -85,6 +85,7 @@ REVIEW_PROFILES = {
     "email-deliverability",
 }
 CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+CLAUDE_EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_TIMEOUT_MINUTES = 15
 DOCTOR_TIMEOUT_SECONDS = 90
 DOCTOR_CLAUDE_BUDGET_USD = 0.10
@@ -442,6 +443,19 @@ def classify_provider_failure(
         return None
     if any(
         marker in combined
+        for marker in (
+            "budget_exhausted",
+            "budget exhausted",
+            "budget was exhausted",
+            "error_max_budget_usd",
+            "maximum budget",
+            "max budget",
+            "max_budget_usd",
+        )
+    ):
+        return "budget_exhausted"
+    if any(
+        marker in combined
         for marker in ("quota", "rate limit", "usage limit", "resets in")
     ):
         return "quota"
@@ -472,6 +486,20 @@ def classify_provider_failure(
     if returncode == 0 and not stdout.strip():
         return "empty_response"
     return "provider_error"
+
+
+def materially_changes_claude_retry(
+    *,
+    previous_effort: str,
+    previous_budget: float,
+    selected_effort: str,
+    selected_budget: float,
+) -> bool:
+    return (
+        selected_budget > previous_budget
+        or CLAUDE_EFFORT_ORDER.index(selected_effort)
+        < CLAUDE_EFFORT_ORDER.index(previous_effort)
+    )
 
 
 def provider_health() -> dict[str, Any]:
@@ -768,6 +796,15 @@ def changed_paths(
             if path and matches_path_filters(path, path_filters)
         }
     )
+
+
+def excluded_changed_paths(
+    repo: Path, scope: Scope, path_filters: Sequence[str]
+) -> list[str]:
+    if not path_filters:
+        return []
+    included = set(changed_paths(repo, scope, path_filters))
+    return sorted(set(changed_paths(repo, scope)) - included)
 
 
 def render_patch(
@@ -2397,16 +2434,9 @@ def validate_workflow_phase(
         )
 
 
-def validate_review_contract(
-    identifier: str,
-    repository_id: str,
-    *,
-    scope: Scope,
-    path_filters: Sequence[str],
-    risks: Sequence[str],
-    review_profile: str,
-    task: str | None,
-) -> None:
+def baseline_review_contract(
+    identifier: str, repository_id: str
+) -> dict[str, Any] | None:
     completed = [
         metadata
         for _, metadata in workflow_runs(identifier)
@@ -2415,7 +2445,7 @@ def validate_review_contract(
         and metadata.get("status") == "completed"
     ]
     if not completed:
-        return
+        return None
     baseline = min(
         completed,
         key=lambda item: (
@@ -2423,13 +2453,46 @@ def validate_review_contract(
             str(item.get("created_at", "")),
         ),
     )
-    expected = {
+    return {
         "scope": baseline.get("scope"),
         "path_filters": baseline.get("path_filters", []),
         "risks": baseline.get("risks", []),
         "review_profile": baseline.get("review_profile", "normal"),
         "task": baseline.get("task"),
     }
+
+
+def resolve_pinned_scope(
+    args: argparse.Namespace, repo: Path, pinned_scope: Any
+) -> Scope:
+    if not isinstance(pinned_scope, dict):
+        raise ReviewError("The pinned review contract has no valid scope.")
+    scope_kind = str(pinned_scope.get("kind"))
+    if scope_kind not in {"uncommitted", "base", "commit"}:
+        raise ReviewError("The pinned review contract has an invalid scope.")
+    args.uncommitted = scope_kind == "uncommitted"
+    args.base = pinned_scope.get("value") if scope_kind == "base" else None
+    args.commit = pinned_scope.get("value") if scope_kind == "commit" else None
+    resolved = resolve_scope(args, repo)
+    return dataclasses.replace(
+        resolved, label=str(pinned_scope.get("label") or resolved.label)
+    )
+
+
+def validate_review_contract(
+    identifier: str,
+    repository_id: str,
+    *,
+    phase: str = "repair",
+    scope: Scope,
+    path_filters: Sequence[str],
+    risks: Sequence[str],
+    review_profile: str,
+    task: str | None,
+) -> None:
+    expected = baseline_review_contract(identifier, repository_id)
+    if expected is None:
+        return
     actual = {
         "scope": dataclasses.asdict(scope),
         "path_filters": list(path_filters),
@@ -2441,6 +2504,13 @@ def validate_review_contract(
         key for key in expected if expected[key] != actual[key]
     ]
     if mismatches:
+        if phase == "confirmation":
+            raise ReviewError(
+                "Confirmation must reuse the first completed repair contract. "
+                "Rerun with --reuse-contract, or intentionally supersede the "
+                f"workflow if the contract really changed. Mismatches: "
+                + ", ".join(mismatches)
+            )
         raise ReviewError(
             "Review contract drifted from the first completed repair for this "
             "repository. Create a linked successor with `mm-review workflow "
@@ -2635,6 +2705,7 @@ def workflow_metrics(
         "reviewer_invocations": 0,
         "successful_reviewer_invocations": 0,
         "failed_reviewer_invocations": 0,
+        "legacy_resume_runs_with_incomplete_attempt_history": 0,
         "reviewer_duration_seconds": 0.0,
         "reported_cost_usd": 0.0,
         "reviewer_turns": 0,
@@ -2659,38 +2730,50 @@ def workflow_metrics(
             metrics["running_runs"] += 1
         reviewers = metadata.get("reviewers")
         if isinstance(reviewers, dict):
+            resumed_reviewers = metadata.get("resumed_reviewers")
+            if isinstance(resumed_reviewers, list):
+                resume_targets = [
+                    reviewers.get(str(name)) for name in resumed_reviewers
+                ]
+            else:
+                resume_targets = list(reviewers.values())
+            if metadata.get("resumed_at") and any(
+                isinstance(reviewer, dict)
+                and "exit_code" in reviewer
+                and not reviewer.get("attempts")
+                for reviewer in resume_targets
+            ):
+                metrics[
+                    "legacy_resume_runs_with_incomplete_attempt_history"
+                ] += 1
             for reviewer in reviewers.values():
-                if not isinstance(reviewer, dict) or "exit_code" not in reviewer:
+                if not isinstance(reviewer, dict):
                     continue
-                metrics["reviewer_invocations"] += 1
-                succeeded = (
-                    int(reviewer.get("exit_code") or 0) == 0
-                    and reviewer.get("report_contract_valid", True) is not False
-                    and reviewer.get("verdict")
-                    in {"PASS_CLEAN", "PASS_WITH_FINDINGS", "BLOCK"}
-                )
-                counter = (
-                    "successful_reviewer_invocations"
-                    if succeeded
-                    else "failed_reviewer_invocations"
-                )
-                metrics[counter] += 1
-                metrics["reviewer_duration_seconds"] += float(
-                    reviewer.get("duration_seconds") or 0
-                )
-                model = reviewer.get("model")
-                if isinstance(model, str):
-                    attempted_models.add(model)
-                    if succeeded:
-                        successful_models.add(model)
-                usage = reviewer.get("usage")
-                if isinstance(usage, dict):
-                    metrics["reported_cost_usd"] += float(
-                        usage.get("total_cost_usd") or 0
+                for attempt in reviewer_attempts(reviewer):
+                    metrics["reviewer_invocations"] += 1
+                    succeeded = reviewer_attempt_succeeded(attempt)
+                    counter = (
+                        "successful_reviewer_invocations"
+                        if succeeded
+                        else "failed_reviewer_invocations"
                     )
-                    metrics["reviewer_turns"] += int(
-                        usage.get("num_turns") or 0
+                    metrics[counter] += 1
+                    metrics["reviewer_duration_seconds"] += float(
+                        attempt.get("duration_seconds") or 0
                     )
+                    model = attempt.get("model")
+                    if isinstance(model, str):
+                        attempted_models.add(model)
+                        if succeeded:
+                            successful_models.add(model)
+                    usage = attempt.get("usage")
+                    if isinstance(usage, dict):
+                        metrics["reported_cost_usd"] += float(
+                            usage.get("total_cost_usd") or 0
+                        )
+                        metrics["reviewer_turns"] += int(
+                            usage.get("num_turns") or 0
+                        )
         triage_path = run_dir / "triage.json"
         if not triage_path.exists():
             continue
@@ -2728,6 +2811,7 @@ def analytics_report(since_days: int) -> dict[str, Any]:
             runs.append((run_dir, metadata))
     metrics = workflow_metrics(runs)
     providers: dict[str, dict[str, Any]] = {}
+    provider_failure_categories: dict[str, int] = {}
     failure_types: dict[str, int] = {}
     contract_valid_runs = 0
     partial_runs = 0
@@ -2759,20 +2843,37 @@ def analytics_report(since_days: int) -> dict[str, Any]:
         if not isinstance(reviewers, dict):
             continue
         for name, reviewer in reviewers.items():
-            if not isinstance(reviewer, dict) or "exit_code" not in reviewer:
+            if not isinstance(reviewer, dict):
                 continue
-            summary = providers.setdefault(
-                str(name),
-                {"invocations": 0, "successful": 0, "failed": 0, "cost_usd": 0.0},
-            )
-            summary["invocations"] += 1
-            if reviewer.get("exit_code") == 0:
-                summary["successful"] += 1
-            else:
-                summary["failed"] += 1
-            usage = reviewer.get("usage")
-            if isinstance(usage, dict):
-                summary["cost_usd"] += float(usage.get("total_cost_usd") or 0)
+            for attempt in reviewer_attempts(reviewer):
+                summary = providers.setdefault(
+                    str(name),
+                    {
+                        "invocations": 0,
+                        "successful": 0,
+                        "failed": 0,
+                        "cost_usd": 0.0,
+                    },
+                )
+                summary["invocations"] += 1
+                if reviewer_attempt_succeeded(attempt):
+                    summary["successful"] += 1
+                else:
+                    summary["failed"] += 1
+                    category = (
+                        "invalid_report"
+                        if int(attempt.get("exit_code") or 0) == 0
+                        and attempt.get("report_contract_valid") is False
+                        else str(attempt.get("failure_category") or "unknown")
+                    )
+                    provider_failure_categories[category] = (
+                        provider_failure_categories.get(category, 0) + 1
+                    )
+                usage = attempt.get("usage")
+                if isinstance(usage, dict):
+                    summary["cost_usd"] += float(
+                        usage.get("total_cost_usd") or 0
+                    )
     for summary in providers.values():
         summary["cost_usd"] = round(summary["cost_usd"], 6)
     workflow_ids = sorted(
@@ -2801,6 +2902,9 @@ def analytics_report(since_days: int) -> dict[str, Any]:
         "finalized_workflows": finalized,
         "superseded_workflows": superseded,
         "failure_types": dict(sorted(failure_types.items())),
+        "provider_failure_categories": dict(
+            sorted(provider_failure_categories.items())
+        ),
         "providers": dict(sorted(providers.items())),
         "metrics": metrics,
     }
@@ -3888,6 +3992,85 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def reviewer_attempts(reviewer: dict[str, Any]) -> list[dict[str, Any]]:
+    attempts = [
+        item
+        for item in reviewer.get("attempts", [])
+        if isinstance(item, dict) and "exit_code" in item
+    ]
+    if "exit_code" in reviewer:
+        attempts.append(
+            {key: value for key, value in reviewer.items() if key != "attempts"}
+        )
+    return attempts
+
+
+def reviewer_attempt_succeeded(attempt: dict[str, Any]) -> bool:
+    return (
+        int(attempt.get("exit_code") or 0) == 0
+        and attempt.get("report_contract_valid", True) is not False
+        and attempt.get("verdict")
+        in {"PASS_CLEAN", "PASS_WITH_FINDINGS", "BLOCK"}
+    )
+
+
+def reviewer_artifact_archive_plan(
+    run_dir: Path, name: str, reviewer: dict[str, Any]
+) -> list[tuple[Path, Path]]:
+    attempt_number = len(reviewer.get("attempts", [])) + 1
+    plan: list[tuple[Path, Path]] = []
+    for suffix in (".md", ".stderr.log", ".raw.json", ".structured.json"):
+        source = run_dir / f"{name}{suffix}"
+        if not source.exists():
+            continue
+        destination = run_dir / f"{name}.attempt-{attempt_number}{suffix}"
+        if destination.exists():
+            raise ReviewError(
+                f"Cannot preserve {name} attempt {attempt_number}; artifact "
+                f"already exists: {destination}"
+            )
+        plan.append((source, destination))
+    return plan
+
+
+def apply_reviewer_artifact_archive_plan(
+    reviewer: dict[str, Any], plan: Sequence[tuple[Path, Path]]
+) -> None:
+    archived_names = {
+        source.name: destination.name for source, destination in plan
+    }
+    for source, destination in plan:
+        source.replace(destination)
+    for field in ("report", "stderr"):
+        current = reviewer.get(field)
+        if isinstance(current, str) and current in archived_names:
+            reviewer[field] = archived_names[current]
+
+
+def archive_reviewer_artifacts(
+    run_dir: Path, name: str, reviewer: dict[str, Any]
+) -> None:
+    plan = reviewer_artifact_archive_plan(run_dir, name, reviewer)
+    apply_reviewer_artifact_archive_plan(reviewer, plan)
+
+
+def archive_reviewer_artifacts_batch(
+    run_dir: Path,
+    names: Sequence[str],
+    reviewers: dict[str, Any],
+) -> None:
+    plans: list[tuple[dict[str, Any], list[tuple[Path, Path]]]] = []
+    for name in names:
+        reviewer = reviewers.get(name)
+        if not isinstance(reviewer, dict):
+            continue
+        plans.append(
+            (reviewer, reviewer_artifact_archive_plan(run_dir, name, reviewer))
+        )
+    for reviewer, plan in plans:
+        apply_reviewer_artifact_archive_plan(reviewer, plan)
+
+
 def persist_review_results(
     *,
     run_dir: Path,
@@ -3906,7 +4089,23 @@ def persist_review_results(
         parsed = parse_review_report(
             name, report, risk_profiled=bool(metadata.get("risks"))
         )
-        reviewer_metadata[name] = {
+        previous = reviewer_metadata.get(name)
+        attempt_history: list[dict[str, Any]] = []
+        if isinstance(previous, dict):
+            attempt_history = [
+                item
+                for item in previous.get("attempts", [])
+                if isinstance(item, dict) and "exit_code" in item
+            ]
+            if "exit_code" in previous:
+                attempt_history.append(
+                    {
+                        key: value
+                        for key, value in previous.items()
+                        if key != "attempts"
+                    }
+                )
+        latest = {
             "model": definition.model,
             "cli_version": definition.cli_version,
             "started_at": result.started_at,
@@ -3923,6 +4122,9 @@ def persist_review_results(
             "finding_counts": parsed["finding_counts"],
             "test_gap_counts": parsed["test_gap_counts"],
         }
+        if attempt_history:
+            latest["attempts"] = attempt_history
+        reviewer_metadata[name] = latest
 
     parsed_reviews: dict[str, Any] = {}
     invalid_reports: list[str] = []
@@ -4053,10 +4255,20 @@ def resume_review_command(args: argparse.Namespace) -> int:
     os.umask(0o077)
     run_dir = resolve_run_dir(args.run)
     with exclusive_file_lock(run_dir / "resume"):
-        return resume_review_locked(run_dir)
+        overrides: dict[str, Any] = {}
+        if args.claude_effort is not None:
+            overrides["claude_effort"] = args.claude_effort
+        if args.claude_max_budget_usd is not None:
+            overrides["claude_max_budget_usd"] = args.claude_max_budget_usd
+        return resume_review_locked(run_dir, **overrides)
 
 
-def resume_review_locked(run_dir: Path) -> int:
+def resume_review_locked(
+    run_dir: Path,
+    *,
+    claude_effort: str | None = None,
+    claude_max_budget_usd: float | None = None,
+) -> int:
     metadata = read_json(run_dir / "metadata.json")
     resume_terminal_status = (
         "partial" if metadata.get("status") == "partial" else "failed"
@@ -4118,18 +4330,45 @@ def resume_review_locked(run_dir: Path) -> int:
     policy = metadata.get("review_policy")
     if not isinstance(policy, dict):
         policy = {}
+    resume_policy = dict(policy)
     claude = reviewer_metadata.get("claude")
     if "claude" in failed_names and isinstance(claude, dict):
-        command.extend(["--claude-model", str(claude.get("model") or "sonnet")])
-        command.extend(
-            ["--claude-effort", str(policy.get("claude_effort") or "medium")]
+        previous_effort = str(policy.get("claude_effort") or "medium")
+        previous_budget = float(
+            policy.get("claude_max_budget_usd") or 1.25
         )
+        selected_effort = claude_effort or previous_effort
+        selected_budget = (
+            claude_max_budget_usd
+            if claude_max_budget_usd is not None
+            else previous_budget
+        )
+        if (
+            claude.get("failure_category") == "budget_exhausted"
+            and not materially_changes_claude_retry(
+                previous_effort=previous_effort,
+                previous_budget=previous_budget,
+                selected_effort=selected_effort,
+                selected_budget=selected_budget,
+            )
+        ):
+            raise ReviewError(
+                "Claude exhausted the previous per-review budget. A blind "
+                "resume would not improve its limit or effort; pass an explicit "
+                f"--claude-max-budget-usd greater than {previous_budget:g} or "
+                "a lower --claude-effort. If the source or path scope must "
+                "change, create a linked successor instead."
+            )
+        command.extend(["--claude-model", str(claude.get("model") or "sonnet")])
+        command.extend(["--claude-effort", selected_effort])
         command.extend(
             [
                 "--claude-max-budget-usd",
-                str(policy.get("claude_max_budget_usd") or 1.25),
+                str(selected_budget),
             ]
         )
+        resume_policy["claude_effort"] = selected_effort
+        resume_policy["claude_max_budget_usd"] = selected_budget
     antigravity = reviewer_metadata.get("antigravity")
     if "antigravity" in failed_names and isinstance(antigravity, dict):
         command.extend(
@@ -4163,6 +4402,9 @@ def resume_review_locked(run_dir: Path) -> int:
                 "Cannot resume because the recreated snapshot has unapproved "
                 "sensitive findings. Run a fresh sensitive preflight."
             )
+        archive_reviewer_artifacts_batch(
+            run_dir, failed_names, reviewer_metadata
+        )
         metadata.update(
             {
                 "status": "running",
@@ -4170,6 +4412,8 @@ def resume_review_locked(run_dir: Path) -> int:
                 "heartbeat_at": utc_now(),
                 "runner_pid": os.getpid(),
                 "workflow_budget": budget,
+                "review_policy": resume_policy,
+                "resumed_reviewers": failed_names,
             }
         )
         metadata.pop("terminal_error", None)
@@ -4250,13 +4494,6 @@ def run_review_command(args: argparse.Namespace) -> int:
     os.umask(0o077)
     config = load_config()
     repo = resolve_repo(args.repo)
-    scope = resolve_scope(args, repo)
-    path_filters = normalize_path_filters(repo, args.path)
-    paths = changed_paths(repo, scope, path_filters)
-    patch = render_patch(repo, scope, path_filters)
-    if not paths and not patch.strip():
-        raise ReviewError(f"No changes found for {scope.label}.")
-
     repository = repository_metadata(repo)
     selected_workflow = args.workflow_id or workflow_id()
     if args.workflow_id:
@@ -4266,6 +4503,54 @@ def run_review_command(args: argparse.Namespace) -> int:
             selected_workflow,
             max_budget_usd=float(config["workflow"]["max_budget_usd"]),
         )
+    reused_scope: Scope | None = None
+    if args.reuse_contract:
+        if not args.workflow_id:
+            raise ReviewError("--reuse-contract requires --workflow-id.")
+        if (
+            args.uncommitted
+            or args.base
+            or args.commit
+            or args.path
+            or args.risk
+            or args.task is not None
+            or args.review_profile != "normal"
+        ):
+            raise ReviewError(
+                "--reuse-contract cannot be combined with scope, path, risk, "
+                "profile, or task overrides."
+            )
+        pinned = baseline_review_contract(
+            selected_workflow, str(repository["id"])
+        )
+        if pinned is None:
+            raise ReviewError(
+                "--reuse-contract requires a completed repair for this "
+                "repository and workflow."
+            )
+        reused_scope = resolve_pinned_scope(args, repo, pinned.get("scope"))
+        args.path = list(pinned.get("path_filters") or [])
+        args.risk = list(pinned.get("risks") or [])
+        args.review_profile = str(pinned.get("review_profile") or "normal")
+        args.task = pinned.get("task")
+
+    scope = reused_scope or resolve_scope(args, repo)
+    path_filters = normalize_path_filters(repo, args.path)
+    paths = changed_paths(repo, scope, path_filters)
+    patch = render_patch(repo, scope, path_filters)
+    if not paths and not patch.strip():
+        raise ReviewError(f"No changes found for {scope.label}.")
+    excluded_paths = excluded_changed_paths(repo, scope, path_filters)
+    if excluded_paths:
+        print(
+            f"Scope notice: {len(excluded_paths)} changed path(s) are excluded "
+            "by --path; verify they are unrelated to the reviewed behavior:",
+            flush=True,
+        )
+        for path in excluded_paths[:20]:
+            print(f"- {path}", flush=True)
+        if len(excluded_paths) > 20:
+            print(f"- ... and {len(excluded_paths) - 20} more", flush=True)
     existing_rounds = [
         int(metadata.get("round", 0))
         for _, metadata in workflow_runs(selected_workflow)
@@ -4292,6 +4577,7 @@ def run_review_command(args: argparse.Namespace) -> int:
         "scope": dataclasses.asdict(scope),
         "path_filters": list(path_filters),
         "paths": paths,
+        "excluded_changed_paths": excluded_paths,
         "risks": sorted(set(args.risk)),
         "review_profile": args.review_profile,
         "task": args.task,
@@ -4326,6 +4612,7 @@ def run_review_command(args: argparse.Namespace) -> int:
         validate_review_contract(
             selected_workflow,
             str(repository["id"]),
+            phase=args.phase,
             scope=scope,
             path_filters=path_filters,
             risks=args.risk,
@@ -4743,6 +5030,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--task", help="Original intent and acceptance criteria for the change"
     )
     run_parser.add_argument(
+        "--reuse-contract",
+        action="store_true",
+        help=(
+            "Reuse the first completed repair's scope, paths, risks, profile, "
+            "and task; useful for confirmation rounds"
+        ),
+    )
+    run_parser.add_argument(
         "--path",
         action="append",
         default=[],
@@ -4843,6 +5138,16 @@ def build_parser() -> argparse.ArgumentParser:
         "resume", help="Retry only failed reviewers for a fresh partial run"
     )
     resume.add_argument("--run", required=True, help="Partial review run directory")
+    resume.add_argument(
+        "--claude-effort",
+        choices=sorted(CLAUDE_EFFORTS),
+        help="One-resume Claude effort override",
+    )
+    resume.add_argument(
+        "--claude-max-budget-usd",
+        type=float,
+        help="One-resume Claude budget override",
+    )
 
     decide = subparsers.add_parser(
         "decide", help="Record Codex's evidence-backed disposition for one finding"
@@ -4947,6 +5252,14 @@ def main() -> int:
         if args.command == "scan":
             return sensitive_scan_command(args)
         if args.command == "resume":
+            if (
+                args.claude_max_budget_usd is not None
+                and (
+                    not math.isfinite(args.claude_max_budget_usd)
+                    or args.claude_max_budget_usd <= 0
+                )
+            ):
+                raise ReviewError("--claude-max-budget-usd must be positive.")
             return resume_review_command(args)
         if args.command == "decide":
             for field in ("evidence", "action", "verification"):
