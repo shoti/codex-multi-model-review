@@ -112,6 +112,40 @@ class RunnerUnitTests(unittest.TestCase):
             with self.assertRaisesRegex(MM.ReviewError, "positive finite"):
                 MM.reviewer_definitions(invalid_args, config)
 
+    def test_budget_exhaustion_retry_requires_a_material_policy_change(self) -> None:
+        self.assertFalse(
+            MM.materially_changes_claude_retry(
+                previous_effort="medium",
+                previous_budget=1.25,
+                selected_effort="medium",
+                selected_budget=1.25,
+            )
+        )
+        self.assertFalse(
+            MM.materially_changes_claude_retry(
+                previous_effort="medium",
+                previous_budget=1.25,
+                selected_effort="high",
+                selected_budget=1.0,
+            )
+        )
+        self.assertTrue(
+            MM.materially_changes_claude_retry(
+                previous_effort="medium",
+                previous_budget=1.25,
+                selected_effort="medium",
+                selected_budget=1.5,
+            )
+        )
+        self.assertTrue(
+            MM.materially_changes_claude_retry(
+                previous_effort="medium",
+                previous_budget=1.25,
+                selected_effort="low",
+                selected_budget=1.25,
+            )
+        )
+
     def test_non_finite_budget_is_rejected_from_config_and_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.json"
@@ -780,6 +814,43 @@ class RunnerUnitTests(unittest.TestCase):
                     risks=(),
                     review_profile="data-change",
                     task="Change the feature value.",
+                )
+            with self.assertRaisesRegex(MM.ReviewError, "--reuse-contract"):
+                MM.validate_review_contract(
+                    "wf-test",
+                    "repo-1",
+                    phase="confirmation",
+                    scope=MM.Scope("uncommitted", None, "test"),
+                    path_filters=("src/feature.py",),
+                    risks=("db-write",),
+                    review_profile="data-change",
+                    task="Describe the repair instead.",
+                )
+
+    def test_reused_base_and_commit_scopes_preserve_the_pinned_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            initialize_repo(repo)
+            head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+            for kind, label in (
+                ("base", f"branch changes since main (merge-base {head})"),
+                ("commit", "commit HEAD"),
+            ):
+                args = MM.build_parser().parse_args(
+                    ["run", "--workflow-id", "wf-test", "--reuse-contract"]
+                )
+                scope = MM.resolve_pinned_scope(
+                    args,
+                    repo,
+                    {"kind": kind, "value": head, "label": label},
+                )
+                self.assertEqual(
+                    {
+                        "kind": scope.kind,
+                        "value": scope.value,
+                        "label": scope.label,
+                    },
+                    {"kind": kind, "value": head, "label": label},
                 )
 
     def test_workflow_status_exposes_active_run(self) -> None:
@@ -1834,9 +1905,146 @@ None.
         self.assertEqual(result.returncode, 1)
         record.assert_called_once_with(
             "claude",
-            "provider_error",
+            "budget_exhausted",
             "Review budget was exhausted before completion.",
         )
+
+    def test_resume_attempt_history_preserves_artifacts_cost_and_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            report = run_dir / "claude.md"
+            error = run_dir / "claude.stderr.log"
+            raw = run_dir / "claude.raw.json"
+            report.write_text("", encoding="utf-8")
+            error.write_text("Reached maximum budget ($1.25)\n", encoding="utf-8")
+            raw.write_text('{"is_error":true}\n', encoding="utf-8")
+            now = MM.utc_now()
+            metadata = {
+                "run_id": "run-resumed",
+                "workflow_id": "wf-resumed",
+                "repository": {"id": "repo-1"},
+                "created_at": now,
+                "started_at": now,
+                "risks": [],
+            }
+            reviewer = MM.Reviewer(
+                "claude", ("claude",), {}, "sonnet", "fake"
+            )
+            first = MM.ReviewResult(
+                "claude",
+                1,
+                report,
+                error,
+                now,
+                now,
+                1.0,
+                False,
+                {"total_cost_usd": 1.25, "num_turns": 10},
+                "budget_exhausted",
+            )
+            with mock.patch.object(MM, "workflow_runs", return_value=[]):
+                MM.persist_review_results(
+                    run_dir=run_dir,
+                    metadata=metadata,
+                    reviewers=[reviewer],
+                    results=[first],
+                )
+            MM.archive_reviewer_artifacts(
+                run_dir, "claude", metadata["reviewers"]["claude"]
+            )
+            report.write_text(
+                "# Verdict\nPASS_CLEAN\n\n# Findings\nNone.\n\n"
+                "# Test gaps\nNone.\n",
+                encoding="utf-8",
+            )
+            error.write_text("", encoding="utf-8")
+            second = MM.ReviewResult(
+                "claude",
+                0,
+                report,
+                error,
+                now,
+                now,
+                2.0,
+                False,
+                {"total_cost_usd": 0.75, "num_turns": 5},
+                None,
+            )
+            with mock.patch.object(MM, "workflow_runs", return_value=[]):
+                MM.persist_review_results(
+                    run_dir=run_dir,
+                    metadata=metadata,
+                    reviewers=[reviewer],
+                    results=[second],
+                )
+            persisted = MM.read_json(run_dir / "metadata.json")
+            metrics = MM.workflow_metrics([(run_dir, persisted)])
+            archived_raw_exists = (run_dir / "claude.attempt-1.raw.json").exists()
+            legacy = json.loads(json.dumps(persisted))
+            legacy["resumed_at"] = now
+            legacy["reviewers"]["claude"].pop("attempts")
+            legacy_metrics = MM.workflow_metrics([(run_dir, legacy)])
+            healthy_partial = json.loads(json.dumps(persisted))
+            healthy_partial["resumed_at"] = now
+            healthy_partial["resumed_reviewers"] = ["claude"]
+            healthy_partial["reviewers"]["kimi"] = {
+                "model": "k3-256k",
+                "exit_code": 0,
+                "report_contract_valid": True,
+                "verdict": "PASS_CLEAN",
+            }
+            healthy_metrics = MM.workflow_metrics(
+                [(run_dir, healthy_partial)]
+            )
+
+        claude = persisted["reviewers"]["claude"]
+        self.assertEqual(len(claude["attempts"]), 1)
+        self.assertEqual(
+            claude["attempts"][0]["failure_category"], "budget_exhausted"
+        )
+        self.assertEqual(
+            claude["attempts"][0]["report"], "claude.attempt-1.md"
+        )
+        self.assertTrue(archived_raw_exists)
+        self.assertEqual(metrics["reviewer_invocations"], 2)
+        self.assertEqual(metrics["failed_reviewer_invocations"], 1)
+        self.assertEqual(metrics["successful_reviewer_invocations"], 1)
+        self.assertEqual(metrics["reported_cost_usd"], 2.0)
+        self.assertEqual(
+            legacy_metrics[
+                "legacy_resume_runs_with_incomplete_attempt_history"
+            ],
+            1,
+        )
+        self.assertEqual(
+            healthy_metrics[
+                "legacy_resume_runs_with_incomplete_attempt_history"
+            ],
+            0,
+        )
+
+    def test_batch_archive_collision_does_not_move_any_reviewer_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "claude.md").write_text("claude", encoding="utf-8")
+            (run_dir / "kimi.md").write_text("kimi", encoding="utf-8")
+            (run_dir / "kimi.attempt-1.md").write_text(
+                "collision", encoding="utf-8"
+            )
+            reviewers = {
+                "claude": {"exit_code": 1, "report": "claude.md"},
+                "kimi": {"exit_code": 1, "report": "kimi.md"},
+            }
+            with self.assertRaisesRegex(MM.ReviewError, "already exists"):
+                MM.archive_reviewer_artifacts_batch(
+                    run_dir, ["claude", "kimi"], reviewers
+                )
+
+            self.assertTrue((run_dir / "claude.md").exists())
+            self.assertFalse((run_dir / "claude.attempt-1.md").exists())
+            self.assertTrue((run_dir / "kimi.md").exists())
+            self.assertEqual(reviewers["claude"]["report"], "claude.md")
+            self.assertEqual(reviewers["kimi"]["report"], "kimi.md")
 
     def test_pass_clean_with_items_is_safely_downgraded(self) -> None:
         parsed = MM.parse_review_report(
@@ -2205,6 +2413,74 @@ None.
         self.assertEqual(metadata["failure"]["type"], "reviewer_failure")
         self.assertEqual(metadata["terminal_error"]["type"], "RuntimeError")
 
+    def test_budget_exhaustion_requires_an_explicit_resume_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            repo = root / "repo"
+            run_dir.mkdir()
+            repo.mkdir()
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "run_id": "run-budget",
+                    "status": "failed",
+                    "failure": {
+                        "type": "reviewer_failure",
+                        "reviewers": ["claude"],
+                    },
+                    "reviewers": {
+                        "claude": {
+                            "exit_code": 1,
+                            "failure_category": "budget_exhausted",
+                            "model": "sonnet",
+                        }
+                    },
+                    "repository": {"root": str(repo), "id": "repo-1"},
+                    "scope": {
+                        "kind": "uncommitted",
+                        "value": None,
+                        "label": "changes",
+                    },
+                    "path_filters": [],
+                    "paths": ["src/a.py"],
+                    "source_fingerprint": "fingerprint",
+                    "workflow_id": "wf-active",
+                    "review_policy": {
+                        "claude_effort": "medium",
+                        "claude_max_budget_usd": 1.25,
+                    },
+                },
+            )
+            with (
+                mock.patch.object(MM, "require_active_workflow"),
+                mock.patch.object(MM, "resolve_repo", return_value=repo),
+                mock.patch.object(
+                    MM, "changed_paths", return_value=["src/a.py"]
+                ),
+                mock.patch.object(MM, "fingerprint", return_value="fingerprint"),
+                mock.patch.object(MM, "workflow_runs", return_value=[]),
+                self.assertRaisesRegex(
+                    MM.ReviewError, "explicit --claude-max-budget-usd"
+                ),
+            ):
+                MM.resume_review_locked(run_dir)
+            with (
+                mock.patch.object(MM, "require_active_workflow"),
+                mock.patch.object(MM, "resolve_repo", return_value=repo),
+                mock.patch.object(
+                    MM, "changed_paths", return_value=["src/a.py"]
+                ),
+                mock.patch.object(MM, "fingerprint", return_value="fingerprint"),
+                mock.patch.object(MM, "workflow_runs", return_value=[]),
+                self.assertRaisesRegex(
+                    MM.ReviewError, "greater than 1.25"
+                ),
+            ):
+                MM.resume_review_locked(
+                    run_dir, claude_max_budget_usd=1.25
+                )
+
     def test_concurrent_resume_commands_do_not_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)
@@ -2508,6 +2784,9 @@ class RunnerEndToEndTests(unittest.TestCase):
             self.assertEqual(metadata["status"], "completed")
             self.assertEqual(metadata["phase"], "repair")
             self.assertEqual(metadata["paths"], ["src/feature.py"])
+            self.assertEqual(
+                metadata["excluded_changed_paths"], ["unrelated.txt"]
+            )
             self.assertEqual(metadata["reviewers"]["claude"]["cli_version"], "fake-claude 1.0")
             self.assertEqual(metadata["reviewers"]["claude"]["usage"]["total_cost_usd"], 0.01)
             self.assertEqual(
@@ -2617,16 +2896,11 @@ class RunnerEndToEndTests(unittest.TestCase):
                     "run",
                     "--repo",
                     str(repo),
-                    "--path",
-                    "src",
-                    "--risk",
-                    "db-write",
                     "--workflow-id",
                     metadata["workflow_id"],
                     "--phase",
                     "confirmation",
-                    "--task",
-                    "Change the feature value.",
+                    "--reuse-contract",
                 ],
                 cwd=repo,
                 env=environment,

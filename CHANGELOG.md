@@ -7,6 +7,14 @@ All notable user-visible changes are documented here. This project follows
 
 ### Added
 
+- Preserve every failed/resumed reviewer attempt and archive its provider
+  artifacts so analytics and workflow spend include paid retries.
+- Add explicit one-resume Claude effort and budget overrides, plus a typed
+  `budget_exhausted` failure category.
+- Add `run --reuse-contract` for drift-proof confirmation rounds and record
+  changed paths excluded by task filters.
+- Flag legacy resumed artifacts whose overwritten attempt history cannot be
+  reconstructed, instead of presenting their spend as complete.
 - Resume partial runs against their original immutable snapshot without
   reinvoking successful reviewers.
 - Enforce a configurable cumulative Claude budget across every workflow.
@@ -19,6 +27,10 @@ All notable user-visible changes are documented here. This project follows
 
 ### Security
 
+- Prevent resumed attempts from replacing earlier reported usage and thereby
+  weakening the cumulative workflow budget.
+- Refuse a blind Claude resume after budget exhaustion until the operator
+  chooses an explicit retry policy.
 - Require Claude's JSON-schema report contract and normalize contradictory
   clean verdicts fail-closed.
 - Preserve typed provider failures when terminal handling records an error.

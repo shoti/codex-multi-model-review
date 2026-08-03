@@ -154,7 +154,8 @@ The normal Codex-driven flow is:
 4. Verify and disposition every finding and test gap.
 5. Fix accepted items and rerun focused tests.
 6. Repeat only when necessary, up to three repair rounds.
-7. Run one mandatory confirmation with no further source changes planned.
+7. Run one mandatory confirmation with no further source changes planned,
+   reusing the pinned repair contract.
 8. Finalize and verify the freshness-checked gate.
 9. If authorized later, attest the unchanged reviewed snapshot to its commit.
 
@@ -163,6 +164,11 @@ run is preserved as `partial`. Resume that exact immutable snapshot instead of
 paying the successful provider again. If the task contract must change after a
 confirmation, explicitly supersede the closed workflow so the lineage remains
 auditable.
+
+Resume history is append-only: earlier attempt metadata and provider artifacts
+remain available, and every reported attempt cost counts toward the workflow
+cap. Claude budget exhaustion requires an explicit one-resume effort or budget
+override instead of silently repeating the same capped attempt.
 
 Resume holds a run-specific lock for the complete transaction. Overlapping
 attempts against one artifact serialize; after the first succeeds, the next
@@ -184,6 +190,10 @@ For the complete operational contract, see
 review context, the immutable snapshot still contains the entire tracked Git
 tree at the selected revision. Read [Privacy and data handling](#privacy-and-data-handling)
 before reviewing a sensitive repository.
+
+The runner prints and records changed paths excluded by `--path`. Inspect that
+local notice: keep unrelated dirty files excluded, but include every changed
+dependency required by the reviewed behavior.
 
 ### Risk labels and profiles
 
@@ -244,10 +254,20 @@ source:
 python3 "$RUNNER" resume --run <partial-run-directory>
 ```
 
-When repair triage is complete, run the same contract with
-`--phase confirmation`, then:
+If Claude reached its per-review cap, choose an explicit retry policy while
+keeping the source unchanged:
 
 ```bash
+python3 "$RUNNER" resume --run <partial-run-directory> \
+  --claude-max-budget-usd 2 --claude-effort medium
+```
+
+When repair triage is complete, load the pinned contract for confirmation, then:
+
+```bash
+python3 "$RUNNER" run --repo /path/to/repository \
+  --workflow-id <workflow-id> --phase confirmation --reuse-contract
+
 python3 "$RUNNER" finalize \
   --run <confirmation-run-directory> \
   --codex-review "Final diff review found no remaining defect." \
@@ -344,6 +364,12 @@ lock, so concurrent repositories cannot reserve the same dollars. It fails
 closed when less than `$0.05` remains. Most workflows should converge well
 before the limit.
 
+Every resume attempt is retained and charged to that cumulative calculation;
+a failed paid attempt cannot be hidden by a later successful retry. Use
+`--claude-effort` and `--claude-max-budget-usd` on `run` or `resume` for
+one-attempt tuning. The `set-effort` and `set-budget` commands change persistent
+defaults.
+
 The reservation is released after provider results and reported usage are
 persisted. If the runner process is forcibly killed, its reservation remains
 conservatively unavailable rather than silently permitting overspend; inspect
@@ -371,11 +397,14 @@ is a safety limit, not a prediction of the final bill.
   `mm-review recover --run <run-directory>`.
 - **Partial run:** keep the source unchanged and use
   `mm-review resume --run <run-directory>`; only failed reviewers run again.
+- **Claude budget exhausted:** resume only with an explicit
+  `--claude-max-budget-usd` and/or lower `--claude-effort`; the cumulative
+  workflow cap still applies.
 - **Stale final gate or changed confirmation contract:** use
   `mm-review workflow supersede <workflow-id> --reason "<why>"`, then review
   under the reported successor workflow.
-- **Review contract drift:** keep scope, paths, risks, profile, and task text
-  identical within one workflow, or explicitly supersede it.
+- **Review contract drift:** use `--reuse-contract` for confirmation. Explicitly
+  supersede only when scope, paths, risks, profile, or task truly changed.
 - **Sensitive material blocked:** remove it from scope, or run
   `mm-review scan ... --approve-findings` and pass the returned token to the
   exact review after inspecting every redacted finding. External symlinks and
