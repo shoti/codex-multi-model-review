@@ -853,6 +853,30 @@ class RunnerUnitTests(unittest.TestCase):
                     {"kind": kind, "value": head, "label": label},
                 )
 
+    def test_commit_scope_ignores_changes_outside_path_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            initialize_repo(repo)
+            head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+            (repo / "REVIEW.md").write_text("local notes\n", encoding="utf-8")
+            (repo / "unrelated.txt").write_text("dirty\n", encoding="utf-8")
+            args = MM.build_parser().parse_args(
+                ["run", "--commit", "HEAD", "--path", "src"]
+            )
+
+            scope = MM.resolve_scope(args, repo, ("src",))
+
+            self.assertEqual(scope.kind, "commit")
+            self.assertEqual(scope.value, head)
+            in_scope_untracked = repo / "src" / "new_file.py"
+            in_scope_untracked.write_text("VALUE = 2\n", encoding="utf-8")
+            with self.assertRaisesRegex(MM.ReviewError, "task-scoped"):
+                MM.resolve_scope(args, repo, ("src",))
+            in_scope_untracked.unlink()
+            (repo / "src" / "feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+            with self.assertRaisesRegex(MM.ReviewError, "task-scoped"):
+                MM.resolve_scope(args, repo, ("src",))
+
     def test_workflow_status_exposes_active_run(self) -> None:
         active = (
             Path("/private/tmp/running-review"),
@@ -876,6 +900,37 @@ class RunnerUnitTests(unittest.TestCase):
         self.assertEqual(status["active_runs"][0]["phase"], "confirmation")
         self.assertEqual(status["active_runs"][0]["reviewers"], ["claude"])
         self.assertEqual(status["metrics"]["running_runs"], 1)
+
+    def test_workflow_status_reports_persisted_workflow_before_first_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows_dir = Path(temporary)
+            with mock.patch.object(MM, "WORKFLOWS_DIR", workflows_dir):
+                MM.create_workflow(
+                    "wf-new",
+                    name="new workflow",
+                    max_budget_usd=3.0,
+                )
+                with (
+                    mock.patch.object(MM, "workflow_runs", return_value=[]),
+                    mock.patch.object(MM, "latest_workflow_runs", return_value=[]),
+                ):
+                    status, ready = MM.workflow_status("wf-new")
+
+        self.assertFalse(ready)
+        self.assertEqual(status["state"], "active")
+        self.assertEqual(status["workflow"]["name"], "new workflow")
+        self.assertEqual(status["metrics"]["run_count"], 0)
+        self.assertEqual(status["repositories"], [])
+
+    def test_workflow_status_rejects_unknown_workflow_without_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", Path(temporary)),
+                mock.patch.object(MM, "workflow_runs", return_value=[]),
+                mock.patch.object(MM, "latest_workflow_runs", return_value=[]),
+                self.assertRaisesRegex(MM.ReviewError, "Unknown workflow"),
+            ):
+                MM.workflow_status("wf-missing")
 
     def test_failed_only_workflow_cannot_be_ready_or_finalized(self) -> None:
         failed = (
@@ -2610,6 +2665,79 @@ None.
 
 
 class RunnerEndToEndTests(unittest.TestCase):
+    def test_commit_run_ignores_unrelated_dirty_paths_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            repo = root / "repo"
+            bin_dir = root / "bin"
+            home.mkdir()
+            repo.mkdir()
+            bin_dir.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+            run(["git", "add", "src/feature.py"], cwd=repo)
+            run(["git", "commit", "-qm", "change feature"], cwd=repo)
+            (repo / "unrelated.txt").write_text("dirty\n", encoding="utf-8")
+            (repo / "REVIEW.md").write_text("local notes\n", encoding="utf-8")
+
+            fake_claude = bin_dir / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/bin/sh
+                    if [ "$1" = "--version" ]; then
+                      echo "fake-claude 1.0"
+                      exit 0
+                    fi
+                    test "$(cat unrelated.txt)" = "clean" || exit 3
+                    test ! -e REVIEW.md || exit 4
+                    cat >/dev/null
+                    python3 -c 'import json; print(json.dumps({
+                      "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n",
+                      "total_cost_usd": 0.01
+                    }))'
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+            completed = run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--commit",
+                    "HEAD",
+                    "--path",
+                    "src",
+                    "--task",
+                    "Review the committed feature change.",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+
+            self.assertIn("PASS_CLEAN", completed.stdout)
+            metadata_path = next(
+                (home / ".codex" / "review-runs").glob("*/*/metadata.json")
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            patch = (metadata_path.parent / "change.patch").read_text(encoding="utf-8")
+            self.assertEqual(metadata["status"], "completed")
+            self.assertEqual(metadata["scope"]["kind"], "commit")
+            self.assertEqual(metadata["paths"], ["src/feature.py"])
+            self.assertEqual(metadata["excluded_changed_paths"], [])
+            self.assertNotIn("dirty", patch)
+            self.assertNotIn("local notes", patch)
+
     def test_scan_token_flows_through_cli_and_is_consumed_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2890,6 +3018,30 @@ class RunnerEndToEndTests(unittest.TestCase):
             self.assertEqual(repair_finalize.returncode, 2)
             self.assertIn("Repair rounds cannot be finalized", repair_finalize.stderr)
 
+            mismatched_confirmation = run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    metadata["workflow_id"],
+                    "--phase",
+                    "confirmation",
+                    "--base",
+                    "HEAD",
+                    "--reuse-contract",
+                ],
+                cwd=repo,
+                env=environment,
+                check=False,
+            )
+            self.assertEqual(mismatched_confirmation.returncode, 2)
+            self.assertIn(
+                "scope selector does not match",
+                mismatched_confirmation.stderr,
+            )
+
             confirmation = run(
                 [
                     *base,
@@ -2900,6 +3052,7 @@ class RunnerEndToEndTests(unittest.TestCase):
                     metadata["workflow_id"],
                     "--phase",
                     "confirmation",
+                    "--uncommitted",
                     "--reuse-contract",
                 ],
                 cwd=repo,

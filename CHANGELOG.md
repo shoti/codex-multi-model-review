@@ -48,6 +48,13 @@ All notable user-visible changes are documented here. This project follows
 
 ### Changed
 
+- Accept an explicit scope selector with `--reuse-contract` when it resolves to
+  the pinned scope, matching the documented confirmation command while still
+  rejecting scope drift.
+- Let path-filtered commit reviews ignore unrelated working-tree changes while
+  retaining task-scoped cleanliness checks.
+- Report newly started or superseding workflows with zero runs as active in
+  `workflow status`, while still rejecting genuinely unknown workflow IDs.
 - Extracted the reviewer report contract and parser into a focused module.
 - Clarified the reviewer report contract so inspection-budget limitations are
   recorded in Notes instead of producing an empty `PASS_WITH_FINDINGS`.

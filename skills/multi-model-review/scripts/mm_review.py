@@ -608,7 +608,11 @@ def resolve_repo(requested_path: str) -> Path:
     return Path(result).resolve()
 
 
-def resolve_scope(args: argparse.Namespace, repo: Path) -> Scope:
+def resolve_scope(
+    args: argparse.Namespace,
+    repo: Path,
+    path_filters: Sequence[str] = (),
+) -> Scope:
     if args.base:
         run_command(
             ["git", "rev-parse", "--verify", f"{args.base}^{{commit}}"], cwd=repo
@@ -623,13 +627,21 @@ def resolve_scope(args: argparse.Namespace, repo: Path) -> Scope:
         ).stdout.strip()
         head = run_command(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
         status = run_command(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=repo
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                *git_pathspec(path_filters),
+            ],
+            cwd=repo,
         ).stdout
         if commit != head or status:
             raise ReviewError(
-                "--commit requires that commit to be the clean checked-out HEAD "
-                "so full-file review matches the patch. Check it out cleanly or "
-                "use --base for a branch plus working-tree review."
+                "--commit requires that commit to be the checked-out HEAD with "
+                "a clean task-scoped working tree so full-file review matches "
+                "the patch. Check it out cleanly or use --base for a branch plus "
+                "working-tree review."
             )
         return Scope("commit", commit, f"commit {args.commit}")
     return Scope("uncommitted", None, "staged, unstaged, and untracked changes")
@@ -2463,7 +2475,10 @@ def baseline_review_contract(
 
 
 def resolve_pinned_scope(
-    args: argparse.Namespace, repo: Path, pinned_scope: Any
+    args: argparse.Namespace,
+    repo: Path,
+    pinned_scope: Any,
+    path_filters: Sequence[str] = (),
 ) -> Scope:
     if not isinstance(pinned_scope, dict):
         raise ReviewError("The pinned review contract has no valid scope.")
@@ -2473,7 +2488,7 @@ def resolve_pinned_scope(
     args.uncommitted = scope_kind == "uncommitted"
     args.base = pinned_scope.get("value") if scope_kind == "base" else None
     args.commit = pinned_scope.get("value") if scope_kind == "commit" else None
-    resolved = resolve_scope(args, repo)
+    resolved = resolve_scope(args, repo, path_filters)
     return dataclasses.replace(
         resolved, label=str(pinned_scope.get("label") or resolved.label)
     )
@@ -2925,8 +2940,8 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
     )
     all_runs = workflow_runs(identifier)
     latest_runs = latest_workflow_runs(identifier)
-    if not all_runs:
-        raise ReviewError(f"No review runs found for workflow {identifier}.")
+    if not all_runs and not workflow_document:
+        raise ReviewError(f"Unknown workflow {identifier}.")
     repositories: list[dict[str, Any]] = []
     history_issues: list[str] = []
     for run_dir, metadata in all_runs:
@@ -3931,8 +3946,8 @@ def attest_commit_command(args: argparse.Namespace) -> int:
 def sensitive_scan_command(args: argparse.Namespace) -> int:
     os.umask(0o077)
     repo = resolve_repo(args.repo)
-    scope = resolve_scope(args, repo)
     path_filters = normalize_path_filters(repo, args.path)
+    scope = resolve_scope(args, repo, path_filters)
     paths = changed_paths(repo, scope, path_filters)
     patch = render_patch(repo, scope, path_filters)
     if not paths and not patch.strip():
@@ -4508,17 +4523,14 @@ def run_review_command(args: argparse.Namespace) -> int:
         if not args.workflow_id:
             raise ReviewError("--reuse-contract requires --workflow-id.")
         if (
-            args.uncommitted
-            or args.base
-            or args.commit
-            or args.path
+            args.path
             or args.risk
             or args.task is not None
             or args.review_profile != "normal"
         ):
             raise ReviewError(
-                "--reuse-contract cannot be combined with scope, path, risk, "
-                "profile, or task overrides."
+                "--reuse-contract cannot be combined with path, risk, profile, "
+                "or task overrides."
             )
         pinned = baseline_review_contract(
             selected_workflow, str(repository["id"])
@@ -4528,14 +4540,32 @@ def run_review_command(args: argparse.Namespace) -> int:
                 "--reuse-contract requires a completed repair for this "
                 "repository and workflow."
             )
-        reused_scope = resolve_pinned_scope(args, repo, pinned.get("scope"))
-        args.path = list(pinned.get("path_filters") or [])
+        pinned_paths = list(pinned.get("path_filters") or [])
+        path_filters = normalize_path_filters(repo, pinned_paths)
+        explicit_scope = (
+            resolve_scope(args, repo, path_filters)
+            if args.uncommitted or args.base or args.commit
+            else None
+        )
+        reused_scope = resolve_pinned_scope(
+            args, repo, pinned.get("scope"), path_filters
+        )
+        if explicit_scope is not None and (
+            explicit_scope.kind != reused_scope.kind
+            or explicit_scope.value != reused_scope.value
+        ):
+            raise ReviewError(
+                "--reuse-contract scope selector does not match the pinned "
+                f"{reused_scope.kind} scope. Omit the selector to reuse it "
+                "exactly."
+            )
+        args.path = pinned_paths
         args.risk = list(pinned.get("risks") or [])
         args.review_profile = str(pinned.get("review_profile") or "normal")
         args.task = pinned.get("task")
 
-    scope = reused_scope or resolve_scope(args, repo)
     path_filters = normalize_path_filters(repo, args.path)
+    scope = reused_scope or resolve_scope(args, repo, path_filters)
     paths = changed_paths(repo, scope, path_filters)
     patch = render_patch(repo, scope, path_filters)
     if not paths and not patch.strip():
@@ -5025,7 +5055,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Review staged, unstaged, and untracked changes (default)",
     )
     scope.add_argument("--base", help="Review the working tree against this branch")
-    scope.add_argument("--commit", help="Review exactly one commit")
+    scope.add_argument(
+        "--commit",
+        help=(
+            "Review exactly one checked-out commit; with --path, unrelated "
+            "working-tree changes are ignored"
+        ),
+    )
     run_parser.add_argument(
         "--task", help="Original intent and acceptance criteria for the change"
     )
@@ -5034,7 +5070,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Reuse the first completed repair's scope, paths, risks, profile, "
-            "and task; useful for confirmation rounds"
+            "and task; an explicit matching scope selector is allowed"
         ),
     )
     run_parser.add_argument(

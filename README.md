@@ -195,6 +195,10 @@ The runner prints and records changed paths excluded by `--path`. Inspect that
 local notice: keep unrelated dirty files excluded, but include every changed
 dependency required by the reviewed behavior.
 
+For a path-filtered `--commit` review, working-tree changes outside those paths
+do not block the immutable commit snapshot. Changes inside the reviewed paths
+still fail closed so task-scoped work cannot be omitted accidentally.
+
 ### Risk labels and profiles
 
 Risk labels are repeatable:
@@ -266,7 +270,8 @@ When repair triage is complete, load the pinned contract for confirmation, then:
 
 ```bash
 python3 "$RUNNER" run --repo /path/to/repository \
-  --workflow-id <workflow-id> --phase confirmation --reuse-contract
+  --uncommitted --workflow-id <workflow-id> \
+  --phase confirmation --reuse-contract
 
 python3 "$RUNNER" finalize \
   --run <confirmation-run-directory> \
@@ -276,6 +281,9 @@ python3 "$RUNNER" finalize \
 python3 "$RUNNER" verify --run <confirmation-run-directory>
 python3 "$RUNNER" workflow finalize <workflow-id>
 ```
+
+The explicit scope selector may be omitted. When present, it must resolve to
+the pinned scope; paths, risks, profile, and task cannot be re-specified.
 
 ## Command reference
 

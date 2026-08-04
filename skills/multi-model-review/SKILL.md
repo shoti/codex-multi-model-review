@@ -139,7 +139,9 @@ mm-review run --uncommitted \
 
 `--reuse-contract` loads the first completed repair's exact scope, paths,
 risks, profile, and task for that repository, preventing accidental
-confirmation drift.
+confirmation drift. An explicit scope selector is accepted only when it
+resolves to that pinned scope, so the `--uncommitted` command above is safe and
+repeatable.
 
 8. Triage the confirmation, perform Codex's final diff review, and finalize it:
 
