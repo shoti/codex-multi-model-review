@@ -148,16 +148,29 @@ always works.
 The normal Codex-driven flow is:
 
 1. Finish the implementation and focused local checks.
-2. Start one workflow for the user task, with an explicit cumulative budget when
-   the default `$5.00` cap is not appropriate.
+2. Start one workflow for the user task with a deliberate review mode and an
+   explicit cumulative budget when the default `$5.00` cap is not appropriate.
 3. Run a repair review against explicit scope, paths, risks, and intent.
 4. Verify and disposition every finding and test gap.
 5. Fix accepted items and rerun focused tests.
-6. Repeat only when necessary, up to three repair rounds.
+6. Repeat only when necessary, within the selected repair-round limit.
 7. Run one mandatory confirmation with no further source changes planned,
    reusing the pinned repair contract.
 8. Finalize and verify the freshness-checked gate.
 9. If authorized later, attest the unchanged reviewed snapshot to its commit.
+
+Review mode is pinned with the workflow:
+
+| Mode | Use for | Repair policy |
+|---|---|---|
+| `fast` | Small, localized, low-risk changes | One low-effort repair, then medium-effort confirmation |
+| `balanced` | Ordinary features and bug fixes; the default | Up to two medium-effort repairs, then confirmation |
+| `deep` | Auth, money, trading, data writes, migrations, email, security, or broad cross-component changes | Up to three medium-effort repairs, then confirmation |
+
+Every mode retains the immutable snapshot, full triage, mandatory independent
+confirmation, freshness verification, and commit attestation controls. Use
+`deep` whenever a risk label applies; speed should come from avoiding redundant
+rounds, not weakening a high-impact review.
 
 If one provider fails after another provider has produced a valid report, the
 run is preserved as `partial`. Resume that exact immutable snapshot instead of
@@ -291,12 +304,12 @@ the pinned scope; paths, risks, profile, and task cannot be re-specified.
 |---|---|
 | `status` | Show reviewer configuration and readiness |
 | `doctor [--live]` | Check packaging, permissions, CLI contracts, and optional live access |
-| `enable` / `disable` | Persist reviewer availability |
+| `enable` / `disable [--lock]` | Persist reviewer availability; a lock also rejects one-run overrides |
 | `set-model` | Set a reviewer model |
 | `set-effort` | Set Claude reasoning effort |
 | `set-budget` | Set Claude's per-review USD cap |
 | `set-workflow-budget` | Set the default cumulative Claude USD cap for new workflows |
-| `workflow start/status/supersede/finalize` | Manage task lineage across one or more repositories |
+| `workflow start/status/supersede/finalize` | Manage adaptive review mode and task lineage across repositories |
 | `scan` | Issue a one-shot fingerprint-bound approval after inspecting secret findings |
 | `run` | Execute one repair or confirmation round |
 | `resume` | Retry only failed reviewers from an unchanged partial run |
@@ -305,7 +318,7 @@ the pinned scope; paths, risks, profile, and task cannot be re-specified.
 | `verify` | Confirm that the gate still matches current source |
 | `attest-commit` | Bind unchanged reviewed content to the checked-out commit |
 | `recover` | Mark an orphaned run failed after its process exits |
-| `analytics` | Summarize local workflow, provider, failure, spend, and decision evidence |
+| `analytics` | Summarize local workflow, review-mode, provider, failure, spend, and decision evidence |
 
 Use `python3 .../mm_review.py <command> --help` for all flags.
 
@@ -378,6 +391,10 @@ a failed paid attempt cannot be hidden by a later successful retry. Use
 one-attempt tuning. The `set-effort` and `set-budget` commands change persistent
 defaults.
 
+After budget exhaustion, lowering effort counts as a meaningful retry only if
+the per-review budget is not also reduced. This avoids paying for a predictably
+weaker retry that is even more likely to exhaust its cap.
+
 The reservation is released after provider results and reported usage are
 persisted. If the runner process is forcibly killed, its reservation remains
 conservatively unavailable rather than silently permitting overspend; inspect
@@ -385,9 +402,9 @@ and recover the interrupted run before deciding whether to supersede the
 workflow with a new explicit budget.
 
 `doctor --live` performs provider calls and gives its Claude probe a `$0.10`
-cap. Plain `doctor` does not run a review, but Antigravity readiness may call
-`agy models`. Antigravity and Kimi usage is governed by their accounts; the
-runner does not enforce an equivalent USD cap for them.
+cap. Plain `status` and `doctor` do not probe disabled providers. Antigravity
+and Kimi usage is governed by their accounts; the runner does not enforce an
+equivalent USD cap for them.
 
 Provider-reported cost and usage are recorded when available. A configured cap
 is a safety limit, not a prediction of the final bill.

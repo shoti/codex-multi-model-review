@@ -7,6 +7,13 @@ All notable user-visible changes are documented here. This project follows
 
 ### Added
 
+- Add pinned `fast`, `balanced`, and `deep` workflow modes that adapt repair
+  limits and Claude effort while retaining mandatory confirmation.
+- Break out review-mode runtime, spend, success, finding, and test-gap metrics
+  in local analytics so the adaptive policy can be tuned from real outcomes.
+- Add `disable <provider> --lock` so an unavailable provider cannot be restored
+  accidentally by a one-run override.
+
 - Preserve every failed/resumed reviewer attempt and archive its provider
   artifacts so analytics and workflow spend include paid retries.
 - Add explicit one-resume Claude effort and budget overrides, plus a typed
@@ -47,6 +54,10 @@ All notable user-visible changes are documented here. This project follows
   provider, and evidence writes.
 
 ### Changed
+
+- Skip CLI and readiness probes for disabled providers in `status` and plain
+  `doctor`.
+- Reject budget-exhaustion retries that lower both Claude effort and budget.
 
 - Accept an explicit scope selector with `--reuse-contract` when it resolves to
   the pinned scope, matching the documented confirmation command while still
