@@ -39,7 +39,10 @@ repository. Do not stop after collecting reviewer reports.
 7. Select applicable risks and a review profile. Risks include auth, backfill,
    db-write, email-send, email-deliverability, external-api, migration,
    security, and trading.
-8. If the target, intended behavior, or production impact is ambiguous, ask
+8. Select `--review-mode fast` only for a small, localized, low-risk change;
+   use `balanced` for ordinary work and `deep` whenever a risk label applies or
+   the behavior spans components. Every mode retains mandatory confirmation.
+9. If the target, intended behavior, or production impact is ambiguous, ask
    before proceeding.
 
 ## Plan
@@ -51,7 +54,8 @@ enabled. Codex remains implementer, finding verifier, and final gate.
 
 ## Commands
 
-1. Run `mm-review workflow start --max-budget-usd <cap>`, then run
+1. Run `mm-review workflow start --review-mode <fast|balanced|deep>
+   --max-budget-usd <cap>`, then run
    `--phase repair` in each affected
    repository with the same workflow ID, explicit `--path` filters, task
    intent, risks, review profile, and any provider override. Round numbering is
@@ -61,8 +65,9 @@ enabled. Codex remains implementer, finding verifier, and final gate.
 2. Read every reviewer report completely.
    If a run is `partial`, keep the source unchanged and use `mm-review resume`
    so only failed reviewers are retried. If Claude exhausted its budget, pass
-   an explicit one-resume `--claude-max-budget-usd` and/or lower
-   `--claude-effort`; do not repeat the same cap blindly.
+   a larger one-resume `--claude-max-budget-usd` and/or lower
+   `--claude-effort` without reducing the existing budget; do not repeat a
+   weaker cap blindly.
 3. Independently trace every finding and test gap against the actual code path.
    Record every result with `mm-review decide` or one atomic
    `mm-review decide-batch`; model agreement alone is not evidence.
@@ -73,7 +78,7 @@ enabled. Codex remains implementer, finding verifier, and final gate.
    verification (or an accepted test gap to `covered`). Confirm the repair has
    no pending, accepted, or uncertain decisions. Any scoped source change makes
    it stale; run another repair if needed.
-7. After at most three repairs, run one `--phase confirmation
+7. After the selected mode's repair limit, run one `--phase confirmation
    --reuse-contract` with no planned source changes. Only that confirmation can
    be finalized. If scoped source changes after confirmation, explicitly use
    `workflow supersede` and review under its successor. Keep scope, path

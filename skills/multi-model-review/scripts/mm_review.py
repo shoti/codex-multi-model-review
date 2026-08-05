@@ -60,9 +60,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "model": "sonnet",
         "effort": "medium",
         "max_budget_usd": 1.25,
+        "allow_run_override": True,
     },
-    "antigravity": {"enabled": False, "model": "auto"},
-    "kimi": {"enabled": False, "model": "k3-256k"},
+    "antigravity": {
+        "enabled": False,
+        "model": "auto",
+        "allow_run_override": True,
+    },
+    "kimi": {
+        "enabled": False,
+        "model": "k3-256k",
+        "allow_run_override": True,
+    },
     "workflow": {"max_budget_usd": 5.0},
 }
 PROVIDERS = ("claude", "antigravity", "kimi")
@@ -76,6 +85,24 @@ PROVIDER_CHOICES = (*PROVIDERS, *LEGACY_PROVIDER_ALIASES)
 SCHEMA_VERSION = 5
 MAX_REPAIR_ROUNDS = 3
 RUN_PHASES = ("repair", "confirmation")
+DEFAULT_REVIEW_MODE = "balanced"
+REVIEW_MODES: dict[str, dict[str, Any]] = {
+    "fast": {
+        "max_repair_rounds": 1,
+        "repair_effort": "low",
+        "confirmation_effort": "medium",
+    },
+    "balanced": {
+        "max_repair_rounds": 2,
+        "repair_effort": "medium",
+        "confirmation_effort": "medium",
+    },
+    "deep": {
+        "max_repair_rounds": 3,
+        "repair_effort": "medium",
+        "confirmation_effort": "medium",
+    },
+}
 REVIEW_PROFILES = {
     "normal",
     "security",
@@ -495,10 +522,12 @@ def materially_changes_claude_retry(
     selected_effort: str,
     selected_budget: float,
 ) -> bool:
-    return (
-        selected_budget > previous_budget
-        or CLAUDE_EFFORT_ORDER.index(selected_effort)
+    lowers_effort = (
+        CLAUDE_EFFORT_ORDER.index(selected_effort)
         < CLAUDE_EFFORT_ORDER.index(previous_effort)
+    )
+    return selected_budget > previous_budget or (
+        lowers_effort and selected_budget >= previous_budget
     )
 
 
@@ -1447,14 +1476,30 @@ def reviewer_definitions(
     antigravity_enabled = bool(config["antigravity"]["enabled"])
     kimi_enabled = bool(config["kimi"]["enabled"])
     if args.with_claude:
+        if not config["claude"].get("allow_run_override", True):
+            raise ReviewError(
+                "Claude is locked off in persistent configuration. Run "
+                "`mm-review enable claude` before using a one-run override."
+            )
         claude_enabled = True
     if args.without_claude:
         claude_enabled = False
     if args.with_antigravity:
+        if not config["antigravity"].get("allow_run_override", True):
+            raise ReviewError(
+                "Antigravity is locked off in persistent configuration. "
+                "Run `mm-review enable antigravity` before using a one-run "
+                "override."
+            )
         antigravity_enabled = True
     if args.without_antigravity:
         antigravity_enabled = False
     if args.with_kimi:
+        if not config["kimi"].get("allow_run_override", True):
+            raise ReviewError(
+                "Kimi is locked off in persistent configuration. Run "
+                "`mm-review enable kimi` before using a one-run override."
+            )
         kimi_enabled = True
     if args.without_kimi:
         kimi_enabled = False
@@ -2196,12 +2241,32 @@ def workflow_id() -> str:
     return f"wf-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
-def workflow_policy(max_budget_usd: float = 5.0) -> dict[str, Any]:
+def workflow_policy(
+    max_budget_usd: float = 5.0,
+    review_mode: str = DEFAULT_REVIEW_MODE,
+) -> dict[str, Any]:
+    mode = REVIEW_MODES[review_mode]
     return {
-        "max_repair_rounds": MAX_REPAIR_ROUNDS,
+        "review_mode": review_mode,
+        "max_repair_rounds": mode["max_repair_rounds"],
         "confirmation_required": True,
+        "repair_effort": mode["repair_effort"],
+        "confirmation_effort": mode["confirmation_effort"],
         "max_budget_usd": max_budget_usd,
     }
+
+
+def review_mode_from_policy(policy: dict[str, Any]) -> str:
+    review_mode = policy.get("review_mode")
+    if review_mode in REVIEW_MODES:
+        return str(review_mode)
+    max_repairs = policy.get("max_repair_rounds")
+    if not isinstance(max_repairs, int) or not 1 <= max_repairs <= MAX_REPAIR_ROUNDS:
+        max_repairs = MAX_REPAIR_ROUNDS
+    for name, mode in REVIEW_MODES.items():
+        if mode["max_repair_rounds"] == max_repairs:
+            return name
+    return "deep"
 
 
 def workflow_path(identifier: str) -> Path:
@@ -2235,6 +2300,7 @@ def create_workflow(
     *,
     name: str | None = None,
     max_budget_usd: float = 5.0,
+    review_mode: str = DEFAULT_REVIEW_MODE,
     supersedes: Sequence[str] = (),
 ) -> None:
     safe_write_json(
@@ -2244,7 +2310,7 @@ def create_workflow(
             "workflow_id": identifier,
             "name": name,
             "created_at": utc_now(),
-            "policy": workflow_policy(max_budget_usd),
+            "policy": workflow_policy(max_budget_usd, review_mode),
             "supersedes": list(supersedes),
         },
     )
@@ -2260,6 +2326,28 @@ def workflow_requires_confirmation(identifier: str) -> bool:
         isinstance(policy, dict)
         and policy.get("confirmation_required")
     )
+
+
+def workflow_max_repair_rounds(identifier: str) -> int:
+    path = workflow_path(identifier)
+    if not path.exists():
+        return MAX_REPAIR_ROUNDS
+    policy = read_json(path).get("policy")
+    value = policy.get("max_repair_rounds") if isinstance(policy, dict) else None
+    if isinstance(value, int) and 1 <= value <= MAX_REPAIR_ROUNDS:
+        return value
+    return MAX_REPAIR_ROUNDS
+
+
+def workflow_phase_effort(identifier: str, phase: str) -> str | None:
+    path = workflow_path(identifier)
+    if not path.exists():
+        return None
+    policy = read_json(path).get("policy")
+    if not isinstance(policy, dict):
+        return None
+    value = policy.get(f"{phase}_effort")
+    return str(value) if value in CLAUDE_EFFORTS else None
 
 
 def workflow_budget_limit(identifier: str) -> float | None:
@@ -2434,9 +2522,10 @@ def validate_workflow_phase(
             f"{identifier} --reason \"source changed after confirmation\"`."
         )
     if phase == "repair":
-        if len(completed_repairs) >= MAX_REPAIR_ROUNDS:
+        max_repairs = workflow_max_repair_rounds(identifier)
+        if len(completed_repairs) >= max_repairs:
             raise ReviewError(
-                f"The {MAX_REPAIR_ROUNDS}-round repair limit was reached; "
+                f"The {max_repairs}-round repair limit was reached; "
                 "run the mandatory confirmation round."
             )
         return
@@ -2550,6 +2639,7 @@ def workflow_start_command(args: argparse.Namespace) -> int:
         identifier,
         name=args.name,
         max_budget_usd=max_budget_usd,
+        review_mode=args.review_mode,
     )
     print(identifier)
     return 0
@@ -2576,6 +2666,7 @@ def workflow_supersede_command(args: argparse.Namespace) -> int:
             )
         policy = old.get("policy") if isinstance(old.get("policy"), dict) else {}
         max_budget_usd = float(policy.get("max_budget_usd") or 5.0)
+        review_mode = review_mode_from_policy(policy)
         if args.by:
             if not replacement_path.exists():
                 raise ReviewError(
@@ -2594,6 +2685,7 @@ def workflow_supersede_command(args: argparse.Namespace) -> int:
                 replacement,
                 name=args.name or old.get("name"),
                 max_budget_usd=max_budget_usd,
+                review_mode=review_mode,
                 supersedes=(args.workflow_id,),
             )
         old.update(
@@ -2826,13 +2918,44 @@ def analytics_report(since_days: int) -> dict[str, Any]:
             runs.append((run_dir, metadata))
     metrics = workflow_metrics(runs)
     providers: dict[str, dict[str, Any]] = {}
+    review_modes: dict[str, dict[str, Any]] = {}
     provider_failure_categories: dict[str, int] = {}
     failure_types: dict[str, int] = {}
     contract_valid_runs = 0
     partial_runs = 0
-    for _, metadata in runs:
+    for run_dir, metadata in runs:
+        review_mode = str(metadata.get("review_mode") or "legacy")
+        mode_summary = review_modes.setdefault(
+            review_mode,
+            {
+                "runs": 0,
+                "completed_runs": 0,
+                "failed_runs": 0,
+                "reviewer_invocations": 0,
+                "successful_invocations": 0,
+                "reviewer_duration_seconds": 0.0,
+                "reported_cost_usd": 0.0,
+                "findings": 0,
+                "test_gaps": 0,
+            },
+        )
+        mode_summary["runs"] += 1
         if metadata.get("status") == "completed":
             contract_valid_runs += 1
+            mode_summary["completed_runs"] += 1
+        elif metadata.get("status") in {"failed", "partial"}:
+            mode_summary["failed_runs"] += 1
+        triage_path = run_dir / "triage.json"
+        if triage_path.exists():
+            triage = read_json(triage_path)
+            findings = triage.get("findings")
+            gaps = triage.get("test_gaps")
+            mode_summary["findings"] += (
+                len(findings) if isinstance(findings, list) else 0
+            )
+            mode_summary["test_gaps"] += (
+                len(gaps) if isinstance(gaps, list) else 0
+            )
         failure = metadata.get("failure")
         if isinstance(failure, dict):
             failure_type = str(failure.get("type") or "unknown")
@@ -2861,6 +2984,10 @@ def analytics_report(since_days: int) -> dict[str, Any]:
             if not isinstance(reviewer, dict):
                 continue
             for attempt in reviewer_attempts(reviewer):
+                mode_summary["reviewer_invocations"] += 1
+                mode_summary["reviewer_duration_seconds"] += float(
+                    attempt.get("duration_seconds") or 0
+                )
                 summary = providers.setdefault(
                     str(name),
                     {
@@ -2873,6 +3000,7 @@ def analytics_report(since_days: int) -> dict[str, Any]:
                 summary["invocations"] += 1
                 if reviewer_attempt_succeeded(attempt):
                     summary["successful"] += 1
+                    mode_summary["successful_invocations"] += 1
                 else:
                     summary["failed"] += 1
                     category = (
@@ -2886,11 +3014,18 @@ def analytics_report(since_days: int) -> dict[str, Any]:
                     )
                 usage = attempt.get("usage")
                 if isinstance(usage, dict):
-                    summary["cost_usd"] += float(
-                        usage.get("total_cost_usd") or 0
-                    )
+                    attempt_cost = float(usage.get("total_cost_usd") or 0)
+                    summary["cost_usd"] += attempt_cost
+                    mode_summary["reported_cost_usd"] += attempt_cost
     for summary in providers.values():
         summary["cost_usd"] = round(summary["cost_usd"], 6)
+    for summary in review_modes.values():
+        summary["reviewer_duration_seconds"] = round(
+            summary["reviewer_duration_seconds"], 3
+        )
+        summary["reported_cost_usd"] = round(
+            summary["reported_cost_usd"], 6
+        )
     workflow_ids = sorted(
         {
             str(metadata.get("workflow_id"))
@@ -2921,6 +3056,7 @@ def analytics_report(since_days: int) -> dict[str, Any]:
             sorted(provider_failure_categories.items())
         ),
         "providers": dict(sorted(providers.items())),
+        "review_modes": dict(sorted(review_modes.items())),
         "metrics": metrics,
     }
 
@@ -3187,7 +3323,9 @@ def status_command(_: argparse.Namespace) -> int:
     print(f"Config: {CONFIG_PATH}")
     ready = True
     for provider in PROVIDERS:
-        state = "enabled" if config[provider]["enabled"] else "disabled"
+        enabled = bool(config[provider]["enabled"])
+        locked = not bool(config[provider].get("allow_run_override", True))
+        state = "enabled" if enabled else "locked off" if locked else "disabled"
         model = config[provider]["model"]
         policy = ""
         if provider == "claude":
@@ -3196,13 +3334,18 @@ def status_command(_: argparse.Namespace) -> int:
                 f"max_budget_usd={config[provider].get('max_budget_usd')}"
             )
         command = PROVIDER_BINARIES[provider]
-        readiness = provider_readiness(provider, str(model))
+        readiness = (
+            provider_readiness(provider, str(model))
+            if enabled
+            else ProviderReadiness(True, "not probed while disabled")
+        )
+        cli_version = version_of(command) if enabled else "not probed"
         print(
             f"{provider}: {state}, model={model}{policy}, "
-            f"CLI={version_of(command)}, "
+            f"CLI={cli_version}, "
             f"readiness={readiness.detail}"
         )
-        if config[provider]["enabled"] and not readiness.ready:
+        if enabled and not readiness.ready:
             ready = False
     print(
         "workflow: "
@@ -3218,8 +3361,13 @@ def toggle_command(args: argparse.Namespace) -> int:
     if provider == "antigravity" and args.action == "enable":
         install_antigravity_agent()
     config[provider]["enabled"] = args.action == "enable"
+    if args.action == "enable":
+        config[provider]["allow_run_override"] = True
+    elif args.lock:
+        config[provider]["allow_run_override"] = False
     write_config(config)
-    print(f"{provider} {args.action}d in {CONFIG_PATH}")
+    state = "locked off" if args.action == "disable" and args.lock else f"{args.action}d"
+    print(f"{provider} {state} in {CONFIG_PATH}")
     if args.action == "enable":
         readiness = provider_readiness(
             provider, str(config[provider]["model"])
@@ -3425,13 +3573,19 @@ def doctor_command(args: argparse.Namespace) -> int:
         }
     )
     for provider in PROVIDERS:
-        readiness = provider_readiness(
-            provider, str(config[provider]["model"])
+        enabled = bool(config[provider]["enabled"])
+        readiness = (
+            provider_readiness(provider, str(config[provider]["model"]))
+            if enabled
+            else ProviderReadiness(True, "not probed while disabled")
         )
         checks.append(
             {
                 "name": f"{provider}_static_readiness",
-                "enabled": bool(config[provider]["enabled"]),
+                "enabled": enabled,
+                "locked": not bool(
+                    config[provider].get("allow_run_override", True)
+                ),
                 "ok": readiness.ready,
                 "detail": readiness.detail,
                 "models": list(readiness.models),
@@ -4371,7 +4525,8 @@ def resume_review_locked(
                 "Claude exhausted the previous per-review budget. A blind "
                 "resume would not improve its limit or effort; pass an explicit "
                 f"--claude-max-budget-usd greater than {previous_budget:g} or "
-                "a lower --claude-effort. If the source or path scope must "
+                "a lower --claude-effort without reducing that budget. If the "
+                "source or path scope must "
                 "change, create a linked successor instead."
             )
         command.extend(["--claude-model", str(claude.get("model") or "sonnet")])
@@ -4512,12 +4667,23 @@ def run_review_command(args: argparse.Namespace) -> int:
     repository = repository_metadata(repo)
     selected_workflow = args.workflow_id or workflow_id()
     if args.workflow_id:
-        require_active_workflow(selected_workflow)
+        workflow_document = require_active_workflow(selected_workflow)
     else:
         create_workflow(
             selected_workflow,
             max_budget_usd=float(config["workflow"]["max_budget_usd"]),
         )
+        workflow_document = require_active_workflow(selected_workflow)
+    if args.claude_effort is None:
+        args.claude_effort = workflow_phase_effort(
+            selected_workflow, args.phase
+        )
+    workflow_policy_value = workflow_document.get("policy")
+    review_mode = (
+        workflow_policy_value.get("review_mode")
+        if isinstance(workflow_policy_value, dict)
+        else None
+    )
     reused_scope: Scope | None = None
     if args.reuse_contract:
         if not args.workflow_id:
@@ -4601,6 +4767,7 @@ def run_review_command(args: argparse.Namespace) -> int:
         "workflow_id": selected_workflow,
         "round": round_number,
         "phase": args.phase,
+        "review_mode": review_mode,
         "status": "preflight",
         "created_at": utc_now(),
         "repository": repository,
@@ -4972,6 +5139,14 @@ def build_parser() -> argparse.ArgumentParser:
     for action in ("enable", "disable"):
         toggle = subparsers.add_parser(action, help=f"{action.title()} a reviewer")
         toggle.add_argument("provider", choices=PROVIDER_CHOICES)
+        if action == "disable":
+            toggle.add_argument(
+                "--lock",
+                action="store_true",
+                help="Also reject explicit one-run enable overrides",
+            )
+        else:
+            toggle.set_defaults(lock=False)
         toggle.set_defaults(action=action)
 
     set_model = subparsers.add_parser(
@@ -5009,6 +5184,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workflow_start.add_argument("--name", help="Optional human-readable task name")
     workflow_start.add_argument("--max-budget-usd", type=float)
+    workflow_start.add_argument(
+        "--review-mode",
+        choices=sorted(REVIEW_MODES),
+        default=DEFAULT_REVIEW_MODE,
+        help=(
+            "Adaptive review depth: fast allows one repair, balanced two, "
+            "and deep three; every mode still requires confirmation"
+        ),
+    )
     workflow_status_parser = workflow_subparsers.add_parser(
         "status", help="Check latest finalized round for each repository"
     )

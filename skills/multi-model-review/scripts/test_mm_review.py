@@ -145,6 +145,14 @@ class RunnerUnitTests(unittest.TestCase):
                 selected_budget=1.25,
             )
         )
+        self.assertFalse(
+            MM.materially_changes_claude_retry(
+                previous_effort="medium",
+                previous_budget=1.25,
+                selected_effort="low",
+                selected_budget=0.75,
+            )
+        )
 
     def test_non_finite_budget_is_rejected_from_config_and_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -534,6 +542,83 @@ class RunnerUnitTests(unittest.TestCase):
                 phase="confirmation",
                 round_number=4,
             )
+
+    def test_review_modes_bound_repairs_and_keep_confirmation(self) -> None:
+        self.assertEqual(
+            MM.workflow_policy(2.5, "fast"),
+            {
+                "review_mode": "fast",
+                "max_repair_rounds": 1,
+                "confirmation_required": True,
+                "repair_effort": "low",
+                "confirmation_effort": "medium",
+                "max_budget_usd": 2.5,
+            },
+        )
+        repair = (
+            Path("/private/tmp/run-1"),
+            {
+                "repository": {"id": "repo-1"},
+                "status": "completed",
+                "round": 1,
+                "phase": "repair",
+            },
+        )
+        with (
+            mock.patch.object(MM, "workflow_runs", return_value=[repair]),
+            mock.patch.object(MM, "workflow_max_repair_rounds", return_value=1),
+            self.assertRaisesRegex(MM.ReviewError, "1-round repair limit"),
+        ):
+            MM.validate_workflow_phase(
+                "wf-fast",
+                "repo-1",
+                phase="repair",
+                round_number=2,
+            )
+        with (
+            mock.patch.object(MM, "workflow_runs", return_value=[repair]),
+            mock.patch.object(MM, "workflow_max_repair_rounds", return_value=1),
+        ):
+            MM.validate_workflow_phase(
+                "wf-fast",
+                "repo-1",
+                phase="confirmation",
+                round_number=2,
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            with mock.patch.object(MM, "WORKFLOWS_DIR", workflows):
+                MM.create_workflow(
+                    "wf-fast",
+                    max_budget_usd=2.5,
+                    review_mode="fast",
+                )
+                self.assertEqual(MM.workflow_max_repair_rounds("wf-fast"), 1)
+                self.assertEqual(
+                    MM.workflow_phase_effort("wf-fast", "repair"), "low"
+                )
+                self.assertEqual(
+                    MM.workflow_phase_effort("wf-fast", "confirmation"),
+                    "medium",
+                )
+                MM.safe_write_json(
+                    workflows / "wf-legacy.json",
+                    {
+                        "workflow_id": "wf-legacy",
+                        "policy": {
+                            "max_budget_usd": 5.0,
+                            "max_repair_rounds": 3,
+                            "confirmation_required": True,
+                        },
+                    },
+                )
+                self.assertEqual(
+                    MM.workflow_max_repair_rounds("wf-legacy"),
+                    MM.MAX_REPAIR_ROUNDS,
+                )
+                self.assertIsNone(
+                    MM.workflow_phase_effort("wf-legacy", "repair")
+                )
 
     def test_initial_commit_is_equivalent_to_reviewed_unborn_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1423,6 +1508,20 @@ None.
         ):
             MM.reviewer_definitions(explicit_args, config)
 
+    def test_locked_provider_rejects_one_run_override(self) -> None:
+        args = MM.build_parser().parse_args(
+            [
+                "run",
+                "--without-claude",
+                "--with-antigravity",
+                "--without-kimi",
+            ]
+        )
+        config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
+        config["antigravity"]["allow_run_override"] = False
+        with self.assertRaisesRegex(MM.ReviewError, "locked off"):
+            MM.reviewer_definitions(args, config)
+
     def test_legacy_gemini_config_migrates_to_antigravity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config_path = Path(temporary) / "config.json"
@@ -1466,6 +1565,33 @@ None.
         )
         self.assertNotIn("gemini", persisted)
 
+    def test_disable_lock_persists_until_provider_is_enabled(self) -> None:
+        parser = MM.build_parser()
+        with tempfile.TemporaryDirectory() as temporary:
+            config_dir = Path(temporary)
+            config_path = config_dir / "config.json"
+            with (
+                mock.patch.object(MM, "CONFIG_DIR", config_dir),
+                mock.patch.object(MM, "CONFIG_PATH", config_path),
+                mock.patch.object(MM, "install_antigravity_agent"),
+                mock.patch.object(
+                    MM,
+                    "provider_readiness",
+                    return_value=MM.ProviderReadiness(True, "authenticated"),
+                ),
+            ):
+                MM.toggle_command(
+                    parser.parse_args(["disable", "antigravity", "--lock"])
+                )
+                locked = json.loads(config_path.read_text(encoding="utf-8"))
+                MM.toggle_command(parser.parse_args(["enable", "antigravity"]))
+                enabled = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(locked["antigravity"]["enabled"])
+        self.assertFalse(locked["antigravity"]["allow_run_override"])
+        self.assertTrue(enabled["antigravity"]["enabled"])
+        self.assertTrue(enabled["antigravity"]["allow_run_override"])
+
     def test_status_exit_code_tracks_enabled_reviewer_readiness(self) -> None:
         config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
         config["antigravity"]["enabled"] = True
@@ -1504,6 +1630,18 @@ None.
             mock.patch.object(MM, "version_of", return_value="test-version"),
         ):
             self.assertEqual(MM.status_command(mock.Mock()), 0)
+
+    def test_status_does_not_probe_disabled_providers(self) -> None:
+        config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
+        config["claude"]["enabled"] = False
+        with (
+            mock.patch.object(MM, "load_config", return_value=config),
+            mock.patch.object(MM, "provider_readiness") as readiness,
+            mock.patch.object(MM, "version_of") as version,
+        ):
+            self.assertEqual(MM.status_command(mock.Mock()), 0)
+        readiness.assert_not_called()
+        version.assert_not_called()
 
     def test_antigravity_agent_is_installed_with_hard_tool_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2269,7 +2407,12 @@ None.
         with tempfile.TemporaryDirectory() as temporary:
             workflows = Path(temporary)
             with mock.patch.object(MM, "WORKFLOWS_DIR", workflows):
-                MM.create_workflow("wf-old", name="Old", max_budget_usd=7.0)
+                MM.create_workflow(
+                    "wf-old",
+                    name="Old",
+                    max_budget_usd=7.0,
+                    review_mode="fast",
+                )
                 args = MM.build_parser().parse_args(
                     [
                         "workflow",
@@ -2288,7 +2431,55 @@ None.
         self.assertEqual(old["superseded_by"], replacement)
         self.assertEqual(old["status"], "superseded")
         self.assertEqual(new["supersedes"], ["wf-old"])
-        self.assertEqual(new["policy"]["max_budget_usd"], 7.0)
+        self.assertEqual(
+            new["policy"],
+            {
+                "review_mode": "fast",
+                "max_repair_rounds": 1,
+                "confirmation_required": True,
+                "repair_effort": "low",
+                "confirmation_effort": "medium",
+                "max_budget_usd": 7.0,
+            },
+        )
+
+    def test_workflow_supersede_preserves_legacy_repair_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            with mock.patch.object(MM, "WORKFLOWS_DIR", workflows):
+                MM.safe_write_json(
+                    workflows / "wf-legacy.json",
+                    {
+                        "workflow_id": "wf-legacy",
+                        "name": "Legacy",
+                        "policy": {
+                            "max_repair_rounds": 3,
+                            "confirmation_required": True,
+                            "max_budget_usd": 5.0,
+                        },
+                    },
+                )
+                args = MM.build_parser().parse_args(
+                    [
+                        "workflow",
+                        "supersede",
+                        "wf-legacy",
+                        "--reason",
+                        "source changed",
+                    ]
+                )
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    MM.workflow_supersede_command(args)
+                replacement = output.getvalue().strip()
+                successor = MM.read_json(workflows / f"{replacement}.json")
+
+        self.assertEqual(successor["policy"]["review_mode"], "deep")
+        self.assertEqual(successor["policy"]["max_repair_rounds"], 3)
+        self.assertEqual(successor["policy"]["repair_effort"], "medium")
+        self.assertEqual(
+            successor["policy"]["confirmation_effort"], "medium"
+        )
 
     def test_workflow_supersede_waits_for_budget_writer_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2662,6 +2853,20 @@ None.
             {"invalid_report": 1, "reviewer_failure": 1},
         )
         self.assertEqual(report["providers"]["claude"]["cost_usd"], 0.2)
+        self.assertEqual(
+            report["review_modes"]["legacy"],
+            {
+                "runs": 1,
+                "completed_runs": 0,
+                "failed_runs": 1,
+                "reviewer_invocations": 2,
+                "successful_invocations": 1,
+                "reviewer_duration_seconds": 1.1,
+                "reported_cost_usd": 0.2,
+                "findings": 0,
+                "test_gaps": 0,
+            },
+        )
 
 
 class RunnerEndToEndTests(unittest.TestCase):
@@ -2838,6 +3043,110 @@ class RunnerEndToEndTests(unittest.TestCase):
         self.assertEqual(reused.returncode, 2)
         self.assertIn("already consumed", reused.stderr)
         self.assertEqual(count, "1")
+
+    def test_fast_mode_wires_phase_effort_into_run_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            repo = root / "repo"
+            bin_dir = root / "bin"
+            home.mkdir()
+            repo.mkdir()
+            bin_dir.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+
+            fake_claude = bin_dir / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/bin/sh
+                    if [ "$1" = "--version" ]; then
+                      echo "fake-claude 1.0"
+                      exit 0
+                    fi
+                    cat >/dev/null
+                    python3 -c 'import json; print(json.dumps({
+                      "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n",
+                      "total_cost_usd": 0.01
+                    }))'
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+            base = [sys.executable, str(SCRIPT_PATH)]
+            started = run(
+                [
+                    *base,
+                    "workflow",
+                    "start",
+                    "--review-mode",
+                    "fast",
+                    "--max-budget-usd",
+                    "3",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            workflow_identifier = started.stdout.strip()
+            run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    workflow_identifier,
+                    "--path",
+                    "src",
+                    "--task",
+                    "Change the feature value.",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    workflow_identifier,
+                    "--phase",
+                    "confirmation",
+                    "--reuse-contract",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            metadata = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (home / ".codex" / "review-runs").glob(
+                    "*/*/metadata.json"
+                )
+            ]
+
+        by_phase = {item["phase"]: item for item in metadata}
+        self.assertEqual(set(by_phase), {"repair", "confirmation"})
+        self.assertEqual(by_phase["repair"]["review_mode"], "fast")
+        self.assertEqual(
+            by_phase["repair"]["review_policy"]["claude_effort"], "low"
+        )
+        self.assertEqual(
+            by_phase["confirmation"]["review_policy"]["claude_effort"],
+            "medium",
+        )
 
     def test_run_triage_finalize_and_freshness(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
