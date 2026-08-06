@@ -7,6 +7,10 @@ can violate an intended contract. Prefer a focused reproduction or regression
 test. Reject style preferences, speculative future requirements, and findings
 that ignore an existing guard elsewhere in the call path.
 
+A low-severity observation that explicitly has no reachable impact and needs no
+action is not a finding. Preserve it as non-gating audit evidence without
+creating triage work. Never suppress a medium, high, or blocker item this way.
+
 Use these severities:
 
 - `blocker`: credential exposure, destructive data loss, unauthorized live
@@ -96,9 +100,17 @@ The final machine-readable gate is:
   remain;
 - `BLOCK`: an accepted/uncertain blocker or high finding remains.
 
-`mm-review verify` must confirm the final gate is fresh. For tasks spanning
-repositories, `mm-review workflow finalize` must confirm the latest round in
-each repository and the complete triage history.
+`mm-review verify` must confirm the final gate is fresh. Every task must also
+run `mm-review workflow finalize` to close the workflow after confirming the
+latest round in each repository and the complete triage history.
+
+A supplemental review is permitted only for an unchanged passing final and one
+focused additional question. It performs one fresh review and writes a
+non-authoritative `supplemental.json`. If Codex accepts an issue that requires a
+source change, open a normal linked successor and repeat repair plus
+confirmation. Supplemental evidence never replaces or upgrades the parent
+gate. All supplemental siblings share the parent task lineage's spend,
+reservations, and cumulative cap.
 
 Committing an unchanged reviewed working tree is a state transition, not a code
 change. Use `mm-review attest-commit` to bind the final gate to the checked-out
@@ -117,6 +129,10 @@ for the other.
 
 Codex may compare reports only after both reviewers finish. Agreement raises
 priority for investigation but does not prove the finding.
+
+Codex-only evidence memory follows the same boundary: retrieve prior decisions
+only after fresh independent reports return. Never include memory results or
+earlier findings in reviewer prompts.
 
 ## Claude ultrareview
 

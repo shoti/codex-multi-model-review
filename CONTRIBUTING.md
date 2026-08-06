@@ -52,7 +52,7 @@ The following are deliberate safety properties:
 - Repair rounds are bounded and followed by a mandatory confirmation.
 - Source fingerprints make stale final gates fail closed.
 - Credentials and likely secret material are blocked before provider review.
-- Claude reviews have both per-call and cumulative workflow spend caps; other
+- Claude reviews have both per-call and cumulative task-lineage spend caps; other
   providers are opt-in.
 
 Changes that weaken an invariant need explicit rationale, tests, and a migration

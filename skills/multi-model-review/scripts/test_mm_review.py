@@ -2030,6 +2030,7 @@ None.
                         "structured_output": {
                             "verdict": "PASS_WITH_FINDINGS",
                             "findings": [{
+                                "actionable": True,
                                 "severity": "medium",
                                 "title": "Reachable defect",
                                 "location": "src/a.py:1",
@@ -2336,6 +2337,49 @@ None.
                 released = MM.read_json(workflows / "wf-budget.json")
         self.assertEqual(released["budget_reservations"], {})
 
+    def test_supplemental_siblings_share_parent_lineage_reservations(self) -> None:
+        reviewer = MM.Reviewer(
+            "claude",
+            ("claude", "--max-budget-usd", "1.25"),
+            {},
+            "sonnet",
+            "fake",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "workflow_spend", return_value=0.0),
+            ):
+                MM.create_workflow("wf-parent", max_budget_usd=2.0)
+                MM.create_workflow(
+                    "wf-supplemental-one",
+                    max_budget_usd=2.0,
+                    workflow_kind="supplemental",
+                    supplemental_parent_workflow_id="wf-parent",
+                )
+                MM.create_workflow(
+                    "wf-supplemental-two",
+                    max_budget_usd=2.0,
+                    workflow_kind="supplemental",
+                    supplemental_parent_workflow_id="wf-parent",
+                )
+                first, first_status = MM.apply_workflow_budget(
+                    [reviewer], "wf-supplemental-one", reservation_id="run-one"
+                )
+                second, second_status = MM.apply_workflow_budget(
+                    [reviewer], "wf-supplemental-two", reservation_id="run-two"
+                )
+                lineage = MM.workflow_lineage_ids("wf-supplemental-two")
+        self.assertEqual(float(first[0].command[-1]), 1.25)
+        self.assertEqual(float(second[0].command[-1]), 0.75)
+        self.assertEqual(first_status["reserved_before_run_usd"], 0.0)
+        self.assertEqual(second_status["reserved_before_run_usd"], 1.25)
+        self.assertEqual(
+            lineage,
+            ["wf-parent", "wf-supplemental-one", "wf-supplemental-two"],
+        )
+
     def test_mixed_reviewer_and_contract_failures_are_both_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)
@@ -2442,6 +2486,32 @@ None.
                 "max_budget_usd": 7.0,
             },
         )
+
+    def test_workflow_supersede_by_rejects_a_different_budget_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            with mock.patch.object(MM, "WORKFLOWS_DIR", workflows):
+                MM.create_workflow("wf-old", max_budget_usd=5.0)
+                MM.create_workflow("wf-large", max_budget_usd=1000.0)
+                args = MM.build_parser().parse_args(
+                    [
+                        "workflow",
+                        "supersede",
+                        "wf-old",
+                        "--by",
+                        "wf-large",
+                        "--reason",
+                        "contract changed",
+                    ]
+                )
+                with self.assertRaisesRegex(
+                    MM.ReviewError, "must exactly match"
+                ):
+                    MM.workflow_supersede_command(args)
+                old = MM.read_json(workflows / "wf-old.json")
+                replacement = MM.read_json(workflows / "wf-large.json")
+        self.assertNotIn("superseded_by", old)
+        self.assertEqual(replacement["supersedes"], [])
 
     def test_workflow_supersede_preserves_legacy_repair_depth(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2865,11 +2935,651 @@ None.
                 "reported_cost_usd": 0.2,
                 "findings": 0,
                 "test_gaps": 0,
+                "decisions": {},
             },
         )
 
 
+    def test_lineage_spend_and_budget_include_superseded_ancestors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs = root / "runs"
+            workflows = runs / "workflows"
+            run_dir = runs / "repo-one" / "run-one"
+            run_dir.mkdir(parents=True)
+            workflows.mkdir()
+            MM.safe_write_json(
+                workflows / "wf-old.json",
+                {
+                    "workflow_id": "wf-old",
+                    "status": "superseded",
+                    "superseded_by": "wf-new",
+                    "supersedes": [],
+                    "policy": MM.workflow_policy(1.5, "balanced"),
+                    "budget_reservations": {
+                        "ancestor-run": {
+                            "max_budget_usd": 0.25,
+                            "reserved_at": MM.utc_now(),
+                        }
+                    },
+                },
+            )
+            MM.safe_write_json(
+                workflows / "wf-new.json",
+                {
+                    "workflow_id": "wf-new",
+                    "supersedes": ["wf-old"],
+                    "policy": MM.workflow_policy(1.5, "balanced"),
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "workflow_id": "wf-old",
+                    "created_at": MM.utc_now(),
+                    "status": "completed",
+                    "reviewers": {
+                        "claude": {
+                            "exit_code": 0,
+                            "duration_seconds": 1,
+                            "usage": {"total_cost_usd": 1.0},
+                        }
+                    },
+                },
+            )
+            reviewer = MM.Reviewer(
+                "claude",
+                ("claude", "--max-budget-usd", "1.25"),
+                {},
+                "sonnet",
+                "test",
+            )
+            with (
+                mock.patch.object(MM, "RUNS_DIR", runs),
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+            ):
+                self.assertEqual(MM.workflow_spend("wf-new"), 1.0)
+                adjusted, budget = MM.apply_workflow_budget(
+                    [reviewer], "wf-new", reservation_id="run-new"
+                )
+            self.assertEqual(adjusted[0].command[-1], "0.25")
+            self.assertEqual(budget["spent_before_run_usd"], 1.0)
+            self.assertEqual(budget["reserved_before_run_usd"], 0.25)
+
+    def test_evidence_memory_rebuilds_and_searches_across_workflows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            database = root / "evidence.sqlite3"
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "run_id": "run-one",
+                    "workflow_id": "wf-successor",
+                    "repository": {"id": "repo-one", "name": "repo"},
+                    "source_fingerprint": "abc",
+                    "phase": "confirmation",
+                    "round": 2,
+                    "created_at": MM.utc_now(),
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {
+                    "findings": [
+                        {
+                            "id": "claude-001",
+                            "kind": "finding",
+                            "reviewer": "claude",
+                            "severity": "low",
+                            "title": "Duration alert rounds below threshold",
+                            "decision": "fixed",
+                            "evidence": "Message now retains precision.",
+                            "verification": "Focused test passes.",
+                        }
+                    ],
+                    "test_gaps": [],
+                },
+            )
+            rebuilt = MM.rebuild_evidence_memory(
+                database, [(run_dir, "wf-root")]
+            )
+            results = MM.search_evidence_memory(
+                database,
+                "duration alert rounding below threshold",
+                repository_id="repo-one",
+            )
+            compacted = MM.compact_evidence_memory(database)
+            self.assertEqual(rebuilt["evidence_items"], 1)
+            self.assertEqual(results[0]["lineage_root"], "wf-root")
+            self.assertEqual(results[0]["decision"], "fixed")
+            self.assertEqual(database.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(compacted["evidence_items"], 1)
+
+    def test_analytics_reports_lineage_outcomes_and_run_finals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflows = root / "workflows"
+            run_dir = root / "repo" / "run"
+            workflows.mkdir()
+            run_dir.mkdir(parents=True)
+            metadata = {
+                "run_id": "run-one",
+                "workflow_id": "wf-one",
+                "created_at": MM.utc_now(),
+                "status": "completed",
+                "review_mode": "balanced",
+                "repository": {"id": "repo-one"},
+                "reviewers": {},
+            }
+            MM.safe_write_json(run_dir / "metadata.json", metadata)
+            MM.safe_write_json(run_dir / "triage.json", {"findings": [], "test_gaps": []})
+            MM.safe_write_json(run_dir / "final.json", {"status": "PASS_CLEAN"})
+            MM.safe_write_json(
+                workflows / "wf-one.json",
+                {
+                    "workflow_id": "wf-one",
+                    "supersedes": [],
+                    "policy": MM.workflow_policy(5.0, "balanced"),
+                },
+            )
+            with (
+                mock.patch.object(MM, "RUNS_DIR", root),
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "all_run_metadata", return_value=[(run_dir, metadata)]),
+            ):
+                report = MM.analytics_report(7)
+            self.assertEqual(report["finalized_workflows"], 0)
+            self.assertEqual(report["workflows_with_run_finals"], 1)
+            self.assertEqual(report["lineage_count"], 1)
+            self.assertEqual(report["lineage_outcomes"], {"PASS_CLEAN": 1})
+            self.assertEqual(
+                report["review_modes"]["balanced"]["lineage_outcomes"],
+                {"PASS_CLEAN": 1},
+            )
+
+    def test_non_actionable_finding_is_preserved_as_observation(self) -> None:
+        parsed = MM.parse_review_report(
+            "claude",
+            textwrap.dedent(
+                """\
+                # Verdict
+                PASS_CLEAN
+
+                # Findings
+                ## [low] Deterministic timer setup
+                - Location: test_feature.py:10
+                - Trigger: Test runs
+                - Evidence: Fake time advances only in the stub
+                - Impact: None - assertions remain deterministic
+                - Smallest fix: No action needed
+                - Confidence: high
+
+                # Test gaps
+                None.
+
+                # Notes
+                None.
+                """
+            ),
+        )
+        self.assertEqual(parsed["verdict"], "PASS_CLEAN")
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(len(parsed["observations"]), 1)
+        self.assertIn("non-actionable", parsed["normalizations"][0])
+
+    def test_observation_only_pass_with_findings_normalizes_to_clean(self) -> None:
+        parsed = MM.parse_review_report(
+            "claude",
+            textwrap.dedent(
+                """\
+                # Verdict
+                PASS_WITH_FINDINGS
+
+                # Findings
+                ## [low] Deterministic timer setup
+                - Location: test_feature.py:10
+                - Trigger: Test runs
+                - Evidence: Fake time advances only in the stub
+                - Impact: None
+                - Smallest fix: No action needed
+                - Confidence: high
+
+                # Test gaps
+                None.
+
+                # Notes
+                None.
+                """
+            ),
+        )
+        self.assertEqual(parsed["declared_verdict"], "PASS_WITH_FINDINGS")
+        self.assertEqual(parsed["verdict"], "PASS_CLEAN")
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(len(parsed["observations"]), 1)
+        self.assertFalse(MM.parsed_report_is_invalid(parsed))
+
+    def test_high_severity_no_action_text_remains_a_finding(self) -> None:
+        parsed = MM.parse_review_report(
+            "claude",
+            textwrap.dedent(
+                """\
+                # Verdict
+                BLOCK
+
+                # Findings
+                ## [high] Security invariant is unclear
+                - Location: src/security.py:10
+                - Trigger: Untrusted input reaches the parser
+                - Evidence: The reviewer could not prove the guard
+                - Impact: No impact was reproduced
+                - Smallest fix: No action needed
+                - Confidence: low
+
+                # Test gaps
+                None.
+
+                # Notes
+                None.
+                """
+            ),
+            risk_profiled=True,
+        )
+        self.assertEqual(parsed["verdict"], "BLOCK")
+        self.assertEqual(len(parsed["findings"]), 1)
+        self.assertEqual(parsed["observations"], [])
+
+    def test_non_actionable_observation_is_persisted_in_triage_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            report = run_dir / "claude.md"
+            error = run_dir / "claude.stderr.log"
+            report.write_text(
+                textwrap.dedent(
+                    """\
+                    # Verdict
+                    PASS_CLEAN
+
+                    # Findings
+                    ## [low] Harmless test observation
+                    - Location: test_feature.py:10
+                    - Trigger: Fake clock advances
+                    - Evidence: Only the isolated stub changes
+                    - Impact: None
+                    - Smallest fix: No action needed
+                    - Confidence: high
+
+                    # Test gaps
+                    None.
+
+                    # Notes
+                    None.
+                    """
+                ),
+                encoding="utf-8",
+            )
+            error.write_text("", encoding="utf-8")
+            now = MM.utc_now()
+            metadata = {
+                "run_id": "run-observation",
+                "workflow_id": "wf-observation",
+                "repository": {"id": "repo-observation"},
+                "created_at": now,
+                "started_at": now,
+                "risks": [],
+            }
+            reviewer = MM.Reviewer(
+                "claude", ("claude",), {}, "sonnet", "fake"
+            )
+            result = MM.ReviewResult(
+                "claude",
+                0,
+                report,
+                error,
+                now,
+                now,
+                0.1,
+                False,
+                {"total_cost_usd": 0.01},
+                None,
+            )
+            with mock.patch.object(MM, "workflow_lineage_runs", return_value=[]):
+                MM.persist_review_results(
+                    run_dir=run_dir,
+                    metadata=metadata,
+                    reviewers=[reviewer],
+                    results=[result],
+                )
+            triage = MM.read_json(run_dir / "triage.json")
+        self.assertEqual(triage["findings"], [])
+        self.assertEqual(len(triage["observations"]), 1)
+
+    def test_mode_recommendation_fails_closed_for_explicit_risk(self) -> None:
+        args = MM.build_parser().parse_args(
+            ["recommend", "--risk", "security"]
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.object(MM, "resolve_repo", return_value=Path("/repo")),
+            mock.patch.object(MM, "normalize_path_filters", return_value=()),
+            mock.patch.object(
+                MM,
+                "resolve_scope",
+                return_value=MM.Scope("uncommitted", None, "changes"),
+            ),
+            mock.patch.object(MM, "changed_paths", return_value=["src/auth.py"]),
+            redirect_stdout(output),
+        ):
+            MM.recommend_mode_command(args)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["recommended_mode"], "deep")
+        self.assertTrue(result["advisory_only"])
+
+    def test_workflow_status_distinguishes_ready_to_finalize_and_completed(self) -> None:
+        run_dir = Path("/private/tmp/finalized-review")
+        metadata = {
+            "workflow_id": "wf-done",
+            "repository": {"id": "repo-one"},
+            "status": "completed",
+            "round": 2,
+            "phase": "confirmation",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            MM.safe_write_json(
+                workflows / "wf-done.json",
+                {
+                    "workflow_id": "wf-done",
+                    "supersedes": [],
+                    "policy": MM.workflow_policy(),
+                },
+            )
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "workflow_runs", return_value=[(run_dir, metadata)]),
+                mock.patch.object(
+                    MM, "workflow_lineage_runs", return_value=[(run_dir, metadata)]
+                ),
+                mock.patch.object(
+                    MM, "workflow_lineage_ids", return_value=["wf-done"]
+                ),
+                mock.patch.object(MM, "latest_workflow_runs", return_value=[(run_dir, metadata)]),
+                mock.patch.object(Path, "exists", return_value=True),
+                mock.patch.object(MM, "read_json") as read_json,
+                mock.patch.object(
+                    MM,
+                    "freshness_status",
+                    return_value={"fresh": True, "mode": "working-tree"},
+                ),
+            ):
+                workflow_document = {
+                    "workflow_id": "wf-done",
+                    "supersedes": [],
+                    "policy": MM.workflow_policy(),
+                }
+                final_document = {"status": "PASS_CLEAN", "source_fingerprint": "x"}
+                read_json.side_effect = lambda path: (
+                    final_document if path.name == "final.json" else workflow_document
+                )
+                status, ready = MM.workflow_status("wf-done")
+            self.assertTrue(ready)
+            self.assertEqual(status["state"], "ready_to_finalize")
+            self.assertFalse(status["repositories"][0]["accepts_reviews"])
+
+    def test_supplemental_final_is_explicitly_non_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "run_id": "run-supplemental",
+                    "workflow_id": "wf-supplemental",
+                    "status": "completed",
+                    "phase": "supplemental",
+                    "round": 1,
+                    "source_fingerprint": "same",
+                    "supplemental_of": "/private/tmp/parent",
+                    "risks": [],
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {"findings": [], "test_gaps": []},
+            )
+            args = MM.build_parser().parse_args(
+                [
+                    "finalize",
+                    "--run",
+                    str(run_dir),
+                    "--codex-review",
+                    "Focused recheck passed.",
+                ]
+            )
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM,
+                    "freshness_status",
+                    return_value={"fresh": True, "mode": "working-tree"},
+                ),
+                mock.patch.object(
+                    MM, "workflow_requires_confirmation", return_value=False
+                ),
+            ):
+                result = MM.finalize_command(args)
+            supplemental = MM.read_json(run_dir / "supplemental.json")
+            self.assertEqual(result, 0)
+            self.assertEqual(supplemental["status"], "SUPPLEMENTAL_CLEAN")
+            self.assertFalse(supplemental["authoritative_gate"])
+            self.assertFalse((run_dir / "final.json").exists())
+
+    def test_workflow_finalize_persists_completed_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            MM.safe_write_json(
+                workflows / "wf-ready.json",
+                {
+                    "workflow_id": "wf-ready",
+                    "supersedes": [],
+                    "policy": MM.workflow_policy(),
+                },
+            )
+            args = MM.build_parser().parse_args(
+                ["workflow", "finalize", "wf-ready"]
+            )
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(
+                    MM,
+                    "workflow_status",
+                    return_value=(
+                        {
+                            "workflow_id": "wf-ready",
+                            "state": "ready_to_finalize",
+                            "repositories": [],
+                        },
+                        True,
+                    ),
+                ),
+            ):
+                MM.workflow_finalize_command(args)
+            workflow = MM.read_json(workflows / "wf-ready.json")
+            final = MM.read_json(workflows / "wf-ready.final.json")
+            self.assertEqual(workflow["status"], "completed")
+            self.assertEqual(final["state"], "completed")
+
+
 class RunnerEndToEndTests(unittest.TestCase):
+    def test_supplemental_recheck_uses_one_review_and_preserves_parent_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            repo = root / "repo"
+            bin_dir = root / "bin"
+            count_path = root / "invocations"
+            home.mkdir()
+            repo.mkdir()
+            bin_dir.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+            fake_claude = bin_dir / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/usr/bin/env python3
+                    import json
+                    import pathlib
+                    import sys
+                    if "--version" in sys.argv:
+                        print("fake-claude 1.0")
+                        raise SystemExit(0)
+                    path = pathlib.Path({str(count_path)!r})
+                    path.write_text(str(int(path.read_text()) + 1 if path.exists() else 1))
+                    sys.stdin.read()
+                    print(json.dumps({{
+                        "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n",
+                        "total_cost_usd": 0.01
+                    }}))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+            base = [sys.executable, str(SCRIPT_PATH)]
+            started = run(
+                [
+                    *base,
+                    "workflow",
+                    "start",
+                    "--review-mode",
+                    "balanced",
+                    "--max-budget-usd",
+                    "0.08",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            workflow_identifier = started.stdout.strip()
+            run(
+                [
+                    *base,
+                    "run",
+                    "--workflow-id",
+                    workflow_identifier,
+                    "--path",
+                    "src",
+                    "--task",
+                    "Review the feature change.",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            run(
+                [
+                    *base,
+                    "run",
+                    "--workflow-id",
+                    workflow_identifier,
+                    "--phase",
+                    "confirmation",
+                    "--reuse-contract",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            run_dirs = [
+                path.parent
+                for path in (home / ".codex" / "review-runs").glob(
+                    "*/*/metadata.json"
+                )
+            ]
+            confirmation_dir = next(
+                path
+                for path in run_dirs
+                if json.loads((path / "metadata.json").read_text())["phase"]
+                == "confirmation"
+            )
+            run(
+                [
+                    *base,
+                    "finalize",
+                    "--run",
+                    str(confirmation_dir),
+                    "--codex-review",
+                    "Parent gate passed.",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            supplemental = run(
+                [
+                    *base,
+                    "run",
+                    "--supplemental-of",
+                    str(confirmation_dir),
+                    "--task",
+                    "Check the unchanged value path once more.",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            supplemental_dir = Path(
+                next(
+                    line.split(": ", 1)[1]
+                    for line in supplemental.stdout.splitlines()
+                    if line.startswith("Review artifacts: ")
+                )
+            )
+            run(
+                [
+                    *base,
+                    "finalize",
+                    "--run",
+                    str(supplemental_dir),
+                    "--codex-review",
+                    "Supplemental question passed.",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            supplemental_metadata = json.loads(
+                (supplemental_dir / "metadata.json").read_text()
+            )
+            supplemental_workflow = json.loads(
+                (
+                    home
+                    / ".codex"
+                    / "review-runs"
+                    / "workflows"
+                    / f"{supplemental_metadata['workflow_id']}.json"
+                ).read_text()
+            )
+            invocation_count = count_path.read_text()
+            parent_final_exists = (confirmation_dir / "final.json").exists()
+            supplemental_final_exists = (
+                supplemental_dir / "supplemental.json"
+            ).exists()
+
+        self.assertEqual(invocation_count, "3")
+        self.assertTrue(parent_final_exists)
+        self.assertTrue(supplemental_final_exists)
+        self.assertEqual(supplemental_metadata["phase"], "supplemental")
+        self.assertEqual(
+            supplemental_workflow["supplemental_parent_workflow_id"],
+            workflow_identifier,
+        )
+        self.assertEqual(supplemental_workflow["policy"]["max_budget_usd"], 0.08)
+
     def test_commit_run_ignores_unrelated_dirty_paths_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -42,6 +42,8 @@ repository. Do not stop after collecting reviewer reports.
 8. Select `--review-mode fast` only for a small, localized, low-risk change;
    use `balanced` for ordinary work and `deep` whenever a risk label applies or
    the behavior spans components. Every mode retains mandatory confirmation.
+   `mm-review recommend` may be used as a conservative advisory; explicit risk
+   labels always keep the recommendation at `deep`.
 9. If the target, intended behavior, or production impact is ambiguous, ask
    before proceeding.
 
@@ -49,6 +51,7 @@ repository. Do not stop after collecting reviewer reports.
 
 State repositories, path filters, scope, risk profiles, and enabled reviewers.
 Create one workflow ID for the task with a deliberate cumulative Claude budget.
+That cap follows every linked successor; supersession never resets task spend.
 Claude, Antigravity, and Kimi receive fresh independent read-only sessions when
 enabled. Codex remains implementer, finding verifier, and final gate.
 
@@ -96,7 +99,8 @@ Before finishing:
 - inspect the final diff for correctness, scope, secrets, and unintended files;
 - perform the final Codex review;
 - run `mm-review finalize` and `mm-review verify` for every repository;
-- for multi-repository work, run `mm-review workflow finalize`.
+- run `mm-review workflow finalize` after every repository is ready, including
+  a single-repository task, so the workflow becomes explicitly completed;
 - if a reviewed working tree is later committed with user authorization, run
   `mm-review attest-commit --run <run-dir> --commit HEAD` and verify again.
 
@@ -111,6 +115,12 @@ Report:
 - verification commands and results;
 - the final freshness-checked gate status;
 - remaining risks or test gaps.
+
+For an additional focused question about an unchanged fresh final, use one
+`run --supplemental-of <final-run> --task <question>`. Triage, finalize, and
+verify its `supplemental.json`, but never present it as a replacement final
+gate. Historical evidence memory may assist Codex only after fresh reviewers
+finish; do not expose it in reviewer prompts.
 
 ## Next Steps
 
