@@ -34,6 +34,16 @@ broad cross-component changes; it retains the three-repair ceiling. Every mode
 still requires a fresh confirmation round. The default is `balanced`.
 Use `mm-review recommend` when the changed-path risk is unclear; its result is
 advisory and any explicit risk label still recommends `deep`.
+When historical budget exhaustion or an unfamiliar patch size makes the cap
+uncertain, inspect local evidence before starting:
+
+```bash
+mm-review budget-estimate --uncommitted \
+  --review-mode <fast|balanced|deep> --claude-effort <effort>
+```
+
+Treat the estimate as advisory. Never lower review quality or change provider,
+effort, or budget automatically from historical cost evidence.
 
 3. Run repair round 1 in each affected repository. Round numbering is automatic
    when `--round` is omitted. Prefer repeatable `--path` filters over temporary
@@ -94,6 +104,10 @@ gap `covered` requires verification and a changed scoped fingerprint.
 Reviewer test gaps are contractually limited to medium/low. A blocker/high
 test-gap heading makes the provider report invalid, and the triage/final gate
 also refuses to defer such an item as defense in depth.
+When the item includes `memory_matches`, record whether those candidates were
+`useful`, `irrelevant`, or `mixed` with `--memory-assessment`. This feedback is
+Codex-only telemetry and must not influence or enter independent reviewer
+prompts.
 
 Multiple decisions may run concurrently because the runner locks the complete
 triage transaction. Prefer one atomic batch when decisions are already known:
@@ -241,6 +255,8 @@ python3 <skill-dir>/scripts/mm_review.py set-effort medium
 python3 <skill-dir>/scripts/mm_review.py set-budget 1.25
 python3 <skill-dir>/scripts/mm_review.py set-workflow-budget 5
 python3 <skill-dir>/scripts/mm_review.py analytics --since-days 30 --format compact
+python3 <skill-dir>/scripts/mm_review.py budget-estimate --uncommitted --review-mode balanced
+python3 <skill-dir>/scripts/mm_review.py workflow audit --stale-days 7 --format compact
 python3 <skill-dir>/scripts/mm_review.py recommend --uncommitted --risk security
 python3 <skill-dir>/scripts/mm_review.py memory rebuild
 python3 <skill-dir>/scripts/mm_review.py memory search "repeated timeout finding" --format compact
@@ -350,11 +366,15 @@ The runner:
   categories, partial resumes, spend, decisions, lineage-level outcomes, closed
   workflows, provider-reported tokens, artifact bytes, review phases/models,
   and the distinct count of workflows with repository run finals.
+- separates explicit adaptive-mode cohorts from inferred legacy depth, reports
+  lifecycle debt and unclassified runs, and records advisory budget evidence;
+- records optional Codex feedback about memory candidates so retrieval quality
+  can be tuned from real usage instead of assumed relevance.
 
 Evidence memory is for Codex triage only. It is populated after fresh reviewer
 reports return and is never included in reviewer prompts. JSON run artifacts
 remain authoritative; the derived database can always be rebuilt.
-For `analytics`, `workflow status`, and `memory search`, JSON is the complete
+For `analytics`, `workflow status`, `workflow audit`, and `memory search`, JSON is the complete
 default. Use `--format compact` only when a summary is enough; the renderer
 retains references to full evidence and automatically falls back to JSON when
 the compact text would be larger.

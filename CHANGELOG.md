@@ -36,6 +36,16 @@ All notable user-visible changes are documented here. This project follows
   full JSON remains the default and compact rendering falls back when larger.
 - Rank evidence memory across titles, locations, evidence, actions, and
   verification so concise symbol/path/topic queries can retrieve verified work.
+- Separate explicit adaptive-mode lineage evidence from modes inferred for
+  legacy workflows, and report unclassified run records and distributions.
+- Add a read-only `workflow audit` that identifies pending triage, unclosed run
+  finals, failed workflows, and stale incomplete work without mutating history.
+- Add advisory historical budget estimates for the current patch and record the
+  estimate before paid reviews without changing effort or caps automatically.
+- Add explicit useful/irrelevant/mixed feedback for attached memory candidates
+  and report memory recall, structural matches, similarity, and assessments.
+- Extract dependency-free token, artifact, and distribution primitives into a
+  focused metrics module while keeping workflow orchestration in the runner.
 
 - Preserve every failed/resumed reviewer attempt and archive its provider
   artifacts so analytics and workflow spend include paid retries.

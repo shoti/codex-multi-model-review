@@ -42,6 +42,19 @@ from evidence_memory import (
     status as evidence_memory_status,
     upsert_run as upsert_evidence_run,
 )
+from review_metrics import (
+    ARTIFACT_BYTE_FIELDS,
+    TOKEN_FIELDS,
+    add_artifact_bytes,
+    add_token_usage,
+    empty_artifact_bytes,
+    empty_token_usage,
+    normalized_usage_tokens,
+    numeric_distribution,
+    path_size,
+    run_artifact_bytes,
+    tokens_from_mapping as _tokens_from_mapping,
+)
 
 
 CONFIG_DIR = Path.home() / ".config" / "multi-model-review"
@@ -128,6 +141,8 @@ DOCTOR_CLAUDE_BUDGET_USD = 0.10
 DEFAULT_QUOTA_COOLDOWN_MINUTES = 60
 MIN_CLAUDE_REVIEW_BUDGET_USD = 0.05
 DEFAULT_ANALYTICS_DAYS = 7
+DEFAULT_BUDGET_EVIDENCE_DAYS = 30
+MIN_BUDGET_ESTIMATE_SAMPLES = 5
 
 SENSITIVE_EXACT_NAMES = {
     ".env",
@@ -198,6 +213,7 @@ VALID_RISKS = {
 }
 VALID_DECISIONS = {"accepted", "deferred", "fixed", "rejected", "uncertain"}
 VALID_TEST_GAP_DECISIONS = {"accepted", "covered", "deferred", "rejected"}
+MEMORY_ASSESSMENTS = {"useful", "irrelevant", "mixed"}
 SEVERITY_ORDER = {"blocker": 4, "high": 3, "medium": 2, "low": 1}
 DOTENV_ASSIGNMENT_PATTERN = re.compile(
     r"""(?im)^[+\- ]?(?![+\-]{3})(?:export\s+)?
@@ -2290,6 +2306,13 @@ def review_mode_from_policy(policy: dict[str, Any]) -> str:
     return "deep"
 
 
+def review_mode_with_origin(policy: dict[str, Any]) -> tuple[str, str]:
+    """Keep inferred legacy depth out of explicit adaptive-mode evidence."""
+    mode = review_mode_from_policy(policy)
+    origin = "explicit" if policy.get("review_mode") in REVIEW_MODES else "inferred_legacy"
+    return mode, origin
+
+
 def workflow_path(identifier: str) -> Path:
     return WORKFLOWS_DIR / f"{identifier}.json"
 
@@ -3021,125 +3044,6 @@ def latest_workflow_runs(
     return sorted(latest.values(), key=lambda item: str(item[0]))
 
 
-TOKEN_FIELDS = (
-    "input_tokens",
-    "cache_creation_input_tokens",
-    "cache_read_input_tokens",
-    "output_tokens",
-)
-ARTIFACT_BYTE_FIELDS = (
-    "prompt_bytes",
-    "manifest_bytes",
-    "patch_bytes",
-    "reviewer_report_bytes",
-    "raw_response_bytes",
-)
-
-
-def empty_token_usage() -> dict[str, int]:
-    return {
-        **{field: 0 for field in TOKEN_FIELDS},
-        "total_input_tokens": 0,
-        "total_tokens": 0,
-    }
-
-
-def _numeric_token(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return 0
-    if not math.isfinite(float(value)) or value < 0:
-        return 0
-    return int(value)
-
-
-def _tokens_from_mapping(value: dict[str, Any]) -> dict[str, int]:
-    aliases = {
-        "input_tokens": ("input_tokens", "inputTokens"),
-        "cache_creation_input_tokens": (
-            "cache_creation_input_tokens",
-            "cacheCreationInputTokens",
-        ),
-        "cache_read_input_tokens": (
-            "cache_read_input_tokens",
-            "cacheReadInputTokens",
-            "cache_read_tokens",
-        ),
-        "output_tokens": ("output_tokens", "outputTokens"),
-    }
-    result = empty_token_usage()
-    for field, keys in aliases.items():
-        for key in keys:
-            if key in value:
-                result[field] = _numeric_token(value.get(key))
-                break
-    result["total_input_tokens"] = sum(
-        result[field]
-        for field in (
-            "input_tokens",
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-        )
-    )
-    result["total_tokens"] = (
-        result["total_input_tokens"] + result["output_tokens"]
-    )
-    return result
-
-
-def normalized_usage_tokens(usage: dict[str, Any]) -> dict[str, int]:
-    """Normalize provider token counters without double-counting nested totals."""
-    model_usage = usage.get("modelUsage")
-    if isinstance(model_usage, dict) and model_usage:
-        total = empty_token_usage()
-        for value in model_usage.values():
-            if isinstance(value, dict):
-                add_token_usage(total, _tokens_from_mapping(value))
-        return total
-    nested = usage.get("usage")
-    if isinstance(nested, dict):
-        normalized = _tokens_from_mapping(nested)
-        if normalized["total_tokens"]:
-            return normalized
-    return _tokens_from_mapping(usage)
-
-
-def add_token_usage(target: dict[str, int], value: dict[str, int]) -> None:
-    for field in (*TOKEN_FIELDS, "total_input_tokens", "total_tokens"):
-        target[field] = int(target.get(field) or 0) + int(value.get(field) or 0)
-
-
-def empty_artifact_bytes() -> dict[str, int]:
-    return {field: 0 for field in ARTIFACT_BYTE_FIELDS}
-
-
-def path_size(path: Path) -> int:
-    try:
-        return path.stat().st_size if path.is_file() else 0
-    except OSError:
-        return 0
-
-
-def run_artifact_bytes(run_dir: Path) -> dict[str, int]:
-    result = empty_artifact_bytes()
-    result["prompt_bytes"] = path_size(run_dir / "prompt.md")
-    result["manifest_bytes"] = path_size(run_dir / "manifest.md")
-    result["patch_bytes"] = path_size(run_dir / "change.patch")
-    result["reviewer_report_bytes"] = sum(
-        path_size(path)
-        for path in run_dir.glob("*.md")
-        if path.name not in {"prompt.md", "manifest.md"}
-    )
-    result["raw_response_bytes"] = sum(
-        path_size(path) for path in run_dir.glob("*.raw.json")
-    )
-    return result
-
-
-def add_artifact_bytes(target: dict[str, int], value: dict[str, int]) -> None:
-    for field in ARTIFACT_BYTE_FIELDS:
-        target[field] = int(target.get(field) or 0) + int(value.get(field) or 0)
-
-
 def workflow_metrics(
     runs: Sequence[tuple[Path, dict[str, Any]]],
     artifact_bytes_by_run: dict[Path, dict[str, int]] | None = None,
@@ -3152,6 +3056,7 @@ def workflow_metrics(
         "failed_runs": 0,
         "partial_runs": 0,
         "running_runs": 0,
+        "unclassified_runs": 0,
         "reviewer_invocations": 0,
         "successful_reviewer_invocations": 0,
         "failed_reviewer_invocations": 0,
@@ -3167,11 +3072,18 @@ def workflow_metrics(
         "findings": 0,
         "test_gaps": 0,
         "repeated_findings": 0,
+        "memory_candidate_items": 0,
+        "memory_candidate_matches": 0,
+        "memory_structural_matches": 0,
+        "memory_assessments": {},
+        "memory_similarity_distribution": {"count": 0},
         "decisions": {},
     }
     attempted_models: set[str] = set()
     successful_models: set[str] = set()
     decisions: dict[str, int] = {}
+    memory_assessments: dict[str, int] = {}
+    memory_similarities: list[float] = []
     for run_dir, metadata in runs:
         if include_artifact_bytes:
             artifact_bytes = (
@@ -3193,6 +3105,8 @@ def workflow_metrics(
             metrics["partial_runs"] += 1
         elif metadata.get("status") == "running":
             metrics["running_runs"] += 1
+        else:
+            metrics["unclassified_runs"] += 1
         reviewers = metadata.get("reviewers")
         if isinstance(reviewers, dict):
             resumed_reviewers = metadata.get("resumed_reviewers")
@@ -3254,12 +3168,36 @@ def workflow_metrics(
         for item in triage_items(triage):
             if item.get("prior_matches"):
                 metrics["repeated_findings"] += 1
+            memory_matches = item.get("memory_matches")
+            if isinstance(memory_matches, list) and memory_matches:
+                metrics["memory_candidate_items"] += 1
+                metrics["memory_candidate_matches"] += len(memory_matches)
+                for match in memory_matches:
+                    if not isinstance(match, dict):
+                        continue
+                    similarity = match.get("similarity")
+                    if isinstance(similarity, (int, float)) and math.isfinite(
+                        float(similarity)
+                    ):
+                        memory_similarities.append(float(similarity))
+                    fields = match.get("matched_fields")
+                    if isinstance(fields, list) and "location" in fields:
+                        metrics["memory_structural_matches"] += 1
+            assessment = item.get("memory_assessment")
+            if assessment in {"useful", "irrelevant", "mixed"}:
+                memory_assessments[str(assessment)] = (
+                    memory_assessments.get(str(assessment), 0) + 1
+                )
             decision = str(item.get("decision") or "pending")
             decisions[decision] = decisions.get(decision, 0) + 1
     metrics["attempted_models"] = sorted(attempted_models)
     metrics["successful_models"] = sorted(successful_models)
     metrics["models"] = sorted(successful_models)
     metrics["decisions"] = dict(sorted(decisions.items()))
+    metrics["memory_assessments"] = dict(sorted(memory_assessments.items()))
+    metrics["memory_similarity_distribution"] = numeric_distribution(
+        memory_similarities
+    )
     metrics["reviewer_duration_seconds"] = round(
         metrics["reviewer_duration_seconds"], 3
     )
@@ -3282,6 +3220,15 @@ def empty_analytics_group() -> dict[str, Any]:
         "findings": 0,
         "test_gaps": 0,
         "decisions": {},
+    }
+
+
+def empty_lineage_mode_cohort() -> dict[str, Any]:
+    return {
+        "lineages": 0,
+        "lineage_outcomes": {},
+        "reported_cost_usd": 0.0,
+        "reviewer_duration_seconds": 0.0,
     }
 
 
@@ -3393,8 +3340,14 @@ def analytics_report(since_days: int) -> dict[str, Any]:
     review_modes: dict[str, dict[str, Any]] = {}
     review_phases: dict[str, dict[str, Any]] = {}
     model_usage: dict[str, dict[str, Any]] = {}
+    lineage_mode_cohorts: dict[str, dict[str, dict[str, Any]]] = {
+        "explicit": {},
+        "inferred_legacy": {},
+    }
     provider_failure_categories: dict[str, int] = {}
     failure_types: dict[str, int] = {}
+    attempt_costs: list[float] = []
+    attempt_durations: list[float] = []
     contract_valid_runs = 0
     partial_runs = 0
     for run_dir, metadata in runs:
@@ -3441,6 +3394,7 @@ def analytics_report(since_days: int) -> dict[str, Any]:
             if not isinstance(reviewer, dict):
                 continue
             for attempt in reviewer_attempts(reviewer):
+                attempt_durations.append(float(attempt.get("duration_seconds") or 0))
                 add_attempt_to_analytics_group(mode_summary, attempt)
                 add_attempt_to_analytics_group(phase_summary, attempt)
                 summary = providers.setdefault(
@@ -3471,6 +3425,7 @@ def analytics_report(since_days: int) -> dict[str, Any]:
                 usage = attempt.get("usage")
                 if isinstance(usage, dict):
                     attempt_cost = float(usage.get("total_cost_usd") or 0)
+                    attempt_costs.append(attempt_cost)
                     summary["cost_usd"] += attempt_cost
                     tokens = normalized_usage_tokens(usage)
                     if tokens["total_tokens"]:
@@ -3572,24 +3527,40 @@ def analytics_report(since_days: int) -> dict[str, Any]:
         root_policy = (
             read_json(root_path).get("policy") if root_path.exists() else {}
         )
-        mode = review_mode_from_policy(
+        mode, mode_origin = review_mode_with_origin(
             root_policy if isinstance(root_policy, dict) else {}
         )
-        mode_summary = review_modes.setdefault(mode, empty_analytics_group())
-        mode_summary["lineages"] = int(mode_summary.get("lineages") or 0) + 1
-        outcomes = mode_summary.setdefault("lineage_outcomes", {})
-        outcomes[outcome] = int(outcomes.get(outcome) or 0) + 1
         lineage_metrics = workflow_metrics(lineage_runs, artifact_bytes_by_run)
-        mode_summary["lineage_cost_usd"] = round(
-            float(mode_summary.get("lineage_cost_usd") or 0)
+        cohort = lineage_mode_cohorts[mode_origin].setdefault(
+            mode, empty_lineage_mode_cohort()
+        )
+        cohort["lineages"] += 1
+        cohort_outcomes = cohort["lineage_outcomes"]
+        cohort_outcomes[outcome] = int(cohort_outcomes.get(outcome) or 0) + 1
+        cohort["reported_cost_usd"] = round(
+            float(cohort["reported_cost_usd"])
             + float(lineage_metrics["reported_cost_usd"]),
             6,
         )
-        mode_summary["lineage_duration_seconds"] = round(
-            float(mode_summary.get("lineage_duration_seconds") or 0)
+        cohort["reviewer_duration_seconds"] = round(
+            float(cohort["reviewer_duration_seconds"])
             + float(lineage_metrics["reviewer_duration_seconds"]),
             3,
         )
+        if mode_origin == "explicit":
+            mode_summary = review_modes.setdefault(mode, empty_analytics_group())
+            mode_summary["lineages"] = int(mode_summary.get("lineages") or 0) + 1
+            outcomes = mode_summary.setdefault("lineage_outcomes", {})
+            outcomes[outcome] = int(outcomes.get(outcome) or 0) + 1
+            mode_summary["lineage_cost_usd"] = cohort["reported_cost_usd"]
+            mode_summary["lineage_duration_seconds"] = cohort[
+                "reviewer_duration_seconds"
+            ]
+    for origin in lineage_mode_cohorts.values():
+        for cohort in origin.values():
+            cohort["lineage_outcomes"] = dict(
+                sorted(cohort["lineage_outcomes"].items())
+            )
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": utc_now(),
@@ -3603,12 +3574,31 @@ def analytics_report(since_days: int) -> dict[str, Any]:
         "finalized_workflows": finalized,
         "workflows_with_run_finals": workflows_with_run_finals,
         "superseded_workflows": superseded,
+        "run_statuses": {
+            "completed": metrics["completed_runs"],
+            "failed": metrics["failed_runs"],
+            "partial": metrics["partial_runs"],
+            "running": metrics["running_runs"],
+            "unclassified": metrics["unclassified_runs"],
+        },
+        "distributions": {
+            "attempt_cost_usd": numeric_distribution(attempt_costs),
+            "attempt_duration_seconds": numeric_distribution(attempt_durations),
+            "patch_bytes": numeric_distribution(
+                value.get("patch_bytes", 0)
+                for value in artifact_bytes_by_run.values()
+            ),
+        },
         "failure_types": dict(sorted(failure_types.items())),
         "provider_failure_categories": dict(
             sorted(provider_failure_categories.items())
         ),
         "providers": dict(sorted(providers.items())),
         "review_modes": dict(sorted(review_modes.items())),
+        "lineage_mode_cohorts": {
+            origin: dict(sorted(values.items()))
+            for origin, values in lineage_mode_cohorts.items()
+        },
         "review_phases": dict(sorted(review_phases.items())),
         "model_usage": dict(sorted(model_usage.items())),
         "metrics": metrics,
@@ -3661,7 +3651,38 @@ def render_analytics_compact(report: dict[str, Any]) -> str:
             f"finalized={format_count(report.get('finalized_workflows'))}; "
             f"run-finals={format_count(report.get('workflows_with_run_finals'))}"
         ),
+        (
+            "Evidence memory: "
+            f"candidate-items={format_count(metrics.get('memory_candidate_items'))}; "
+            f"matches={format_count(metrics.get('memory_candidate_matches'))}; "
+            f"structural={format_count(metrics.get('memory_structural_matches'))}; "
+            f"assessed={format_count(sum((metrics.get('memory_assessments') or {}).values()))}"
+        ),
     ]
+    statuses = report.get("run_statuses")
+    if isinstance(statuses, dict) and statuses.get("unclassified"):
+        lines.append(
+            "Run status warning: "
+            f"{format_count(statuses.get('unclassified'))} legacy/unclassified records"
+        )
+    cohorts = report.get("lineage_mode_cohorts")
+    if isinstance(cohorts, dict):
+        explicit = cohorts.get("explicit")
+        inferred = cohorts.get("inferred_legacy")
+        explicit_count = sum(
+            int(value.get("lineages") or 0)
+            for value in (explicit or {}).values()
+            if isinstance(value, dict)
+        ) if isinstance(explicit, dict) else 0
+        inferred_count = sum(
+            int(value.get("lineages") or 0)
+            for value in (inferred or {}).values()
+            if isinstance(value, dict)
+        ) if isinstance(inferred, dict) else 0
+        lines.append(
+            f"Mode cohorts: explicit={format_count(explicit_count)}; "
+            f"inferred-legacy={format_count(inferred_count)}"
+        )
     providers = report.get("providers")
     if isinstance(providers, dict) and providers:
         lines.append("Providers:")
@@ -3712,6 +3733,171 @@ def analytics_command(args: argparse.Namespace) -> int:
     print_structured_output(
         report, args.output_format, render_analytics_compact(report)
     )
+    return 0
+
+
+def historical_budget_estimate(
+    *,
+    provider: str,
+    model: str,
+    effort: str | None,
+    review_mode: str | None,
+    patch_bytes: int,
+    configured_budget_usd: float,
+    since_days: int = DEFAULT_BUDGET_EVIDENCE_DAYS,
+) -> dict[str, Any]:
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=since_days)
+    attempts: list[dict[str, Any]] = []
+    for run_dir, metadata in all_run_metadata():
+        created = normalized_timestamp(metadata.get("created_at"))
+        if created is None:
+            continue
+        if created < cutoff:
+            continue
+        policy = metadata.get("review_policy")
+        sample_effort = (
+            str(policy.get("claude_effort"))
+            if provider == "claude" and isinstance(policy, dict)
+            else None
+        )
+        reviewers = metadata.get("reviewers")
+        reviewer = reviewers.get(provider) if isinstance(reviewers, dict) else None
+        if not isinstance(reviewer, dict):
+            continue
+        for attempt in reviewer_attempts(reviewer):
+            usage = attempt.get("usage")
+            cost = usage.get("total_cost_usd") if isinstance(usage, dict) else None
+            valid_cost = not (
+                isinstance(cost, bool)
+                or not isinstance(cost, (int, float))
+                or not math.isfinite(float(cost))
+                or float(cost) <= 0
+            )
+            attempts.append(
+                {
+                    "cost_usd": float(cost) if valid_cost else None,
+                    "model": str(
+                        attempt.get("model")
+                        or reviewer.get("model")
+                        or "unknown"
+                    ),
+                    "effort": sample_effort,
+                    "review_mode": metadata.get("review_mode"),
+                    "patch_bytes": path_size(run_dir / "change.patch"),
+                    "budget_exhausted": (
+                        attempt.get("failure_category") == "budget_exhausted"
+                    ),
+                }
+            )
+
+    same_model_effort = [
+        item
+        for item in attempts
+        if item["model"] == model and (effort is None or item["effort"] == effort)
+    ]
+    similar_size = [
+        item
+        for item in same_model_effort
+        if patch_bytes <= 0
+        or item["patch_bytes"] <= 0
+        or 0.5 * patch_bytes <= item["patch_bytes"] <= 2 * patch_bytes
+    ]
+    same_mode_size = [
+        item
+        for item in similar_size
+        if review_mode is None or item["review_mode"] == review_mode
+    ]
+    cohorts = (
+        ("same_mode_model_effort_and_size", same_mode_size),
+        ("same_model_effort_and_size", similar_size),
+        ("same_model_and_effort", same_model_effort),
+        ("provider_history", attempts),
+    )
+    cohort_name, selected = next(
+        (
+            (name, values)
+            for name, values in cohorts
+            if sum(item["cost_usd"] is not None for item in values)
+            >= MIN_BUDGET_ESTIMATE_SAMPLES
+        ),
+        ("insufficient_history", attempts),
+    )
+    distribution = numeric_distribution(
+        item["cost_usd"]
+        for item in selected
+        if item["cost_usd"] is not None
+    )
+    p50 = float(distribution.get("p50") or 0)
+    p90 = float(distribution.get("p90") or 0)
+    recommended = (
+        math.ceil(max(p90 * 1.1, p50 * 1.25) * 100) / 100
+        if distribution["count"]
+        else None
+    )
+    count = int(distribution["count"])
+    confidence = "high" if count >= 20 else "medium" if count >= 5 else "low"
+    return {
+        "advisory_only": True,
+        "provider": provider,
+        "model": model,
+        "effort": effort,
+        "review_mode": review_mode,
+        "evidence_days": since_days,
+        "current_patch_bytes": patch_bytes,
+        "cohort": cohort_name,
+        "confidence": confidence,
+        "evidence_attempt_count": len(selected),
+        "sample_count": count,
+        "cost_distribution_usd": distribution,
+        "budget_exhausted_attempts": sum(
+            1 for item in selected if item["budget_exhausted"]
+        ),
+        "configured_budget_usd": round(configured_budget_usd, 6),
+        "recommended_budget_usd": recommended,
+        "configured_below_recommendation": (
+            recommended is not None and configured_budget_usd < recommended
+        ),
+        "automatic_policy_change": False,
+    }
+
+
+def reviewer_command_value(reviewer: Reviewer, flag: str) -> str | None:
+    try:
+        return reviewer.command[reviewer.command.index(flag) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def budget_estimate_command(args: argparse.Namespace) -> int:
+    config = load_config()
+    repo = resolve_repo(args.repo)
+    path_filters = normalize_path_filters(repo, args.path)
+    scope = resolve_scope(args, repo, path_filters)
+    patch = render_patch(repo, scope, path_filters)
+    paths = changed_paths(repo, scope, path_filters)
+    if not paths and not patch.strip():
+        raise ReviewError(f"No changes found for {scope.label}.")
+    estimate = historical_budget_estimate(
+        provider="claude",
+        model=args.claude_model or str(config["claude"]["model"]),
+        effort=args.claude_effort or str(config["claude"].get("effort", "medium")),
+        review_mode=args.review_mode,
+        patch_bytes=len(patch.encode()),
+        configured_budget_usd=(
+            args.claude_max_budget_usd
+            if args.claude_max_budget_usd is not None
+            else float(config["claude"].get("max_budget_usd", 1.25))
+        ),
+        since_days=args.since_days,
+    )
+    estimate.update(
+        {
+            "repository": repository_metadata(repo),
+            "scope": dataclasses.asdict(scope),
+            "changed_paths": paths,
+        }
+    )
+    print(json.dumps(estimate, indent=2))
     return 0
 
 
@@ -3860,6 +4046,194 @@ def render_memory_search_compact(payload: dict[str, Any]) -> str:
         )
     lines.append("Use --format json for evidence, action, and verification details.")
     return "\n".join(lines)
+
+
+def workflow_timestamp(identifier: str) -> dt.datetime | None:
+    match = re.match(r"^wf-(\d{8}T\d{6}Z)-", identifier)
+    if not match:
+        return None
+    try:
+        return dt.datetime.strptime(
+            match.group(1), "%Y%m%dT%H%M%SZ"
+        ).replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def normalized_timestamp(value: Any) -> dt.datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def workflow_audit_report(stale_days: int) -> dict[str, Any]:
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=stale_days)
+    run_records = all_run_metadata()
+    runs_by_workflow: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
+    for run_dir, metadata in run_records:
+        identifier = metadata.get("workflow_id")
+        if identifier:
+            runs_by_workflow.setdefault(str(identifier), []).append(
+                (run_dir, metadata)
+            )
+    entries: list[dict[str, Any]] = []
+    if WORKFLOWS_DIR.exists():
+        paths = sorted(
+            path
+            for path in WORKFLOWS_DIR.glob("wf-*.json")
+            if not path.name.endswith(".final.json")
+        )
+    else:
+        paths = []
+    for path in paths:
+        document = read_json(path)
+        identifier = str(document.get("workflow_id") or path.stem)
+        runs = runs_by_workflow.get(identifier, [])
+        unresolved: list[str] = []
+        run_finals = 0
+        unclassified_runs = 0
+        latest_activity = workflow_timestamp(identifier)
+        for run_dir, metadata in runs:
+            if metadata.get("status") is None:
+                unclassified_runs += 1
+            for field in ("completed_at", "started_at", "created_at"):
+                candidate = normalized_timestamp(metadata.get(field))
+                if candidate is None:
+                    continue
+                if latest_activity is None or candidate > latest_activity:
+                    latest_activity = candidate
+                break
+            if (run_dir / "final.json").exists() or (
+                run_dir / "supplemental.json"
+            ).exists():
+                run_finals += 1
+            triage_path = run_dir / "triage.json"
+            if not triage_path.exists():
+                continue
+            for item in triage_items(read_json(triage_path)):
+                decision = item.get("decision")
+                valid = (
+                    VALID_TEST_GAP_DECISIONS
+                    if item.get("kind") == "test_gap"
+                    else VALID_DECISIONS
+                )
+                if decision not in valid or decision in {"accepted", "uncertain"}:
+                    unresolved.append(
+                        f"{metadata.get('run_id') or run_dir.name}:{item.get('id')}"
+                    )
+        workflow_final = (WORKFLOWS_DIR / f"{identifier}.final.json").exists()
+        persisted_status = str(document.get("status") or "active")
+        if persisted_status == "superseded":
+            state = "superseded"
+            action = "none"
+        elif persisted_status == "completed" or workflow_final:
+            state = "completed"
+            action = "none"
+        elif any(metadata.get("status") == "running" for _, metadata in runs):
+            state = "running"
+            action = "monitor"
+        elif unresolved:
+            state = "needs_triage"
+            action = "decide pending or unresolved items"
+        elif run_finals:
+            state = "unclosed_run_final"
+            action = "verify freshness and run workflow finalize"
+        elif runs and all(
+            metadata.get("status") == "failed" for _, metadata in runs
+        ):
+            state = "failed"
+            action = "inspect failure or supersede intentionally"
+        elif latest_activity is not None and latest_activity < cutoff:
+            state = "stale_incomplete"
+            action = "inspect and supersede or resume intentionally"
+        else:
+            state = "active"
+            action = "continue workflow"
+        try:
+            lineage_root = workflow_lineage_root(identifier)
+        except ReviewError:
+            lineage_root = None
+            state = "invalid_lineage"
+            action = "repair workflow ancestry metadata"
+        entries.append(
+            {
+                "workflow_id": identifier,
+                "name": document.get("name"),
+                "lineage_root": lineage_root,
+                "state": state,
+                "action": action,
+                "persisted_status": persisted_status,
+                "run_count": len(runs),
+                "run_finals": run_finals,
+                "unclassified_runs": unclassified_runs,
+                "unresolved_items": unresolved,
+                "latest_activity": (
+                    latest_activity.isoformat() if latest_activity else None
+                ),
+            }
+        )
+    state_counts: dict[str, int] = {}
+    for entry in entries:
+        state = str(entry["state"])
+        state_counts[state] = state_counts.get(state, 0) + 1
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": utc_now(),
+        "stale_days": stale_days,
+        "workflow_count": len(entries),
+        "state_counts": dict(sorted(state_counts.items())),
+        "unclassified_run_records": sum(
+            1 for _, metadata in run_records if metadata.get("status") is None
+        ),
+        "workflows": entries,
+        "mutated": False,
+    }
+
+
+def render_workflow_audit_compact(report: dict[str, Any]) -> str:
+    counts = report.get("state_counts")
+    counts = counts if isinstance(counts, dict) else {}
+    lines = [
+        f"Workflow audit: {format_count(report.get('workflow_count'))} workflows; "
+        f"stale threshold={format_count(report.get('stale_days'))}d",
+        "States: "
+        + ", ".join(
+            f"{state}={format_count(count)}" for state, count in counts.items()
+        ),
+    ]
+    workflows = report.get("workflows")
+    if isinstance(workflows, list):
+        actionable = [
+            entry
+            for entry in workflows
+            if isinstance(entry, dict)
+            and entry.get("state") not in {"completed", "superseded", "active"}
+        ]
+        if actionable:
+            lines.append("Needs attention:")
+            for entry in actionable:
+                lines.append(
+                    f"- {entry.get('workflow_id')}: {entry.get('state')}; "
+                    f"{entry.get('action')}"
+                )
+    lines.append("Use --format json for complete workflow evidence.")
+    return "\n".join(lines)
+
+
+def workflow_audit_command(args: argparse.Namespace) -> int:
+    if args.stale_days < 1:
+        raise ReviewError("--stale-days must be at least 1.")
+    report = workflow_audit_report(args.stale_days)
+    print_structured_output(
+        report, args.output_format, render_workflow_audit_compact(report)
+    )
+    return 0
 
 
 def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
@@ -4587,6 +4961,7 @@ def apply_triage_decision(
     evidence: str,
     action: str | None,
     verification: str | None,
+    memory_assessment: str | None = None,
 ) -> None:
     selected = next(
         (item for item in triage_items(triage) if item.get("id") == identifier),
@@ -4610,6 +4985,9 @@ def apply_triage_decision(
     clean_evidence = evidence.strip()
     clean_action = action.strip() if action else None
     clean_verification = verification.strip() if verification else None
+    clean_memory_assessment = (
+        memory_assessment.strip() if memory_assessment else None
+    )
     for label, value in (
         ("evidence", clean_evidence),
         ("action", clean_action),
@@ -4638,6 +5016,16 @@ def apply_triage_decision(
         raise ReviewError(
             "Verification is required when marking a test gap covered."
         )
+    if clean_memory_assessment:
+        if clean_memory_assessment not in MEMORY_ASSESSMENTS:
+            raise ReviewError(
+                "Memory assessment must be one of: "
+                + ", ".join(sorted(MEMORY_ASSESSMENTS))
+            )
+        if not selected.get("memory_matches"):
+            raise ReviewError(
+                "Memory assessment requires memory_matches on the triage item."
+            )
     history = selected.setdefault("decision_history", [])
     if not isinstance(history, list):
         history = []
@@ -4649,6 +5037,7 @@ def apply_triage_decision(
             "evidence": clean_evidence,
             "action": clean_action,
             "verification": clean_verification,
+            "memory_assessment": clean_memory_assessment,
             "decided_at": decided_at,
         }
     )
@@ -4656,6 +5045,8 @@ def apply_triage_decision(
     selected["evidence"] = clean_evidence
     selected["action"] = clean_action
     selected["verification"] = clean_verification
+    if clean_memory_assessment:
+        selected["memory_assessment"] = clean_memory_assessment
     selected["decided_at"] = decided_at
 
 
@@ -4681,6 +5072,11 @@ def write_triage_decisions(
                     if item.get("verification") is not None
                     else None
                 ),
+                memory_assessment=(
+                    str(item["memory_assessment"])
+                    if item.get("memory_assessment") is not None
+                    else None
+                ),
             )
         triage["updated_at"] = utc_now()
         safe_write_json(triage_path, triage)
@@ -4700,6 +5096,7 @@ def decide_command(args: argparse.Namespace) -> int:
                 "evidence": args.evidence,
                 "action": args.action,
                 "verification": args.verification,
+                "memory_assessment": args.memory_assessment,
             }
         ],
     )
@@ -5937,6 +6334,21 @@ def run_review_command(args: argparse.Namespace) -> int:
             phase=args.phase,
         )
         safe_write(prompt_path, prompt)
+        budget_estimates: dict[str, dict[str, Any]] = {}
+        for reviewer in reviewers:
+            if reviewer.name != "claude":
+                continue
+            configured_budget = float(
+                reviewer_command_value(reviewer, "--max-budget-usd") or 0
+            )
+            budget_estimates[reviewer.name] = historical_budget_estimate(
+                provider=reviewer.name,
+                model=reviewer.model,
+                effort=reviewer_command_value(reviewer, "--effort"),
+                review_mode=(str(review_mode) if review_mode else None),
+                patch_bytes=len(patch.encode()),
+                configured_budget_usd=configured_budget,
+            )
         metadata.update(
             {
                 "status": "running",
@@ -5965,6 +6377,7 @@ def run_review_command(args: argparse.Namespace) -> int:
                     ),
                 },
                 "workflow_budget": workflow_budget,
+                "budget_estimates": budget_estimates,
                 "reviewers": {
                     reviewer.name: {
                         "model": reviewer.model,
@@ -5977,6 +6390,26 @@ def run_review_command(args: argparse.Namespace) -> int:
         safe_write_json(run_dir / "metadata.json", metadata)
         if scan_token_path and scan_token_value:
             consume_sensitive_scan_token(scan_token_path, scan_token_value)
+
+        for provider, estimate in budget_estimates.items():
+            recommendation = estimate.get("recommended_budget_usd")
+            if recommendation is None:
+                continue
+            message = (
+                f"Budget evidence: {provider} configured "
+                f"${float(estimate['configured_budget_usd']):.2f}; "
+                f"historical p90=${float(estimate['cost_distribution_usd']['p90']):.2f}; "
+                f"recommended=${float(recommendation):.2f}; "
+                f"confidence={estimate['confidence']} ({estimate['sample_count']} samples)."
+            )
+            print(message, flush=True)
+            if estimate["configured_below_recommendation"]:
+                print(
+                    "Budget warning: the configured cap is below the historical "
+                    "recommendation. No effort, budget, or provider setting was "
+                    "changed automatically.",
+                    flush=True,
+                )
 
         print(
             f"Running {', '.join(reviewer.name for reviewer in reviewers)} "
@@ -6204,6 +6637,27 @@ def build_parser() -> argparse.ArgumentParser:
         default="json",
         help="Output format; compact is lossless-by-reference and JSON remains default",
     )
+    budget_estimate = subparsers.add_parser(
+        "budget-estimate",
+        help="Estimate a non-binding Claude budget from comparable local history",
+    )
+    budget_estimate.add_argument("--repo", default=".")
+    budget_scope = budget_estimate.add_mutually_exclusive_group()
+    budget_scope.add_argument("--uncommitted", action="store_true")
+    budget_scope.add_argument("--base")
+    budget_scope.add_argument("--commit")
+    budget_estimate.add_argument("--path", action="append", default=[])
+    budget_estimate.add_argument(
+        "--review-mode", choices=sorted(REVIEW_MODES), default=DEFAULT_REVIEW_MODE
+    )
+    budget_estimate.add_argument(
+        "--claude-effort", choices=sorted(CLAUDE_EFFORTS)
+    )
+    budget_estimate.add_argument("--claude-model")
+    budget_estimate.add_argument("--claude-max-budget-usd", type=float)
+    budget_estimate.add_argument(
+        "--since-days", type=int, default=DEFAULT_BUDGET_EVIDENCE_DAYS
+    )
     recommend = subparsers.add_parser(
         "recommend",
         help="Conservatively recommend fast, balanced, or deep without running providers",
@@ -6278,6 +6732,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workflow_status_parser.add_argument("workflow_id")
     workflow_status_parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "compact"),
+        default="json",
+        help="Output format; JSON remains the complete machine-readable default",
+    )
+    workflow_audit_parser = workflow_subparsers.add_parser(
+        "audit", help="Read-only lifecycle audit across all stored workflows"
+    )
+    workflow_audit_parser.add_argument("--stale-days", type=int, default=7)
+    workflow_audit_parser.add_argument(
         "--format",
         dest="output_format",
         choices=("json", "compact"),
@@ -6476,6 +6941,11 @@ def build_parser() -> argparse.ArgumentParser:
     decide.add_argument("--evidence", required=True)
     decide.add_argument("--action")
     decide.add_argument("--verification")
+    decide.add_argument(
+        "--memory-assessment",
+        choices=sorted(MEMORY_ASSESSMENTS),
+        help="Rate attached memory candidates for future retrieval calibration",
+    )
 
     decide_batch = subparsers.add_parser(
         "decide-batch",
@@ -6488,7 +6958,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "JSON decision object with finding, decision, evidence, and "
-            "optional action/verification; repeat as needed"
+            "optional action/verification/memory_assessment; repeat as needed"
         ),
     )
     decide_batch.add_argument(
@@ -6554,6 +7024,18 @@ def main() -> int:
             return set_workflow_budget_command(args)
         if args.command == "analytics":
             return analytics_command(args)
+        if args.command == "budget-estimate":
+            if args.since_days < 1:
+                raise ReviewError("--since-days must be at least 1.")
+            if (
+                args.claude_max_budget_usd is not None
+                and (
+                    not math.isfinite(args.claude_max_budget_usd)
+                    or args.claude_max_budget_usd <= 0
+                )
+            ):
+                raise ReviewError("--claude-max-budget-usd must be positive.")
+            return budget_estimate_command(args)
         if args.command == "recommend":
             return recommend_mode_command(args)
         if args.command == "memory":
@@ -6574,6 +7056,8 @@ def main() -> int:
                 return workflow_start_command(args)
             if args.workflow_command == "status":
                 return workflow_status_command(args)
+            if args.workflow_command == "audit":
+                return workflow_audit_command(args)
             if args.workflow_command == "finalize":
                 return workflow_finalize_command(args)
             if args.workflow_command == "supersede":
