@@ -2933,11 +2933,283 @@ None.
                 "successful_invocations": 1,
                 "reviewer_duration_seconds": 1.1,
                 "reported_cost_usd": 0.2,
+                "attempts_with_token_usage": 0,
+                "token_usage": MM.empty_token_usage(),
+                "artifact_bytes": MM.empty_artifact_bytes(),
                 "findings": 0,
                 "test_gaps": 0,
                 "decisions": {},
             },
         )
+
+    def test_analytics_aggregates_provider_reported_tokens_and_artifact_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            run_dir.mkdir()
+            (run_dir / "prompt.md").write_text("abc", encoding="utf-8")
+            (run_dir / "manifest.md").write_text("m", encoding="utf-8")
+            (run_dir / "change.patch").write_text("patch", encoding="utf-8")
+            (run_dir / "claude.md").write_text("report", encoding="utf-8")
+            (run_dir / "claude.raw.json").write_text("{}", encoding="utf-8")
+            metadata = {
+                "created_at": MM.utc_now(),
+                "status": "completed",
+                "workflow_id": "wf-token-test",
+                "review_mode": "balanced",
+                "phase": "confirmation",
+                "reviewers": {
+                    "claude": {
+                        "exit_code": 0,
+                        "verdict": "PASS_CLEAN",
+                        "report_contract_valid": True,
+                        "duration_seconds": 2,
+                        "model": "sonnet",
+                        "usage": {
+                            "total_cost_usd": 0.51,
+                            "num_turns": 3,
+                            "modelUsage": {
+                                "claude-sonnet": {
+                                    "inputTokens": 10,
+                                    "cacheCreationInputTokens": 20,
+                                    "cacheReadInputTokens": 30,
+                                    "outputTokens": 40,
+                                    "costUSD": 0.5,
+                                },
+                                "claude-haiku": {
+                                    "inputTokens": 1,
+                                    "cacheCreationInputTokens": 2,
+                                    "cacheReadInputTokens": 3,
+                                    "outputTokens": 4,
+                                    "costUSD": 0.01,
+                                },
+                            },
+                            "usage": {
+                                "input_tokens": 999,
+                                "output_tokens": 999,
+                            },
+                        },
+                    }
+                },
+            }
+            with (
+                mock.patch.object(MM, "all_run_metadata", return_value=[(run_dir, metadata)]),
+                mock.patch.object(MM, "workflow_path", return_value=Path("/missing")),
+                mock.patch.object(MM, "WORKFLOWS_DIR", Path("/missing")),
+                mock.patch.object(
+                    MM, "run_artifact_bytes", wraps=MM.run_artifact_bytes
+                ) as artifact_bytes,
+            ):
+                report = MM.analytics_report(7)
+        self.assertEqual(artifact_bytes.call_count, 1)
+        expected_tokens = {
+            "input_tokens": 11,
+            "cache_creation_input_tokens": 22,
+            "cache_read_input_tokens": 33,
+            "output_tokens": 44,
+            "total_input_tokens": 66,
+            "total_tokens": 110,
+        }
+        self.assertEqual(report["metrics"]["token_usage"], expected_tokens)
+        self.assertEqual(
+            report["providers"]["claude"]["token_usage"], expected_tokens
+        )
+        self.assertEqual(
+            report["review_phases"]["confirmation"]["token_usage"],
+            expected_tokens,
+        )
+        self.assertEqual(
+            report["metrics"]["artifact_bytes"],
+            {
+                "prompt_bytes": 3,
+                "manifest_bytes": 1,
+                "patch_bytes": 5,
+                "reviewer_report_bytes": 6,
+                "raw_response_bytes": 2,
+            },
+        )
+        self.assertEqual(
+            report["model_usage"]["claude-sonnet"]["token_usage"]
+            ["total_tokens"],
+            100,
+        )
+        self.assertEqual(
+            report["model_usage"]["claude-haiku"]["cost_usd"], 0.01
+        )
+
+    def test_compact_rendering_never_emits_more_than_json(self) -> None:
+        full = '{"ok": true}'
+        self.assertEqual(MM.smaller_output(full, "ok"), "ok")
+        self.assertEqual(MM.smaller_output(full, "longer compact output"), full)
+        args = MM.build_parser().parse_args(
+            ["analytics", "--format", "compact"]
+        )
+        self.assertEqual(args.output_format, "compact")
+        default_args = MM.build_parser().parse_args(["analytics"])
+        self.assertEqual(default_args.output_format, "json")
+
+    def test_memory_search_compact_renders_empty_and_matched_results(self) -> None:
+        empty = MM.render_memory_search_compact(
+            {"query": "nothing", "results": []}
+        )
+        self.assertIn("0 matches", empty)
+        rendered = MM.render_memory_search_compact(
+            {
+                "query": "budget cap",
+                "results": [
+                    {
+                        "kind": "finding",
+                        "severity": "high",
+                        "decision": "fixed",
+                        "title": "Budget cap bypass",
+                        "similarity": 0.75,
+                        "matched_fields": ["title", "evidence"],
+                        "location": "scripts/mm_review.py:1",
+                        "workflow_id": "wf-one",
+                        "run_id": "run-one",
+                    }
+                ],
+            }
+        )
+        self.assertIn("Budget cap bypass", rendered)
+        self.assertIn("matched=title,evidence", rendered)
+        self.assertIn("workflow=wf-one run=run-one", rendered)
+
+    def test_workflow_status_compact_renders_empty_and_detailed_status(self) -> None:
+        empty = MM.render_workflow_status_compact({})
+        self.assertIn("reviewer calls=0", empty)
+        rendered = MM.render_workflow_status_compact(
+            {
+                "workflow_id": "wf-one",
+                "state": "active",
+                "ready": False,
+                "lineage_root": "wf-root",
+                "metrics": {
+                    "run_count": 2,
+                    "reviewer_invocations": 3,
+                    "reported_cost_usd": 1.25,
+                    "reviewer_duration_seconds": 4.5,
+                },
+                "active_runs": [
+                    {
+                        "round": 2,
+                        "phase": "repair",
+                        "process_alive": True,
+                        "elapsed_seconds": 1.5,
+                        "run_dir": "/tmp/run",
+                    }
+                ],
+                "repositories": [
+                    {
+                        "repository": {"name": "plugin"},
+                        "round": 1,
+                        "phase": "repair",
+                        "state": "triage_required",
+                        "final_status": None,
+                        "fresh": True,
+                    }
+                ],
+                "history_issues": ["missing confirmation"],
+            }
+        )
+        self.assertIn("Workflow wf-one: state=active", rendered)
+        self.assertIn("Active runs:", rendered)
+        self.assertIn("- plugin: round=1 phase=repair", rendered)
+        self.assertIn("- missing confirmation", rendered)
+
+    def test_real_compact_renderers_never_emit_more_bytes_than_json(self) -> None:
+        tokens = MM.empty_token_usage()
+        analytics = {
+            "since_days": 30,
+            "run_attempts": 100,
+            "workflow_count": 20,
+            "lineage_count": 10,
+            "finalized_workflows": 8,
+            "workflows_with_run_finals": 9,
+            "metrics": {
+                "reviewer_invocations": 90,
+                "failed_reviewer_invocations": 2,
+                "reported_cost_usd": 12.5,
+                "reviewer_duration_seconds": 3600,
+                "attempts_with_token_usage": 88,
+                "token_usage": tokens,
+            },
+            "providers": {
+                f"provider-{index}": {
+                    "successful": index,
+                    "invocations": index + 1,
+                    "cost_usd": index / 10,
+                    "token_usage": tokens,
+                }
+                for index in range(20)
+            },
+            "review_phases": {
+                f"phase-{index}": {
+                    "runs": index,
+                    "reviewer_invocations": index,
+                    "reported_cost_usd": index / 10,
+                    "token_usage": tokens,
+                }
+                for index in range(20)
+            },
+            "failure_types": {},
+        }
+        memory = {
+            "query": "budget cap",
+            "results": [
+                {
+                    "kind": "finding",
+                    "severity": "low",
+                    "decision": "fixed",
+                    "title": f"Finding {index}",
+                    "similarity": 0.75,
+                    "matched_fields": ["title", "evidence"],
+                    "location": f"file.py:{index}",
+                    "workflow_id": "wf-one",
+                    "run_id": f"run-{index}",
+                }
+                for index in range(20)
+            ],
+        }
+        workflow = {
+            "workflow_id": "wf-one",
+            "state": "active",
+            "ready": False,
+            "lineage_root": "wf-root",
+            "metrics": {
+                "run_count": 20,
+                "reviewer_invocations": 20,
+                "reported_cost_usd": 2.5,
+                "reviewer_duration_seconds": 100,
+            },
+            "active_runs": [],
+            "repositories": [
+                {
+                    "repository": {"name": f"repo-{index}"},
+                    "round": 1,
+                    "phase": "repair",
+                    "state": "triage_required",
+                    "final_status": None,
+                    "fresh": True,
+                }
+                for index in range(20)
+            ],
+            "history_issues": [],
+        }
+        cases = (
+            (analytics, MM.render_analytics_compact(analytics)),
+            (memory, MM.render_memory_search_compact(memory)),
+            (workflow, MM.render_workflow_status_compact(workflow)),
+        )
+        for payload, compact in cases:
+            full = json.dumps(payload, indent=2)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                MM.print_structured_output(payload, "compact", compact)
+            emitted = output.getvalue().rstrip("\n")
+            self.assertEqual(emitted, MM.smaller_output(full, compact))
+            self.assertLessEqual(len(emitted.encode()), len(full.encode()))
 
 
     def test_lineage_spend_and_budget_include_superseded_ancestors(self) -> None:
@@ -2997,6 +3269,7 @@ None.
             with (
                 mock.patch.object(MM, "RUNS_DIR", runs),
                 mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "run_artifact_bytes") as artifact_bytes,
             ):
                 self.assertEqual(MM.workflow_spend("wf-new"), 1.0)
                 adjusted, budget = MM.apply_workflow_budget(
@@ -3005,6 +3278,7 @@ None.
             self.assertEqual(adjusted[0].command[-1], "0.25")
             self.assertEqual(budget["spent_before_run_usd"], 1.0)
             self.assertEqual(budget["reserved_before_run_usd"], 0.25)
+            artifact_bytes.assert_not_called()
 
     def test_evidence_memory_rebuilds_and_searches_across_workflows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3034,8 +3308,10 @@ None.
                             "reviewer": "claude",
                             "severity": "low",
                             "title": "Duration alert rounds below threshold",
+                            "location": "services/alerts.py:42",
                             "decision": "fixed",
                             "evidence": "Message now retains precision.",
+                            "action": "Preserve millisecond precision.",
                             "verification": "Focused test passes.",
                         }
                     ],
@@ -3047,13 +3323,38 @@ None.
             )
             results = MM.search_evidence_memory(
                 database,
-                "duration alert rounding below threshold",
+                "duration threshold",
+                repository_id="repo-one",
+            )
+            evidence_results = MM.search_evidence_memory(
+                database,
+                "message retains precision",
+                repository_id="repo-one",
+            )
+            path_results = MM.search_evidence_memory(
+                database,
+                "alerts py",
+                repository_id="repo-one",
+            )
+            broad_results = MM.search_evidence_memory(
+                database,
+                "duration",
+                repository_id="repo-one",
+            )
+            null_results = MM.search_evidence_memory(
+                database,
+                "none",
                 repository_id="repo-one",
             )
             compacted = MM.compact_evidence_memory(database)
             self.assertEqual(rebuilt["evidence_items"], 1)
             self.assertEqual(results[0]["lineage_root"], "wf-root")
             self.assertEqual(results[0]["decision"], "fixed")
+            self.assertIn("title", results[0]["matched_fields"])
+            self.assertIn("evidence", evidence_results[0]["matched_fields"])
+            self.assertIn("location", path_results[0]["matched_fields"])
+            self.assertEqual(broad_results, [])
+            self.assertEqual(null_results, [])
             self.assertEqual(database.stat().st_mode & 0o777, 0o600)
             self.assertEqual(compacted["evidence_items"], 1)
 
@@ -3312,6 +3613,11 @@ None.
                     "freshness_status",
                     return_value={"fresh": True, "mode": "working-tree"},
                 ),
+                mock.patch.object(
+                    MM,
+                    "run_artifact_bytes",
+                    return_value=MM.empty_artifact_bytes(),
+                ) as artifact_bytes,
             ):
                 workflow_document = {
                     "workflow_id": "wf-done",
@@ -3326,6 +3632,7 @@ None.
             self.assertTrue(ready)
             self.assertEqual(status["state"], "ready_to_finalize")
             self.assertFalse(status["repositories"][0]["accepts_reviews"])
+            self.assertEqual(artifact_bytes.call_count, 1)
 
     def test_supplemental_final_is_explicitly_non_authoritative(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

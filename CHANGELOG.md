@@ -29,6 +29,13 @@ All notable user-visible changes are documented here. This project follows
   in local analytics so the adaptive policy can be tuned from real outcomes.
 - Add `disable <provider> --lock` so an unavailable provider cannot be restored
   accidentally by a one-run override.
+- Add provider-reported token analytics by provider, model, review mode, and
+  phase, plus artifact-byte totals by mode and phase, without estimating
+  unavailable usage.
+- Add opt-in compact output for analytics, workflow status, and evidence search;
+  full JSON remains the default and compact rendering falls back when larger.
+- Rank evidence memory across titles, locations, evidence, actions, and
+  verification so concise symbol/path/topic queries can retrieve verified work.
 
 - Preserve every failed/resumed reviewer attempt and archive its provider
   artifacts so analytics and workflow spend include paid retries.

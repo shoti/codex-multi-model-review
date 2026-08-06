@@ -2498,7 +2498,9 @@ def workflow_budget_limit(identifier: str) -> float | None:
 
 def workflow_spend(identifier: str) -> float:
     return float(
-        workflow_metrics(workflow_lineage_runs(identifier)).get("reported_cost_usd")
+        workflow_metrics(
+            workflow_lineage_runs(identifier), include_artifact_bytes=False
+        ).get("reported_cost_usd")
         or 0
     )
 
@@ -3019,8 +3021,130 @@ def latest_workflow_runs(
     return sorted(latest.values(), key=lambda item: str(item[0]))
 
 
+TOKEN_FIELDS = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "output_tokens",
+)
+ARTIFACT_BYTE_FIELDS = (
+    "prompt_bytes",
+    "manifest_bytes",
+    "patch_bytes",
+    "reviewer_report_bytes",
+    "raw_response_bytes",
+)
+
+
+def empty_token_usage() -> dict[str, int]:
+    return {
+        **{field: 0 for field in TOKEN_FIELDS},
+        "total_input_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
+def _numeric_token(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(float(value)) or value < 0:
+        return 0
+    return int(value)
+
+
+def _tokens_from_mapping(value: dict[str, Any]) -> dict[str, int]:
+    aliases = {
+        "input_tokens": ("input_tokens", "inputTokens"),
+        "cache_creation_input_tokens": (
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+        ),
+        "cache_read_input_tokens": (
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "cache_read_tokens",
+        ),
+        "output_tokens": ("output_tokens", "outputTokens"),
+    }
+    result = empty_token_usage()
+    for field, keys in aliases.items():
+        for key in keys:
+            if key in value:
+                result[field] = _numeric_token(value.get(key))
+                break
+    result["total_input_tokens"] = sum(
+        result[field]
+        for field in (
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+    )
+    result["total_tokens"] = (
+        result["total_input_tokens"] + result["output_tokens"]
+    )
+    return result
+
+
+def normalized_usage_tokens(usage: dict[str, Any]) -> dict[str, int]:
+    """Normalize provider token counters without double-counting nested totals."""
+    model_usage = usage.get("modelUsage")
+    if isinstance(model_usage, dict) and model_usage:
+        total = empty_token_usage()
+        for value in model_usage.values():
+            if isinstance(value, dict):
+                add_token_usage(total, _tokens_from_mapping(value))
+        return total
+    nested = usage.get("usage")
+    if isinstance(nested, dict):
+        normalized = _tokens_from_mapping(nested)
+        if normalized["total_tokens"]:
+            return normalized
+    return _tokens_from_mapping(usage)
+
+
+def add_token_usage(target: dict[str, int], value: dict[str, int]) -> None:
+    for field in (*TOKEN_FIELDS, "total_input_tokens", "total_tokens"):
+        target[field] = int(target.get(field) or 0) + int(value.get(field) or 0)
+
+
+def empty_artifact_bytes() -> dict[str, int]:
+    return {field: 0 for field in ARTIFACT_BYTE_FIELDS}
+
+
+def path_size(path: Path) -> int:
+    try:
+        return path.stat().st_size if path.is_file() else 0
+    except OSError:
+        return 0
+
+
+def run_artifact_bytes(run_dir: Path) -> dict[str, int]:
+    result = empty_artifact_bytes()
+    result["prompt_bytes"] = path_size(run_dir / "prompt.md")
+    result["manifest_bytes"] = path_size(run_dir / "manifest.md")
+    result["patch_bytes"] = path_size(run_dir / "change.patch")
+    result["reviewer_report_bytes"] = sum(
+        path_size(path)
+        for path in run_dir.glob("*.md")
+        if path.name not in {"prompt.md", "manifest.md"}
+    )
+    result["raw_response_bytes"] = sum(
+        path_size(path) for path in run_dir.glob("*.raw.json")
+    )
+    return result
+
+
+def add_artifact_bytes(target: dict[str, int], value: dict[str, int]) -> None:
+    for field in ARTIFACT_BYTE_FIELDS:
+        target[field] = int(target.get(field) or 0) + int(value.get(field) or 0)
+
+
 def workflow_metrics(
-    runs: Sequence[tuple[Path, dict[str, Any]]]
+    runs: Sequence[tuple[Path, dict[str, Any]]],
+    artifact_bytes_by_run: dict[Path, dict[str, int]] | None = None,
+    *,
+    include_artifact_bytes: bool = True,
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
         "run_count": len(runs),
@@ -3035,6 +3159,9 @@ def workflow_metrics(
         "reviewer_duration_seconds": 0.0,
         "reported_cost_usd": 0.0,
         "reviewer_turns": 0,
+        "attempts_with_token_usage": 0,
+        "token_usage": empty_token_usage(),
+        "artifact_bytes": empty_artifact_bytes(),
         "attempted_models": [],
         "successful_models": [],
         "findings": 0,
@@ -3046,6 +3173,18 @@ def workflow_metrics(
     successful_models: set[str] = set()
     decisions: dict[str, int] = {}
     for run_dir, metadata in runs:
+        if include_artifact_bytes:
+            artifact_bytes = (
+                artifact_bytes_by_run.get(run_dir)
+                if artifact_bytes_by_run is not None
+                else None
+            )
+            add_artifact_bytes(
+                metrics["artifact_bytes"],
+                artifact_bytes
+                if artifact_bytes is not None
+                else run_artifact_bytes(run_dir),
+            )
         if metadata.get("status") == "completed":
             metrics["completed_runs"] += 1
         elif metadata.get("status") == "failed":
@@ -3100,6 +3239,10 @@ def workflow_metrics(
                         metrics["reviewer_turns"] += int(
                             usage.get("num_turns") or 0
                         )
+                        tokens = normalized_usage_tokens(usage)
+                        if tokens["total_tokens"]:
+                            metrics["attempts_with_token_usage"] += 1
+                            add_token_usage(metrics["token_usage"], tokens)
         triage_path = run_dir / "triage.json"
         if not triage_path.exists():
             continue
@@ -3124,6 +3267,113 @@ def workflow_metrics(
     return metrics
 
 
+def empty_analytics_group() -> dict[str, Any]:
+    return {
+        "runs": 0,
+        "completed_runs": 0,
+        "failed_runs": 0,
+        "reviewer_invocations": 0,
+        "successful_invocations": 0,
+        "reviewer_duration_seconds": 0.0,
+        "reported_cost_usd": 0.0,
+        "attempts_with_token_usage": 0,
+        "token_usage": empty_token_usage(),
+        "artifact_bytes": empty_artifact_bytes(),
+        "findings": 0,
+        "test_gaps": 0,
+        "decisions": {},
+    }
+
+
+def add_run_to_analytics_group(
+    summary: dict[str, Any],
+    run_dir: Path,
+    metadata: dict[str, Any],
+    artifact_bytes: dict[str, int] | None = None,
+) -> None:
+    summary["runs"] += 1
+    if metadata.get("status") == "completed":
+        summary["completed_runs"] += 1
+    elif metadata.get("status") in {"failed", "partial"}:
+        summary["failed_runs"] += 1
+    add_artifact_bytes(
+        summary["artifact_bytes"],
+        artifact_bytes
+        if artifact_bytes is not None
+        else run_artifact_bytes(run_dir),
+    )
+    triage_path = run_dir / "triage.json"
+    if not triage_path.exists():
+        return
+    triage = read_json(triage_path)
+    findings = triage.get("findings")
+    gaps = triage.get("test_gaps")
+    summary["findings"] += len(findings) if isinstance(findings, list) else 0
+    summary["test_gaps"] += len(gaps) if isinstance(gaps, list) else 0
+    decisions = summary["decisions"]
+    for item in triage_items(triage):
+        decision = str(item.get("decision") or "pending")
+        decisions[decision] = int(decisions.get(decision) or 0) + 1
+
+
+def add_attempt_to_analytics_group(
+    summary: dict[str, Any], attempt: dict[str, Any]
+) -> None:
+    summary["reviewer_invocations"] += 1
+    summary["reviewer_duration_seconds"] += float(
+        attempt.get("duration_seconds") or 0
+    )
+    if reviewer_attempt_succeeded(attempt):
+        summary["successful_invocations"] += 1
+    usage = attempt.get("usage")
+    if not isinstance(usage, dict):
+        return
+    summary["reported_cost_usd"] += float(usage.get("total_cost_usd") or 0)
+    tokens = normalized_usage_tokens(usage)
+    if tokens["total_tokens"]:
+        summary["attempts_with_token_usage"] += 1
+        add_token_usage(summary["token_usage"], tokens)
+
+
+def finalize_analytics_groups(groups: dict[str, dict[str, Any]]) -> None:
+    for summary in groups.values():
+        summary["reviewer_duration_seconds"] = round(
+            summary["reviewer_duration_seconds"], 3
+        )
+        summary["reported_cost_usd"] = round(
+            summary["reported_cost_usd"], 6
+        )
+        decisions = summary.get("decisions")
+        if isinstance(decisions, dict):
+            summary["decisions"] = dict(sorted(decisions.items()))
+
+
+def provider_model_usage(
+    usage: dict[str, Any], fallback_model: str
+) -> list[tuple[str, dict[str, int], float]]:
+    model_usage = usage.get("modelUsage")
+    if isinstance(model_usage, dict) and model_usage:
+        result: list[tuple[str, dict[str, int], float]] = []
+        for name, value in model_usage.items():
+            if not isinstance(value, dict):
+                continue
+            result.append(
+                (
+                    str(name),
+                    _tokens_from_mapping(value),
+                    float(value.get("costUSD") or 0),
+                )
+            )
+        return result
+    return [
+        (
+            fallback_model,
+            normalized_usage_tokens(usage),
+            float(usage.get("total_cost_usd") or 0),
+        )
+    ]
+
+
 def analytics_report(since_days: int) -> dict[str, Any]:
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=since_days)
     runs: list[tuple[Path, dict[str, Any]]] = []
@@ -3135,51 +3385,34 @@ def analytics_report(since_days: int) -> dict[str, Any]:
             continue
         if created >= cutoff:
             runs.append((run_dir, metadata))
-    metrics = workflow_metrics(runs)
+    artifact_bytes_by_run = {
+        run_dir: run_artifact_bytes(run_dir) for run_dir, _ in runs
+    }
+    metrics = workflow_metrics(runs, artifact_bytes_by_run)
     providers: dict[str, dict[str, Any]] = {}
     review_modes: dict[str, dict[str, Any]] = {}
+    review_phases: dict[str, dict[str, Any]] = {}
+    model_usage: dict[str, dict[str, Any]] = {}
     provider_failure_categories: dict[str, int] = {}
     failure_types: dict[str, int] = {}
     contract_valid_runs = 0
     partial_runs = 0
     for run_dir, metadata in runs:
         review_mode = str(metadata.get("review_mode") or "legacy")
-        mode_summary = review_modes.setdefault(
-            review_mode,
-            {
-                "runs": 0,
-                "completed_runs": 0,
-                "failed_runs": 0,
-                "reviewer_invocations": 0,
-                "successful_invocations": 0,
-                "reviewer_duration_seconds": 0.0,
-                "reported_cost_usd": 0.0,
-                "findings": 0,
-                "test_gaps": 0,
-                "decisions": {},
-            },
+        review_phase = str(metadata.get("phase") or "legacy")
+        mode_summary = review_modes.setdefault(review_mode, empty_analytics_group())
+        phase_summary = review_phases.setdefault(
+            review_phase, empty_analytics_group()
         )
-        mode_summary["runs"] += 1
+        artifact_bytes = artifact_bytes_by_run[run_dir]
+        add_run_to_analytics_group(
+            mode_summary, run_dir, metadata, artifact_bytes
+        )
+        add_run_to_analytics_group(
+            phase_summary, run_dir, metadata, artifact_bytes
+        )
         if metadata.get("status") == "completed":
             contract_valid_runs += 1
-            mode_summary["completed_runs"] += 1
-        elif metadata.get("status") in {"failed", "partial"}:
-            mode_summary["failed_runs"] += 1
-        triage_path = run_dir / "triage.json"
-        if triage_path.exists():
-            triage = read_json(triage_path)
-            findings = triage.get("findings")
-            gaps = triage.get("test_gaps")
-            mode_summary["findings"] += (
-                len(findings) if isinstance(findings, list) else 0
-            )
-            mode_summary["test_gaps"] += (
-                len(gaps) if isinstance(gaps, list) else 0
-            )
-            mode_decisions = mode_summary["decisions"]
-            for item in triage_items(triage):
-                decision = str(item.get("decision") or "pending")
-                mode_decisions[decision] = int(mode_decisions.get(decision) or 0) + 1
         failure = metadata.get("failure")
         if isinstance(failure, dict):
             failure_type = str(failure.get("type") or "unknown")
@@ -3208,10 +3441,8 @@ def analytics_report(since_days: int) -> dict[str, Any]:
             if not isinstance(reviewer, dict):
                 continue
             for attempt in reviewer_attempts(reviewer):
-                mode_summary["reviewer_invocations"] += 1
-                mode_summary["reviewer_duration_seconds"] += float(
-                    attempt.get("duration_seconds") or 0
-                )
+                add_attempt_to_analytics_group(mode_summary, attempt)
+                add_attempt_to_analytics_group(phase_summary, attempt)
                 summary = providers.setdefault(
                     str(name),
                     {
@@ -3219,12 +3450,13 @@ def analytics_report(since_days: int) -> dict[str, Any]:
                         "successful": 0,
                         "failed": 0,
                         "cost_usd": 0.0,
+                        "attempts_with_token_usage": 0,
+                        "token_usage": empty_token_usage(),
                     },
                 )
                 summary["invocations"] += 1
                 if reviewer_attempt_succeeded(attempt):
                     summary["successful"] += 1
-                    mode_summary["successful_invocations"] += 1
                 else:
                     summary["failed"] += 1
                     category = (
@@ -3240,18 +3472,31 @@ def analytics_report(since_days: int) -> dict[str, Any]:
                 if isinstance(usage, dict):
                     attempt_cost = float(usage.get("total_cost_usd") or 0)
                     summary["cost_usd"] += attempt_cost
-                    mode_summary["reported_cost_usd"] += attempt_cost
+                    tokens = normalized_usage_tokens(usage)
+                    if tokens["total_tokens"]:
+                        summary["attempts_with_token_usage"] += 1
+                        add_token_usage(summary["token_usage"], tokens)
+                    fallback_model = str(attempt.get("model") or "unknown")
+                    for model, model_tokens, model_cost in provider_model_usage(
+                        usage, fallback_model
+                    ):
+                        model_summary = model_usage.setdefault(
+                            model,
+                            {
+                                "reported_uses": 0,
+                                "cost_usd": 0.0,
+                                "token_usage": empty_token_usage(),
+                            },
+                        )
+                        model_summary["reported_uses"] += 1
+                        model_summary["cost_usd"] += model_cost
+                        add_token_usage(model_summary["token_usage"], model_tokens)
     for summary in providers.values():
         summary["cost_usd"] = round(summary["cost_usd"], 6)
-    for summary in review_modes.values():
-        summary["reviewer_duration_seconds"] = round(
-            summary["reviewer_duration_seconds"], 3
-        )
-        summary["reported_cost_usd"] = round(
-            summary["reported_cost_usd"], 6
-        )
-        if isinstance(summary.get("decisions"), dict):
-            summary["decisions"] = dict(sorted(summary["decisions"].items()))
+    finalize_analytics_groups(review_modes)
+    finalize_analytics_groups(review_phases)
+    for summary in model_usage.values():
+        summary["cost_usd"] = round(summary["cost_usd"], 6)
     workflow_ids = sorted(
         {
             str(metadata.get("workflow_id"))
@@ -3330,24 +3575,11 @@ def analytics_report(since_days: int) -> dict[str, Any]:
         mode = review_mode_from_policy(
             root_policy if isinstance(root_policy, dict) else {}
         )
-        mode_summary = review_modes.setdefault(mode, {})
-        for key, default in (
-            ("runs", 0),
-            ("completed_runs", 0),
-            ("failed_runs", 0),
-            ("reviewer_invocations", 0),
-            ("successful_invocations", 0),
-            ("reviewer_duration_seconds", 0.0),
-            ("reported_cost_usd", 0.0),
-            ("findings", 0),
-            ("test_gaps", 0),
-            ("decisions", {}),
-        ):
-            mode_summary.setdefault(key, default)
+        mode_summary = review_modes.setdefault(mode, empty_analytics_group())
         mode_summary["lineages"] = int(mode_summary.get("lineages") or 0) + 1
         outcomes = mode_summary.setdefault("lineage_outcomes", {})
         outcomes[outcome] = int(outcomes.get(outcome) or 0) + 1
-        lineage_metrics = workflow_metrics(lineage_runs)
+        lineage_metrics = workflow_metrics(lineage_runs, artifact_bytes_by_run)
         mode_summary["lineage_cost_usd"] = round(
             float(mode_summary.get("lineage_cost_usd") or 0)
             + float(lineage_metrics["reported_cost_usd"]),
@@ -3377,14 +3609,109 @@ def analytics_report(since_days: int) -> dict[str, Any]:
         ),
         "providers": dict(sorted(providers.items())),
         "review_modes": dict(sorted(review_modes.items())),
+        "review_phases": dict(sorted(review_phases.items())),
+        "model_usage": dict(sorted(model_usage.items())),
         "metrics": metrics,
     }
+
+
+def smaller_output(full: str, compact: str) -> str:
+    """Return a compact rendering only when it reduces emitted UTF-8 bytes."""
+    return compact if len(compact.encode()) < len(full.encode()) else full
+
+
+def print_structured_output(
+    payload: dict[str, Any], output_format: str, compact: str
+) -> None:
+    full = json.dumps(payload, indent=2)
+    selected = smaller_output(full, compact) if output_format == "compact" else full
+    print(selected)
+
+
+def format_count(value: Any) -> str:
+    return f"{int(value or 0):,}"
+
+
+def render_analytics_compact(report: dict[str, Any]) -> str:
+    metrics = report.get("metrics")
+    metrics = metrics if isinstance(metrics, dict) else {}
+    tokens = metrics.get("token_usage")
+    tokens = tokens if isinstance(tokens, dict) else {}
+    lines = [
+        (
+            f"Analytics {report.get('since_days')}d: "
+            f"{format_count(report.get('run_attempts'))} runs, "
+            f"{format_count(metrics.get('reviewer_invocations'))} reviewer calls, "
+            f"{format_count(metrics.get('failed_reviewer_invocations'))} failed, "
+            f"${float(metrics.get('reported_cost_usd') or 0):.2f}, "
+            f"{float(metrics.get('reviewer_duration_seconds') or 0) / 3600:.2f}h"
+        ),
+        (
+            "Tokens: "
+            f"input={format_count(tokens.get('input_tokens'))}, "
+            f"cache-create={format_count(tokens.get('cache_creation_input_tokens'))}, "
+            f"cache-read={format_count(tokens.get('cache_read_input_tokens'))}, "
+            f"output={format_count(tokens.get('output_tokens'))}, "
+            f"total={format_count(tokens.get('total_tokens'))}; "
+            f"reported by {format_count(metrics.get('attempts_with_token_usage'))} attempts"
+        ),
+        (
+            f"Workflows: {format_count(report.get('workflow_count'))}; "
+            f"lineages={format_count(report.get('lineage_count'))}; "
+            f"finalized={format_count(report.get('finalized_workflows'))}; "
+            f"run-finals={format_count(report.get('workflows_with_run_finals'))}"
+        ),
+    ]
+    providers = report.get("providers")
+    if isinstance(providers, dict) and providers:
+        lines.append("Providers:")
+        for name, value in providers.items():
+            if not isinstance(value, dict):
+                continue
+            provider_tokens = value.get("token_usage")
+            provider_tokens = (
+                provider_tokens if isinstance(provider_tokens, dict) else {}
+            )
+            lines.append(
+                f"- {name}: {format_count(value.get('successful'))}/"
+                f"{format_count(value.get('invocations'))} successful, "
+                f"${float(value.get('cost_usd') or 0):.2f}, "
+                f"tokens={format_count(provider_tokens.get('total_tokens'))}"
+            )
+    phases = report.get("review_phases")
+    if isinstance(phases, dict) and phases:
+        lines.append("Phases:")
+        for name, value in phases.items():
+            if not isinstance(value, dict):
+                continue
+            phase_tokens = value.get("token_usage")
+            phase_tokens = phase_tokens if isinstance(phase_tokens, dict) else {}
+            lines.append(
+                f"- {name}: runs={format_count(value.get('runs'))}, "
+                f"calls={format_count(value.get('reviewer_invocations'))}, "
+                f"${float(value.get('reported_cost_usd') or 0):.2f}, "
+                f"tokens={format_count(phase_tokens.get('total_tokens'))}"
+            )
+    failure_types = report.get("failure_types")
+    if isinstance(failure_types, dict) and failure_types:
+        lines.append(
+            "Failures: "
+            + ", ".join(
+                f"{name}={format_count(count)}"
+                for name, count in failure_types.items()
+            )
+        )
+    lines.append("Use --format json for the complete report.")
+    return "\n".join(lines)
 
 
 def analytics_command(args: argparse.Namespace) -> int:
     if args.since_days < 1:
         raise ReviewError("--since-days must be at least 1.")
-    print(json.dumps(analytics_report(args.since_days), indent=2))
+    report = analytics_report(args.since_days)
+    print_structured_output(
+        report, args.output_format, render_analytics_compact(report)
+    )
     return 0
 
 
@@ -3498,17 +3825,41 @@ def memory_search_command(args: argparse.Namespace) -> int:
         limit=args.limit,
         minimum_similarity=args.minimum_similarity,
     )
-    print(
-        json.dumps(
-            {
-                "query": args.query,
-                "count": len(results),
-                "results": results,
-            },
-            indent=2,
-        )
+    payload = {
+        "query": args.query,
+        "count": len(results),
+        "results": results,
+    }
+    print_structured_output(
+        payload, args.output_format, render_memory_search_compact(payload)
     )
     return 0
+
+
+def render_memory_search_compact(payload: dict[str, Any]) -> str:
+    results = payload.get("results")
+    results = results if isinstance(results, list) else []
+    lines = [
+        f"Memory search {payload.get('query')!r}: {format_count(len(results))} matches"
+    ]
+    for index, result in enumerate(results, start=1):
+        if not isinstance(result, dict):
+            continue
+        fields = result.get("matched_fields")
+        matched = ",".join(fields) if isinstance(fields, list) else "unknown"
+        lines.append(
+            f"{index}. [{result.get('kind')}/{result.get('severity')} "
+            f"{result.get('decision')}] {result.get('title')} "
+            f"(score={float(result.get('similarity') or 0):.3f}; "
+            f"matched={matched})"
+        )
+        if result.get("location"):
+            lines.append(f"   {result.get('location')}")
+        lines.append(
+            f"   workflow={result.get('workflow_id')} run={result.get('run_id')}"
+        )
+    lines.append("Use --format json for evidence, action, and verification details.")
+    return "\n".join(lines)
 
 
 def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
@@ -3616,6 +3967,13 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
     else:
         state = "active"
     lineage_ids = workflow_lineage_ids(identifier)
+    lineage_runs = workflow_lineage_runs(identifier)
+    artifact_run_dirs = {
+        run_dir for run_dir, _ in [*all_runs, *lineage_runs]
+    }
+    artifact_bytes_by_run = {
+        run_dir: run_artifact_bytes(run_dir) for run_dir in artifact_run_dirs
+    }
     return {
         "workflow_id": identifier,
         "workflow": workflow_document,
@@ -3628,16 +3986,69 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
         "active_runs": active_runs,
         "history_complete": not history_issues,
         "history_issues": history_issues,
-        "metrics": workflow_metrics(all_runs),
-        "lineage_metrics": workflow_metrics(workflow_lineage_runs(identifier)),
+        "metrics": workflow_metrics(all_runs, artifact_bytes_by_run),
+        "lineage_metrics": workflow_metrics(
+            lineage_runs, artifact_bytes_by_run
+        ),
         "repositories": repositories,
     }, ready
 
 
 def workflow_status_command(args: argparse.Namespace) -> int:
     status, ready = workflow_status(args.workflow_id)
-    print(json.dumps(status, indent=2))
+    print_structured_output(
+        status, args.output_format, render_workflow_status_compact(status)
+    )
     return 0 if ready else 3
+
+
+def render_workflow_status_compact(status: dict[str, Any]) -> str:
+    metrics = status.get("metrics")
+    metrics = metrics if isinstance(metrics, dict) else {}
+    lines = [
+        (
+            f"Workflow {status.get('workflow_id')}: state={status.get('state')}, "
+            f"ready={str(bool(status.get('ready'))).lower()}, "
+            f"lineage={status.get('lineage_root')}"
+        ),
+        (
+            f"Runs: {format_count(metrics.get('run_count'))}; "
+            f"reviewer calls={format_count(metrics.get('reviewer_invocations'))}; "
+            f"cost=${float(metrics.get('reported_cost_usd') or 0):.2f}; "
+            f"duration={float(metrics.get('reviewer_duration_seconds') or 0):.1f}s"
+        ),
+    ]
+    active_runs = status.get("active_runs")
+    if isinstance(active_runs, list) and active_runs:
+        lines.append("Active runs:")
+        for run in active_runs:
+            if isinstance(run, dict):
+                lines.append(
+                    f"- round={run.get('round')} phase={run.get('phase')} "
+                    f"alive={run.get('process_alive')} elapsed="
+                    f"{float(run.get('elapsed_seconds') or 0):.1f}s "
+                    f"run={run.get('run_dir')}"
+                )
+    repositories = status.get("repositories")
+    if isinstance(repositories, list) and repositories:
+        lines.append("Repositories:")
+        for item in repositories:
+            if not isinstance(item, dict):
+                continue
+            repository = item.get("repository")
+            repository = repository if isinstance(repository, dict) else {}
+            label = repository.get("name") or repository.get("root") or "unknown"
+            lines.append(
+                f"- {label}: round={item.get('round')} phase={item.get('phase')} "
+                f"state={item.get('state')} final={item.get('final_status')} "
+                f"fresh={item.get('fresh')}"
+            )
+    issues = status.get("history_issues")
+    if isinstance(issues, list) and issues:
+        lines.append("History issues:")
+        lines.extend(f"- {issue}" for issue in issues)
+    lines.append("Use --format json for complete workflow policy and metrics.")
+    return "\n".join(lines)
 
 
 def workflow_finalize_command(args: argparse.Namespace) -> int:
@@ -5786,6 +6197,13 @@ def build_parser() -> argparse.ArgumentParser:
     analytics.add_argument(
         "--since-days", type=int, default=DEFAULT_ANALYTICS_DAYS
     )
+    analytics.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "compact"),
+        default="json",
+        help="Output format; compact is lossless-by-reference and JSON remains default",
+    )
     recommend = subparsers.add_parser(
         "recommend",
         help="Conservatively recommend fast, balanced, or deep without running providers",
@@ -5827,6 +6245,13 @@ def build_parser() -> argparse.ArgumentParser:
     memory_search.add_argument(
         "--minimum-similarity", type=float, default=0.35
     )
+    memory_search.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "compact"),
+        default="json",
+        help="Output format; compact links matches while JSON keeps complete evidence",
+    )
 
     workflow = subparsers.add_parser(
         "workflow", help="Manage a review workflow spanning one or more repositories"
@@ -5852,6 +6277,13 @@ def build_parser() -> argparse.ArgumentParser:
         "status", help="Check latest finalized round for each repository"
     )
     workflow_status_parser.add_argument("workflow_id")
+    workflow_status_parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "compact"),
+        default="json",
+        help="Output format; JSON remains the complete machine-readable default",
+    )
     workflow_finalize_parser = workflow_subparsers.add_parser(
         "finalize", help="Write a final workflow PASS if every repository is ready"
     )
