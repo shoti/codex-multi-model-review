@@ -343,7 +343,9 @@ class RunnerUnitTests(unittest.TestCase):
             error_path = run_dir / f"{reviewer.name}.stderr.log"
             report_path.write_text(
                 "# Verdict\nPASS_CLEAN\n\n# Findings\nNone.\n\n"
-                "# Test gaps\nNone.\n",
+                "# Test gaps\nNone.\n\n# Coverage\n- Complete: yes\n"
+                "- Unreviewed changed paths: []\n- Limitations: []\n\n"
+                "# Notes\nNone.\n",
                 encoding="utf-8",
             )
             error_path.write_text("", encoding="utf-8")
@@ -1240,7 +1242,7 @@ None.
                         json.dump(sys.argv[1:], output)
                     print(json.dumps({
                         "status": "SUCCESS",
-                        "response": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n",
+                        "response": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n",
                         "duration_seconds": 1.25,
                         "num_turns": 1,
                         "usage": {"total_tokens": 12}
@@ -1871,13 +1873,15 @@ None.
             collapsed_prompt,
         )
         self.assertIn(
-            "Limited review time, context, budget, or tool access belongs in Notes",
+            "Limited review time, context, budget, or tool access is not itself",
             collapsed_prompt,
         )
         self.assertIn(
-            "use PASS_CLEAN and state the limitation under Notes",
+            "marking coverage incomplete",
             collapsed_prompt,
         )
+        self.assertIn("# Coverage", prompt)
+        self.assertIn("Do not hide incomplete coverage in Notes", prompt)
 
         structured_gap = MM.parse_review_report(
             "kimi",
@@ -1903,6 +1907,215 @@ None.
         self.assertEqual(
             structured_gap["test_gaps"][0]["severity"], "medium"
         )
+
+    def test_incomplete_coverage_is_structured_and_requires_compensation(
+        self,
+    ) -> None:
+        report = textwrap.dedent(
+            """\
+            # Verdict
+            PASS_CLEAN
+
+            # Findings
+            None.
+
+            # Test gaps
+            None.
+
+            # Coverage
+            - Complete: no
+            - Unreviewed changed paths: ["src/large.ts"]
+            - Limitations: ["Budget ended before the full file was traced."]
+
+            # Notes
+            - No defect was found in inspected code.
+            """
+        )
+        parsed = MM.parse_review_report("claude", report)
+        self.assertFalse(parsed["coverage"]["complete"])
+        self.assertEqual(
+            parsed["coverage"]["unreviewed_changed_paths"],
+            ["src/large.ts"],
+        )
+        self.assertTrue(parsed["coverage"]["contract_valid"])
+        self.assertFalse(
+            MM.parsed_report_is_invalid(parsed, require_coverage=True)
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "status": "completed",
+                    "phase": "confirmation",
+                    "source_fingerprint": "fingerprint",
+                    "coverage_contract_required": True,
+                    "risks": [],
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {"findings": [], "test_gaps": []},
+            )
+            MM.safe_write_json(
+                run_dir / "review-summary.json",
+                {"reviews": {"claude": parsed}},
+            )
+            without_compensation = MM.build_parser().parse_args(
+                [
+                    "finalize",
+                    "--run",
+                    str(run_dir),
+                    "--codex-review",
+                    "No reachable defect found.",
+                ]
+            )
+            with (
+                mock.patch.object(
+                    MM,
+                    "freshness_status",
+                    return_value={"fresh": True, "mode": "working-tree"},
+                ),
+                self.assertRaisesRegex(
+                    MM.ReviewError, "Confirmation coverage is incomplete"
+                ),
+            ):
+                MM.finalize_command(without_compensation)
+
+            compensated = MM.build_parser().parse_args(
+                [
+                    "finalize",
+                    "--run",
+                    str(run_dir),
+                    "--codex-review",
+                    "No reachable defect found.",
+                    "--coverage-verification",
+                    "Read src/large.ts in full and traced both callers.",
+                ]
+            )
+            with mock.patch.object(
+                MM,
+                "freshness_status",
+                return_value={"fresh": True, "mode": "working-tree"},
+            ):
+                self.assertEqual(MM.finalize_command(compensated), 0)
+            final = MM.read_json(run_dir / "final.json")
+            self.assertTrue(final["review_coverage"]["gate_compensated"])
+            self.assertEqual(
+                final["review_coverage"]["incomplete_reviewers"][0]["reviewer"],
+                "claude",
+            )
+
+    def test_missing_coverage_is_invalid_when_contract_requires_it(self) -> None:
+        parsed = MM.parse_review_report(
+            "claude",
+            "# Verdict\nPASS_CLEAN\n\n# Findings\nNone.\n\n"
+            "# Test gaps\nNone.\n",
+        )
+        self.assertFalse(parsed["coverage"]["contract_valid"])
+        self.assertTrue(
+            MM.parsed_report_is_invalid(parsed, require_coverage=True)
+        )
+
+    def test_coverage_accepts_multiline_json_arrays(self) -> None:
+        parsed = MM.parse_review_report(
+            "antigravity",
+            """# Verdict
+PASS_CLEAN
+
+# Findings
+None.
+
+# Test gaps
+None.
+
+# Coverage
+- Complete: no
+- Unreviewed changed paths: [
+  "src/large.ts"
+]
+- Limitations: [
+  "Context ended before tracing the caller."
+]
+
+# Notes
+None.
+""",
+        )
+        self.assertTrue(parsed["coverage"]["contract_valid"])
+        self.assertEqual(
+            parsed["coverage"]["unreviewed_changed_paths"],
+            ["src/large.ts"],
+        )
+        self.assertEqual(
+            parsed["coverage"]["limitations"],
+            ["Context ended before tracing the caller."],
+        )
+
+    def test_base_scope_review_attests_clean_branch_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            run_dir = root / "run"
+            repo.mkdir()
+            run_dir.mkdir()
+            initialize_repo(repo)
+            base = run(
+                ["git", "rev-parse", "HEAD"], cwd=repo
+            ).stdout.strip()
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            run(["git", "add", "src/feature.py"], cwd=repo)
+            run(["git", "commit", "-qm", "feature"], cwd=repo)
+            head = run(
+                ["git", "rev-parse", "HEAD"], cwd=repo
+            ).stdout.strip()
+            scope = MM.Scope("base", base, "working tree against base")
+            filters = ("src",)
+            paths = MM.changed_paths(repo, scope, filters)
+            fingerprint = MM.fingerprint(repo, scope, paths, filters)
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "status": "completed",
+                    "repository": {"root": str(repo), "head": head},
+                    "scope": MM.dataclasses.asdict(scope),
+                    "path_filters": list(filters),
+                    "paths": paths,
+                    "source_fingerprint": fingerprint,
+                    "result_content_fingerprint": MM.content_fingerprint(
+                        repo, paths
+                    ),
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "final.json",
+                {"source_fingerprint": fingerprint, "status": "PASS_CLEAN"},
+            )
+
+            freshness = MM.freshness_status(
+                run_dir,
+                MM.read_json(run_dir / "metadata.json"),
+                fingerprint,
+            )
+            self.assertTrue(freshness["fresh"])
+            self.assertEqual(freshness["mode"], "committed-equivalent")
+            self.assertEqual(freshness["commit"], head)
+
+            args = MM.build_parser().parse_args(
+                [
+                    "attest-commit",
+                    "--run",
+                    str(run_dir),
+                    "--commit",
+                    "HEAD",
+                ]
+            )
+            self.assertEqual(MM.attest_commit_command(args), 0)
+            final = MM.read_json(run_dir / "final.json")
+            self.assertEqual(final["commit_attestations"][0]["commit"], head)
 
     def test_batch_triage_is_atomic_for_findings_and_test_gaps(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2041,6 +2254,11 @@ None.
                                 "confidence": "high"
                             }],
                             "test_gaps": [],
+                            "coverage": {
+                                "complete": True,
+                                "unreviewed_changed_paths": [],
+                                "limitations": []
+                            },
                             "notes": ["Static review"]
                         },
                         "total_cost_usd": 0.01
@@ -2148,7 +2366,9 @@ None.
             )
             report.write_text(
                 "# Verdict\nPASS_CLEAN\n\n# Findings\nNone.\n\n"
-                "# Test gaps\nNone.\n",
+                "# Test gaps\nNone.\n\n# Coverage\n- Complete: yes\n"
+                "- Unreviewed changed paths: []\n- Limitations: []\n\n"
+                "# Notes\nNone.\n",
                 encoding="utf-8",
             )
             error.write_text("", encoding="utf-8")
@@ -2172,6 +2392,9 @@ None.
                     results=[second],
                 )
             persisted = MM.read_json(run_dir / "metadata.json")
+            triage = MM.read_json(run_dir / "triage.json")
+            self.assertTrue(triage["review_coverage"]["claude"]["complete"])
+            self.assertEqual(triage["review_notes"]["claude"], [])
             metrics = MM.workflow_metrics([(run_dir, persisted)])
             archived_raw_exists = (run_dir / "claude.attempt-1.raw.json").exists()
             legacy = json.loads(json.dumps(persisted))
@@ -2929,6 +3152,7 @@ None.
                 "runs": 1,
                 "completed_runs": 0,
                 "failed_runs": 1,
+                "preflight_blocked_runs": 0,
                 "reviewer_invocations": 2,
                 "successful_invocations": 1,
                 "reviewer_duration_seconds": 1.1,
@@ -2938,8 +3162,45 @@ None.
                 "artifact_bytes": MM.empty_artifact_bytes(),
                 "findings": 0,
                 "test_gaps": 0,
+                "coverage_complete_reviews": 0,
+                "incomplete_coverage_reviews": 0,
+                "unknown_coverage_reviews": 1,
+                "unreviewed_changed_paths": 0,
                 "decisions": {},
             },
+        )
+
+    def test_preflight_blocks_are_not_counted_as_failed_reviews(self) -> None:
+        run_dir = Path("/tmp/preflight-block")
+        metadata = {
+            "created_at": MM.utc_now(),
+            "status": "preflight_blocked",
+            "workflow_id": "wf-preflight",
+            "review_mode": "deep",
+            "phase": "confirmation",
+            "failure": {
+                "type": "ReviewError",
+                "message": "Sensitive material requires inspection.",
+            },
+        }
+        metrics = MM.workflow_metrics(
+            [(run_dir, metadata)], include_artifact_bytes=False
+        )
+        self.assertEqual(metrics["preflight_blocked_runs"], 1)
+        self.assertEqual(metrics["failed_runs"], 0)
+        self.assertEqual(metrics["failed_reviewer_invocations"], 0)
+        with (
+            mock.patch.object(
+                MM, "all_run_metadata", return_value=[(run_dir, metadata)]
+            ),
+            mock.patch.object(MM, "workflow_path", return_value=Path("/missing")),
+            mock.patch.object(MM, "WORKFLOWS_DIR", Path("/missing")),
+        ):
+            report = MM.analytics_report(7)
+        self.assertEqual(report["run_statuses"]["preflight_blocked"], 1)
+        self.assertEqual(report["run_statuses"]["failed"], 0)
+        self.assertEqual(
+            report["review_modes"]["deep"]["preflight_blocked_runs"], 1
         )
 
     def test_analytics_aggregates_provider_reported_tokens_and_artifact_bytes(
@@ -4018,7 +4279,7 @@ class RunnerEndToEndTests(unittest.TestCase):
                     path.write_text(str(int(path.read_text()) + 1 if path.exists() else 1))
                     sys.stdin.read()
                     print(json.dumps({{
-                        "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n",
+                        "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n",
                         "total_cost_usd": 0.01
                     }}))
                     """
@@ -4189,7 +4450,7 @@ class RunnerEndToEndTests(unittest.TestCase):
                     test ! -e REVIEW.md || exit 4
                     cat >/dev/null
                     python3 -c 'import json; print(json.dumps({
-                      "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n",
+                      "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n",
                       "total_cost_usd": 0.01
                     }))'
                     """
@@ -4263,7 +4524,7 @@ class RunnerEndToEndTests(unittest.TestCase):
                     count_path.write_text(str(count + 1))
                     sys.stdin.read()
                     print(json.dumps({{
-                        "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n",
+                        "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n",
                         "total_cost_usd": 0.01
                     }}))
                     """
@@ -4359,7 +4620,7 @@ class RunnerEndToEndTests(unittest.TestCase):
                     fi
                     cat >/dev/null
                     python3 -c 'import json; print(json.dumps({
-                      "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n",
+                      "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n",
                       "total_cost_usd": 0.01
                     }))'
                     """
@@ -4462,7 +4723,7 @@ class RunnerEndToEndTests(unittest.TestCase):
                     fi
                     cat >/dev/null
                     python3 -c 'import json; print(json.dumps({
-                      "result": "# Verdict\\nPASS_WITH_FINDINGS\\n\\n# Findings\\n## [medium] Add a behavior assertion\\n- Location: src/feature.py:1\\n- Trigger: value changes\\n- Evidence: adapter behavior is not asserted\\n- Impact: bounded regression risk\\n- Smallest fix: add an assertion\\n- Confidence: medium\\n\\n# Test gaps\\n- Add a behavior assertion.\\n\\n# Notes\\nNone.\\n",
+                      "result": "# Verdict\\nPASS_WITH_FINDINGS\\n\\n# Findings\\n## [medium] Add a behavior assertion\\n- Location: src/feature.py:1\\n- Trigger: value changes\\n- Evidence: adapter behavior is not asserted\\n- Impact: bounded regression risk\\n- Smallest fix: add an assertion\\n- Confidence: medium\\n\\n# Test gaps\\n- Add a behavior assertion.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n",
                       "duration_ms": 25,
                       "total_cost_usd": 0.01,
                       "usage": {"input_tokens": 10, "output_tokens": 20}
@@ -4755,7 +5016,10 @@ class RunnerEndToEndTests(unittest.TestCase):
                 env=environment,
             )
             self.assertIn('"ready": true', committed_workflow.stdout)
-            self.assertIn('"failed_runs": 1', committed_workflow.stdout)
+            self.assertIn(
+                '"preflight_blocked_runs": 1', committed_workflow.stdout
+            )
+            self.assertIn('"failed_runs": 0', committed_workflow.stdout)
             attested = run(
                 [
                     *base,
@@ -4810,17 +5074,20 @@ class RunnerEndToEndTests(unittest.TestCase):
             )
             self.assertEqual(blocked.returncode, 2)
             self.assertNotIn(secret, blocked.stderr)
-            failed_metadata = [
+            preflight_metadata = [
                 json.loads(path.read_text(encoding="utf-8"))
                 for path in (home / ".codex" / "review-runs").glob(
                     "*/*/metadata.json"
                 )
                 if json.loads(path.read_text(encoding="utf-8")).get("status")
-                == "failed"
+                == "preflight_blocked"
             ]
-            self.assertEqual(len(failed_metadata), 2)
+            self.assertEqual(len(preflight_metadata), 2)
             self.assertTrue(
-                all(item["status"] == "failed" for item in failed_metadata)
+                all(
+                    item["status"] == "preflight_blocked"
+                    for item in preflight_metadata
+                )
             )
 
     def test_partial_run_resumes_only_failed_provider(self) -> None:
@@ -4853,7 +5120,7 @@ class RunnerEndToEndTests(unittest.TestCase):
                     count = int(path.read_text() or "0") if path.exists() else 0
                     path.write_text(str(count + 1))
                     print(json.dumps({{
-                        "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n",
+                        "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n",
                         "total_cost_usd": 0.01
                     }}))
                     """
@@ -4880,7 +5147,7 @@ class RunnerEndToEndTests(unittest.TestCase):
                         marker.write_text("failed")
                         print('error: Model "k3-256k" temporarily unavailable', file=sys.stderr)
                         raise SystemExit(1)
-                    print("# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n")
+                    print("# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n")
                     """
                 ),
                 encoding="utf-8",

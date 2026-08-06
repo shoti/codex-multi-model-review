@@ -74,6 +74,19 @@ Examples:
 A green mock-based suite is not proof when the production adapter can silently
 accept a malformed call as a no-op.
 
+## Coverage completeness
+
+Every new reviewer report must declare whether it read every changed file and
+completed the task-level trace. It must list unreviewed changed paths and any
+time, context, budget, or tool limitation. These disclosures are evidence, not
+repository findings, and do not manufacture a false test gap.
+
+An incomplete repair may proceed to an independent confirmation, which can
+close the missing coverage. An incomplete confirmation cannot be finalized
+silently. Either obtain another review or use `--coverage-verification` to
+record concrete Codex inspection of every uncovered path or behavior. A generic
+statement such as "reviewed manually" is not sufficient evidence.
+
 ## Convergence gate
 
 Run another external round when an accepted blocker/high finding caused code to

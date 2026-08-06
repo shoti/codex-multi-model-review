@@ -104,7 +104,7 @@ PROVIDER_BINARIES = {
 }
 LEGACY_PROVIDER_ALIASES = {"gemini": "antigravity"}
 PROVIDER_CHOICES = (*PROVIDERS, *LEGACY_PROVIDER_ALIASES)
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MAX_REPAIR_ROUNDS = 3
 RUN_PHASES = ("repair", "confirmation", "supplemental")
 DEFAULT_REVIEW_MODE = "balanced"
@@ -1472,9 +1472,10 @@ both Findings and Test gaps are "None."
 
 PASS_WITH_FINDINGS is invalid unless at least one structured finding or
 actionable test gap is present. Limited review time, context, budget, or tool
-access belongs in Notes and is not itself a repository test gap. If those
-limitations reveal no actionable item, use PASS_CLEAN and state the limitation
-under Notes.
+access is not itself a repository test gap, but it must be disclosed under
+Coverage. If those limitations reveal no actionable item, use PASS_CLEAN while
+marking coverage incomplete; Codex must compensate explicitly before the final
+gate can pass.
 
 # Findings
 For each actionable finding:
@@ -1500,6 +1501,16 @@ For each actionable missing test:
 Use medium for changed risk-profiled behavior and low for bounded coverage
 debt. Write "None." when no actionable test gap remains. Do not duplicate a
 correctness finding here.
+
+# Coverage
+- Complete: yes or no
+- Unreviewed changed paths: a JSON string array, for example [] or ["src/a.ts"]
+- Limitations: a JSON string array with any time, budget, context, or tool limits
+
+Use Complete: yes only after reading the patch and full contents of every
+changed file and tracing enough connected code for the task. If Complete is no,
+name every known unreviewed changed path and describe remaining limitations.
+Do not hide incomplete coverage in Notes.
 
 # Notes
 Optional concise assumptions or areas you could not verify.
@@ -2077,7 +2088,11 @@ def freshness_status(
         current = current_run_fingerprint(metadata)
     except ReviewError:
         current = None
-    if current is not None and current == expected_fingerprint:
+    if (
+        current is not None
+        and current == expected_fingerprint
+        and scope.kind != "base"
+    ):
         return {
             "fresh": True,
             "mode": "working-tree",
@@ -2105,6 +2120,21 @@ def freshness_status(
         repo, Scope("uncommitted", None, "current working tree"), filters
     )
     expected_content = metadata.get("result_content_fingerprint")
+
+    if scope.kind == "base" and task_worktree_paths:
+        if current is not None and current == expected_fingerprint:
+            return {
+                "fresh": True,
+                "mode": "working-tree",
+                "current_fingerprint": current,
+                "commit": None,
+            }
+        return {
+            "fresh": False,
+            "mode": "stale",
+            "current_fingerprint": current,
+            "commit": head,
+        }
 
     if not isinstance(base, str) or not base:
         is_initial_commit = first_parent(repo, head) is None
@@ -3054,6 +3084,7 @@ def workflow_metrics(
         "run_count": len(runs),
         "completed_runs": 0,
         "failed_runs": 0,
+        "preflight_blocked_runs": 0,
         "partial_runs": 0,
         "running_runs": 0,
         "unclassified_runs": 0,
@@ -3071,6 +3102,10 @@ def workflow_metrics(
         "successful_models": [],
         "findings": 0,
         "test_gaps": 0,
+        "coverage_complete_reviews": 0,
+        "incomplete_coverage_reviews": 0,
+        "unknown_coverage_reviews": 0,
+        "unreviewed_changed_paths": 0,
         "repeated_findings": 0,
         "memory_candidate_items": 0,
         "memory_candidate_matches": 0,
@@ -3101,6 +3136,8 @@ def workflow_metrics(
             metrics["completed_runs"] += 1
         elif metadata.get("status") == "failed":
             metrics["failed_runs"] += 1
+        elif metadata.get("status") == "preflight_blocked":
+            metrics["preflight_blocked_runs"] += 1
         elif metadata.get("status") == "partial":
             metrics["partial_runs"] += 1
         elif metadata.get("status") == "running":
@@ -3128,6 +3165,21 @@ def workflow_metrics(
             for reviewer in reviewers.values():
                 if not isinstance(reviewer, dict):
                     continue
+                if int(reviewer.get("exit_code") or 0) == 0 and (
+                    "exit_code" in reviewer
+                ):
+                    coverage = reviewer.get("coverage")
+                    if not isinstance(coverage, dict) or coverage.get(
+                        "complete"
+                    ) is None:
+                        metrics["unknown_coverage_reviews"] += 1
+                    elif coverage.get("complete") is True:
+                        metrics["coverage_complete_reviews"] += 1
+                    else:
+                        metrics["incomplete_coverage_reviews"] += 1
+                        paths = coverage.get("unreviewed_changed_paths")
+                        if isinstance(paths, list):
+                            metrics["unreviewed_changed_paths"] += len(paths)
                 for attempt in reviewer_attempts(reviewer):
                     metrics["reviewer_invocations"] += 1
                     succeeded = reviewer_attempt_succeeded(attempt)
@@ -3210,6 +3262,7 @@ def empty_analytics_group() -> dict[str, Any]:
         "runs": 0,
         "completed_runs": 0,
         "failed_runs": 0,
+        "preflight_blocked_runs": 0,
         "reviewer_invocations": 0,
         "successful_invocations": 0,
         "reviewer_duration_seconds": 0.0,
@@ -3219,6 +3272,10 @@ def empty_analytics_group() -> dict[str, Any]:
         "artifact_bytes": empty_artifact_bytes(),
         "findings": 0,
         "test_gaps": 0,
+        "coverage_complete_reviews": 0,
+        "incomplete_coverage_reviews": 0,
+        "unknown_coverage_reviews": 0,
+        "unreviewed_changed_paths": 0,
         "decisions": {},
     }
 
@@ -3241,6 +3298,8 @@ def add_run_to_analytics_group(
     summary["runs"] += 1
     if metadata.get("status") == "completed":
         summary["completed_runs"] += 1
+    elif metadata.get("status") == "preflight_blocked":
+        summary["preflight_blocked_runs"] += 1
     elif metadata.get("status") in {"failed", "partial"}:
         summary["failed_runs"] += 1
     add_artifact_bytes(
@@ -3249,6 +3308,23 @@ def add_run_to_analytics_group(
         if artifact_bytes is not None
         else run_artifact_bytes(run_dir),
     )
+    reviewers = metadata.get("reviewers")
+    if isinstance(reviewers, dict):
+        for reviewer in reviewers.values():
+            if not isinstance(reviewer, dict) or "exit_code" not in reviewer:
+                continue
+            if int(reviewer.get("exit_code") or 0) != 0:
+                continue
+            coverage = reviewer.get("coverage")
+            if not isinstance(coverage, dict) or coverage.get("complete") is None:
+                summary["unknown_coverage_reviews"] += 1
+            elif coverage.get("complete") is True:
+                summary["coverage_complete_reviews"] += 1
+            else:
+                summary["incomplete_coverage_reviews"] += 1
+                paths = coverage.get("unreviewed_changed_paths")
+                if isinstance(paths, list):
+                    summary["unreviewed_changed_paths"] += len(paths)
     triage_path = run_dir / "triage.json"
     if not triage_path.exists():
         return
@@ -3577,6 +3653,7 @@ def analytics_report(since_days: int) -> dict[str, Any]:
         "run_statuses": {
             "completed": metrics["completed_runs"],
             "failed": metrics["failed_runs"],
+            "preflight_blocked": metrics["preflight_blocked_runs"],
             "partial": metrics["partial_runs"],
             "running": metrics["running_runs"],
             "unclassified": metrics["unclassified_runs"],
@@ -3658,8 +3735,21 @@ def render_analytics_compact(report: dict[str, Any]) -> str:
             f"structural={format_count(metrics.get('memory_structural_matches'))}; "
             f"assessed={format_count(sum((metrics.get('memory_assessments') or {}).values()))}"
         ),
+        (
+            "Coverage: "
+            f"complete={format_count(metrics.get('coverage_complete_reviews'))}; "
+            f"incomplete={format_count(metrics.get('incomplete_coverage_reviews'))}; "
+            f"unknown={format_count(metrics.get('unknown_coverage_reviews'))}; "
+            f"unreviewed-paths={format_count(metrics.get('unreviewed_changed_paths'))}"
+        ),
     ]
     statuses = report.get("run_statuses")
+    if isinstance(statuses, dict) and statuses.get("preflight_blocked"):
+        lines.append(
+            "Preflight blocks: "
+            f"{format_count(statuses.get('preflight_blocked'))} "
+            "run(s) stopped before provider invocation"
+        )
     if isinstance(statuses, dict) and statuses.get("unclassified"):
         lines.append(
             "Run status warning: "
@@ -4149,6 +4239,12 @@ def workflow_audit_report(stale_days: int) -> dict[str, Any]:
         ):
             state = "failed"
             action = "inspect failure or supersede intentionally"
+        elif runs and all(
+            metadata.get("status") == "preflight_blocked"
+            for _, metadata in runs
+        ):
+            state = "preflight_blocked"
+            action = "inspect preflight evidence and retry intentionally"
         elif latest_activity is not None and latest_activity < cutoff:
             state = "stale_incomplete"
             action = "inspect and supersede or resume intentionally"
@@ -4338,6 +4434,11 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
         item["state"] == "confirmation-required" for item in repositories
     ):
         state = "confirmation_required"
+    elif all_runs and all(
+        metadata.get("status") == "preflight_blocked"
+        for _, metadata in all_runs
+    ):
+        state = "preflight_blocked"
     else:
         state = "active"
     lineage_ids = workflow_lineage_ids(identifier)
@@ -5163,6 +5264,42 @@ def final_gate_status(
     return "PASS_CLEAN"
 
 
+def incomplete_review_coverage(run_dir: Path) -> list[dict[str, Any]]:
+    summary_path = run_dir / "review-summary.json"
+    if not summary_path.exists():
+        return []
+    reviews = read_json(summary_path).get("reviews")
+    if not isinstance(reviews, dict):
+        return []
+    incomplete: list[dict[str, Any]] = []
+    for reviewer, review in reviews.items():
+        if not isinstance(review, dict):
+            continue
+        coverage = review.get("coverage")
+        if not isinstance(coverage, dict) or coverage.get("complete") is not True:
+            incomplete.append(
+                {
+                    "reviewer": str(reviewer),
+                    "complete": (
+                        coverage.get("complete")
+                        if isinstance(coverage, dict)
+                        else None
+                    ),
+                    "unreviewed_changed_paths": (
+                        list(coverage.get("unreviewed_changed_paths") or [])
+                        if isinstance(coverage, dict)
+                        else []
+                    ),
+                    "limitations": (
+                        list(coverage.get("limitations") or [])
+                        if isinstance(coverage, dict)
+                        else ["Reviewer report did not include structured coverage."]
+                    ),
+                }
+            )
+    return incomplete
+
+
 def finalize_command(args: argparse.Namespace) -> int:
     os.umask(0o077)
     run_dir = resolve_run_dir(args.run)
@@ -5210,12 +5347,37 @@ def finalize_command(args: argparse.Namespace) -> int:
 
     codex_review = args.codex_review.strip()
     verification = [item.strip() for item in args.verification if item.strip()]
+    coverage_verification = [
+        item.strip()
+        for item in getattr(args, "coverage_verification", [])
+        if item.strip()
+    ]
     if not codex_review:
         raise ReviewError("--codex-review cannot be empty.")
     risky = bool(metadata.get("risks"))
     if risky and not verification:
         raise ReviewError(
             "At least one --verification is required for a risk-profiled review."
+        )
+    incomplete_coverage = (
+        incomplete_review_coverage(run_dir)
+        if metadata.get("coverage_contract_required") is True
+        else []
+    )
+    if incomplete_coverage and not coverage_verification:
+        details = []
+        for item in incomplete_coverage:
+            paths = item.get("unreviewed_changed_paths") or []
+            limitations = item.get("limitations") or []
+            details.append(
+                f"{item['reviewer']}: paths={paths or ['not specified']}; "
+                f"limitations={limitations or ['not specified']}"
+            )
+        raise ReviewError(
+            "Confirmation coverage is incomplete. Run another independent "
+            "review or provide concrete Codex compensation with "
+            "--coverage-verification after inspecting every uncovered area:\n- "
+            + "\n- ".join(details)
         )
     remaining = [
         item
@@ -5275,6 +5437,14 @@ def finalize_command(args: argparse.Namespace) -> int:
         "triage_sha256": sha256_text(triage_text),
         "codex_review": codex_review,
         "verification": verification,
+        "review_coverage": {
+            "provider_complete": not incomplete_coverage,
+            "incomplete_reviewers": incomplete_coverage,
+            "codex_compensating_verification": coverage_verification,
+            "gate_compensated": bool(
+                incomplete_coverage and coverage_verification
+            ),
+        },
         "remaining_finding_ids": [
             str(item.get("id")) for item in remaining
         ],
@@ -5394,7 +5564,10 @@ def attest_commit_command(args: argparse.Namespace) -> int:
         if not freshness["fresh"] or freshness.get("commit") != commit:
             raise ReviewError(
                 "The requested commit is not content-equivalent to the "
-                "finalized review snapshot."
+                "finalized review snapshot "
+                f"(fresh={bool(freshness.get('fresh'))}, "
+                f"mode={freshness.get('mode')}, "
+                f"resolved_commit={freshness.get('commit') or 'none'})."
             )
         attestations = final.setdefault("commit_attestations", [])
         if not isinstance(attestations, list):
@@ -5609,6 +5782,7 @@ def persist_review_results(
             "verdict": parsed["verdict"],
             "finding_counts": parsed["finding_counts"],
             "test_gap_counts": parsed["test_gap_counts"],
+            "coverage": parsed["coverage"],
         }
         if attempt_history:
             latest["attempts"] = attempt_history
@@ -5633,7 +5807,10 @@ def persist_review_results(
             item["report_contract_valid"] = False
             failed_reviewers.append(str(name))
             continue
-        invalid = parsed_report_is_invalid(parsed)
+        invalid = parsed_report_is_invalid(
+            parsed,
+            require_coverage=bool(metadata.get("coverage_contract_required")),
+        )
         item["report_contract_valid"] = not invalid
         if invalid:
             invalid_reports.append(str(name))
@@ -5689,6 +5866,16 @@ def persist_review_results(
             "findings": [triage_entry(item) for item in all_findings],
             "test_gaps": [triage_entry(item) for item in all_test_gaps],
             "observations": all_observations,
+            "review_coverage": {
+                name: review.get("coverage")
+                for name, review in parsed_reviews.items()
+                if isinstance(review, dict)
+            },
+            "review_notes": {
+                name: review.get("notes", [])
+                for name, review in parsed_reviews.items()
+                if isinstance(review, dict)
+            },
         },
     )
     completed_at = dt.datetime.now(dt.timezone.utc)
@@ -6185,6 +6372,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             else None
         ),
         "isolated_snapshot": True,
+        "coverage_contract_required": True,
         "patch_sha256": sha256_text(patch),
         "sensitive_override": bool(args.allow_sensitive_paths),
         "allowed_sensitive_findings": sorted(set(args.allow_sensitive_finding)),
@@ -6543,7 +6731,13 @@ def run_review_command(args: argparse.Namespace) -> int:
             run_dir,
             error_type=type(exc).__name__,
             message=str(exc),
-            status=("partial" if current_status == "partial" else "failed"),
+            status=(
+                "partial"
+                if current_status == "partial"
+                else "preflight_blocked"
+                if current_status == "preflight"
+                else "failed"
+            ),
             completed_at=utc_now(),
             duration_seconds=elapsed_since(
                 str(metadata.get("started_at") or metadata.get("created_at"))
@@ -6975,6 +7169,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Command/check and result; repeat for multiple checks",
+    )
+    finalize.add_argument(
+        "--coverage-verification",
+        action="append",
+        default=[],
+        help=(
+            "Concrete Codex inspection that compensates for explicitly "
+            "incomplete reviewer coverage; repeat as needed"
+        ),
     )
 
     verify = subparsers.add_parser(

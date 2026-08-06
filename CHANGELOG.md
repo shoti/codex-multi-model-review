@@ -7,6 +7,12 @@ All notable user-visible changes are documented here. This project follows
 
 ### Added
 
+- Add structured reviewer coverage declarations, persist reviewer notes and
+  unreviewed changed paths, expose coverage analytics, and require explicit
+  Codex compensation before incomplete confirmation coverage can finalize.
+- Separate preflight-blocked attempts from failed reviews and provider
+  invocation failures in workflow status and analytics.
+
 - Add lineage-wide budget accounting so linked successors retain every
   ancestor's reported spend and active reservations.
 - Add a private, dependency-free SQLite evidence index with rebuild, status,
@@ -87,6 +93,9 @@ All notable user-visible changes are documented here. This project follows
   provider, and evidence writes.
 
 ### Changed
+
+- Allow a clean reviewed `--base` branch to resolve as committed-equivalent and
+  be attested to its checked-out HEAD, with actionable failure diagnostics.
 
 - Skip CLI and readiness probes for disabled providers in `status` and plain
   `doctor`.
