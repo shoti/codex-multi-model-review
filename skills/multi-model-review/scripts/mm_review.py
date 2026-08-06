@@ -19,6 +19,7 @@ import re
 import signal
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -32,6 +33,14 @@ from review_contract import (
     parse_review_report,
     parsed_report_is_invalid,
     render_structured_review,
+)
+from evidence_memory import (
+    compact as compact_evidence_memory,
+    normalized_text,
+    rebuild as rebuild_evidence_memory,
+    search as search_evidence_memory,
+    status as evidence_memory_status,
+    upsert_run as upsert_evidence_run,
 )
 
 
@@ -82,9 +91,9 @@ PROVIDER_BINARIES = {
 }
 LEGACY_PROVIDER_ALIASES = {"gemini": "antigravity"}
 PROVIDER_CHOICES = (*PROVIDERS, *LEGACY_PROVIDER_ALIASES)
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MAX_REPAIR_ROUNDS = 3
-RUN_PHASES = ("repair", "confirmation")
+RUN_PHASES = ("repair", "confirmation", "supplemental")
 DEFAULT_REVIEW_MODE = "balanced"
 REVIEW_MODES: dict[str, dict[str, Any]] = {
     "fast": {
@@ -279,6 +288,10 @@ class SensitiveFinding:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def evidence_memory_path() -> Path:
+    return RUNS_DIR / "evidence-memory.sqlite3"
 
 
 def sha256_text(content: str) -> str:
@@ -1418,6 +1431,11 @@ current snapshot and report only issues that still exist. Do not invent a new
 design direction or re-report already-resolved coverage debt as a correctness
 defect.
 
+In a supplemental review, answer the focused task question against the exact
+unchanged finalized content. It adds evidence but does not replace the original
+gate. Report any real issue normally; Codex will open a successor workflow if a
+source change is required.
+
 Apply the {review_profile} profile. Give extra attention to its concrete
 failure modes, but keep severity tied to reachable impact in the changed code.
 
@@ -1451,6 +1469,9 @@ For each actionable finding:
 - Impact: user or system consequence
 - Smallest fix: concise recommendation
 - Confidence: high, medium, or low
+
+An observation with no reachable impact or no recommended action is not a
+finding. Put it in Notes so it does not create false triage work.
 
 Write "None." when there are no actionable findings.
 
@@ -2273,6 +2294,99 @@ def workflow_path(identifier: str) -> Path:
     return WORKFLOWS_DIR / f"{identifier}.json"
 
 
+def workflow_ancestry_ids(identifier: str) -> list[str]:
+    """Return this workflow and every transitive ancestor, oldest first."""
+    ordered: list[str] = []
+    visiting: set[str] = set()
+
+    def visit(current: str) -> None:
+        if current in visiting:
+            raise ReviewError(f"Workflow lineage contains a cycle at {current}.")
+        if current in ordered:
+            return
+        visiting.add(current)
+        path = workflow_path(current)
+        if path.exists():
+            document = read_json(path)
+            ancestors = document.get("supersedes")
+            if isinstance(ancestors, list):
+                for ancestor in ancestors:
+                    visit(str(ancestor))
+            supplemental_parent = document.get("supplemental_parent_workflow_id")
+            if supplemental_parent:
+                visit(str(supplemental_parent))
+        visiting.remove(current)
+        ordered.append(current)
+
+    visit(identifier)
+    return ordered
+
+
+def workflow_lineage_root(identifier: str) -> str:
+    ancestry = workflow_ancestry_ids(identifier)
+    return ancestry[0] if ancestry else identifier
+
+
+def workflow_lineage_ids(identifier: str) -> list[str]:
+    """Return every workflow connected to the same task-lineage root."""
+    root = workflow_lineage_root(identifier)
+    identifiers = set(workflow_ancestry_ids(identifier))
+    if WORKFLOWS_DIR.exists():
+        for path in WORKFLOWS_DIR.glob("*.json"):
+            if path.name.endswith(".final.json"):
+                continue
+            candidate = path.stem
+            try:
+                if workflow_lineage_root(candidate) == root:
+                    identifiers.add(candidate)
+            except ReviewError:
+                continue
+    return sorted(
+        identifiers,
+        key=lambda item: (
+            len(workflow_ancestry_ids(item)),
+            item,
+        ),
+    )
+
+
+def workflow_lineage_runs(identifier: str) -> list[tuple[Path, dict[str, Any]]]:
+    identifiers = set(workflow_lineage_ids(identifier))
+    return [
+        item
+        for item in all_run_metadata()
+        if str(item[1].get("workflow_id")) in identifiers
+    ]
+
+
+def refresh_evidence_run(run_dir: Path) -> None:
+    """Refresh derived memory without weakening authoritative run evidence."""
+    try:
+        run_dir.resolve().relative_to(RUNS_DIR.resolve())
+    except ValueError:
+        return
+    metadata_path = run_dir / "metadata.json"
+    if not metadata_path.exists() or not (run_dir / "triage.json").exists():
+        return
+    metadata = read_json(metadata_path)
+    identifier = str(metadata.get("workflow_id") or "")
+    try:
+        with exclusive_file_lock(evidence_memory_path()):
+            upsert_evidence_run(
+                evidence_memory_path(),
+                run_dir,
+                lineage_root=(
+                    workflow_lineage_root(identifier) if identifier else ""
+                ),
+            )
+    except (OSError, sqlite3.Error) as exc:
+        print(
+            f"Warning: evidence memory refresh failed for {run_dir}: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+
+
 def require_active_workflow(identifier: str) -> dict[str, Any]:
     path = workflow_path(identifier)
     if not path.exists():
@@ -2292,6 +2406,12 @@ def require_active_workflow(identifier: str) -> dict[str, Any]:
             f"Workflow {identifier} is superseded and cannot accept new "
             f"reviews.{direction}"
         )
+    if workflow.get("status") == "completed":
+        raise ReviewError(
+            f"Workflow {identifier} is completed and cannot accept new reviews. "
+            f"Create a linked successor with `mm-review workflow supersede "
+            f"{identifier} --reason \"source or contract changed\"`."
+        )
     return workflow
 
 
@@ -2302,7 +2422,14 @@ def create_workflow(
     max_budget_usd: float = 5.0,
     review_mode: str = DEFAULT_REVIEW_MODE,
     supersedes: Sequence[str] = (),
+    workflow_kind: str = "standard",
+    supplemental_of: str | None = None,
+    supplemental_parent_run_id: str | None = None,
+    supplemental_parent_workflow_id: str | None = None,
 ) -> None:
+    policy = workflow_policy(max_budget_usd, review_mode)
+    if workflow_kind == "supplemental":
+        policy["confirmation_required"] = False
     safe_write_json(
         workflow_path(identifier),
         {
@@ -2310,8 +2437,12 @@ def create_workflow(
             "workflow_id": identifier,
             "name": name,
             "created_at": utc_now(),
-            "policy": workflow_policy(max_budget_usd, review_mode),
+            "policy": policy,
             "supersedes": list(supersedes),
+            "kind": workflow_kind,
+            "supplemental_of": supplemental_of,
+            "supplemental_parent_run_id": supplemental_parent_run_id,
+            "supplemental_parent_workflow_id": supplemental_parent_workflow_id,
         },
     )
 
@@ -2347,6 +2478,8 @@ def workflow_phase_effort(identifier: str, phase: str) -> str | None:
     if not isinstance(policy, dict):
         return None
     value = policy.get(f"{phase}_effort")
+    if phase == "supplemental" and value is None:
+        value = "medium"
     return str(value) if value in CLAUDE_EFFORTS else None
 
 
@@ -2365,7 +2498,8 @@ def workflow_budget_limit(identifier: str) -> float | None:
 
 def workflow_spend(identifier: str) -> float:
     return float(
-        workflow_metrics(workflow_runs(identifier)).get("reported_cost_usd") or 0
+        workflow_metrics(workflow_lineage_runs(identifier)).get("reported_cost_usd")
+        or 0
     )
 
 
@@ -2425,38 +2559,58 @@ def apply_workflow_budget(
         )
         return adjusted, status
 
+    lineage_root = workflow_lineage_root(identifier)
+    lineage_budget_lock = WORKFLOWS_DIR / f"{lineage_root}.lineage-budget"
     path = workflow_path(identifier)
-    with exclusive_file_lock(path):
-        workflow = require_active_workflow(identifier)
-        policy = workflow.get("policy")
-        limit_value = policy.get("max_budget_usd") if isinstance(policy, dict) else None
-        if not isinstance(limit_value, (int, float)):
-            return list(reviewers), None
-        limit = float(limit_value)
-        reservations = workflow.get("budget_reservations")
-        if not isinstance(reservations, dict):
-            reservations = {}
-        reservations.pop(reservation_id, None)
-        reserved = sum(
-            float(item.get("max_budget_usd") or 0)
-            for item in reservations.values()
-            if isinstance(item, dict)
-        )
-        adjusted, status, reserved_for_run = _adjust_workflow_budget(
-            reviewers,
-            identifier=identifier,
-            limit=limit,
-            spent=workflow_spend(identifier),
-            reserved=reserved,
-        )
-        if reserved_for_run:
-            reservations[reservation_id] = {
-                "max_budget_usd": reserved_for_run,
-                "reserved_at": utc_now(),
-                "runner_pid": os.getpid(),
-            }
-            workflow["budget_reservations"] = reservations
-            safe_write_json(path, workflow)
+    with exclusive_file_lock(lineage_budget_lock):
+        lineage_ids = workflow_lineage_ids(identifier)
+        lineage_paths = [workflow_path(item) for item in lineage_ids]
+        with exclusive_file_locks(lineage_paths):
+            workflow = require_active_workflow(identifier)
+            policy = workflow.get("policy")
+            limit_value = (
+                policy.get("max_budget_usd") if isinstance(policy, dict) else None
+            )
+            if not isinstance(limit_value, (int, float)):
+                return list(reviewers), None
+            limit = float(limit_value)
+            reservations = workflow.get("budget_reservations")
+            if not isinstance(reservations, dict):
+                reservations = {}
+            reservations.pop(reservation_id, None)
+            reserved = 0.0
+            for lineage_id in lineage_ids:
+                lineage_path = workflow_path(lineage_id)
+                if not lineage_path.exists():
+                    continue
+                document = (
+                    workflow
+                    if lineage_id == identifier
+                    else read_json(lineage_path)
+                )
+                current_reservations = document.get("budget_reservations")
+                if not isinstance(current_reservations, dict):
+                    continue
+                reserved += sum(
+                    float(item.get("max_budget_usd") or 0)
+                    for key, item in current_reservations.items()
+                    if key != reservation_id and isinstance(item, dict)
+                )
+            adjusted, status, reserved_for_run = _adjust_workflow_budget(
+                reviewers,
+                identifier=identifier,
+                limit=limit,
+                spent=workflow_spend(identifier),
+                reserved=reserved,
+            )
+            if reserved_for_run:
+                reservations[reservation_id] = {
+                    "max_budget_usd": reserved_for_run,
+                    "reserved_at": utc_now(),
+                    "runner_pid": os.getpid(),
+                }
+                workflow["budget_reservations"] = reservations
+                safe_write_json(path, workflow)
         return adjusted, status
 
 
@@ -2483,6 +2637,12 @@ def validate_workflow_phase(
     phase: str,
     round_number: int,
 ) -> None:
+    workflow = (
+        read_json(workflow_path(identifier))
+        if workflow_path(identifier).exists()
+        else {}
+    )
+    workflow_kind = str(workflow.get("kind") or "standard")
     relevant = [
         metadata
         for _, metadata in workflow_runs(identifier)
@@ -2515,6 +2675,16 @@ def validate_workflow_phase(
             f"Expected round {expected_round} for this repository and workflow; "
             f"received {round_number}."
         )
+    if phase == "supplemental":
+        if workflow_kind != "supplemental":
+            raise ReviewError(
+                "Supplemental reviews require --supplemental-of a fresh final run."
+            )
+        if completed:
+            raise ReviewError("A supplemental workflow permits exactly one review.")
+        return
+    if workflow_kind == "supplemental":
+        raise ReviewError("Supplemental workflows accept only a supplemental phase.")
     if completed_confirmations:
         raise ReviewError(
             "This repository already has a completed confirmation round. "
@@ -2673,6 +2843,21 @@ def workflow_supersede_command(args: argparse.Namespace) -> int:
                     f"Replacement workflow does not exist: {replacement}."
                 )
             replacement_document = read_json(replacement_path)
+            replacement_policy = replacement_document.get("policy")
+            replacement_budget = (
+                replacement_policy.get("max_budget_usd")
+                if isinstance(replacement_policy, dict)
+                else None
+            )
+            if not isinstance(replacement_budget, (int, float)) or not math.isclose(
+                float(replacement_budget), max_budget_usd
+            ):
+                raise ReviewError(
+                    "Replacement workflow budget must exactly match the current "
+                    f"lineage cap (${max_budget_usd:.2f}); received "
+                    f"{replacement_budget!r}. Create an inheriting successor "
+                    "without --by instead."
+                )
             supersedes = replacement_document.get("supersedes")
             if not isinstance(supersedes, list):
                 supersedes = []
@@ -2697,6 +2882,28 @@ def workflow_supersede_command(args: argparse.Namespace) -> int:
             }
         )
         safe_write_json(old_path, old)
+    if WORKFLOWS_DIR == RUNS_DIR / "workflows":
+        try:
+            with exclusive_file_lock(evidence_memory_path()):
+                rebuild_evidence_memory(
+                    evidence_memory_path(),
+                    [
+                        (
+                            run_dir,
+                            workflow_lineage_root(
+                                str(metadata.get("workflow_id") or "")
+                            ),
+                        )
+                        for run_dir, metadata in all_run_metadata()
+                        if (run_dir / "triage.json").exists()
+                    ],
+                )
+        except (OSError, sqlite3.Error) as exc:
+            print(
+                "Warning: workflow was superseded but derived evidence-memory "
+                f"rebuild failed: {type(exc).__name__}",
+                file=sys.stderr,
+            )
     print(replacement)
     return 0
 
@@ -2722,9 +2929,7 @@ def workflow_runs(identifier: str) -> list[tuple[Path, dict[str, Any]]]:
 
 
 def normalized_item_title(value: Any) -> str:
-    return " ".join(
-        re.findall(r"[a-z0-9]+", str(value).lower())
-    )
+    return normalized_text(value)
 
 
 def attach_prior_matches(
@@ -2735,7 +2940,7 @@ def attach_prior_matches(
     current_run_id: str,
 ) -> None:
     prior_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for run_dir, metadata in workflow_runs(workflow_identifier):
+    for run_dir, metadata in workflow_lineage_runs(workflow_identifier):
         if metadata.get("run_id") == current_run_id:
             continue
         repository = metadata.get("repository")
@@ -2773,6 +2978,20 @@ def attach_prior_matches(
         matches = prior_by_key.get(key)
         if matches:
             item["prior_matches"] = matches
+        try:
+            memory_matches = search_evidence_memory(
+                evidence_memory_path(),
+                str(item.get("title") or ""),
+                repository_id=repository_id,
+                kind=str(item.get("kind") or "finding"),
+                exclude_run_id=current_run_id,
+                limit=5,
+                minimum_similarity=0.5,
+            )
+        except (OSError, sqlite3.Error):
+            memory_matches = []
+        if memory_matches:
+            item["memory_matches"] = memory_matches
 
 
 def latest_workflow_runs(
@@ -2937,6 +3156,7 @@ def analytics_report(since_days: int) -> dict[str, Any]:
                 "reported_cost_usd": 0.0,
                 "findings": 0,
                 "test_gaps": 0,
+                "decisions": {},
             },
         )
         mode_summary["runs"] += 1
@@ -2956,6 +3176,10 @@ def analytics_report(since_days: int) -> dict[str, Any]:
             mode_summary["test_gaps"] += (
                 len(gaps) if isinstance(gaps, list) else 0
             )
+            mode_decisions = mode_summary["decisions"]
+            for item in triage_items(triage):
+                decision = str(item.get("decision") or "pending")
+                mode_decisions[decision] = int(mode_decisions.get(decision) or 0) + 1
         failure = metadata.get("failure")
         if isinstance(failure, dict):
             failure_type = str(failure.get("type") or "unknown")
@@ -3026,6 +3250,8 @@ def analytics_report(since_days: int) -> dict[str, Any]:
         summary["reported_cost_usd"] = round(
             summary["reported_cost_usd"], 6
         )
+        if isinstance(summary.get("decisions"), dict):
+            summary["decisions"] = dict(sorted(summary["decisions"].items()))
     workflow_ids = sorted(
         {
             str(metadata.get("workflow_id"))
@@ -3034,13 +3260,104 @@ def analytics_report(since_days: int) -> dict[str, Any]:
         }
     )
     finalized = 0
+    workflows_with_run_finals = 0
     superseded = 0
+    lineage_ids_by_root: dict[str, set[str]] = {}
     for identifier in workflow_ids:
-        if (WORKFLOWS_DIR / f"{identifier}.final.json").exists():
-            finalized += 1
+        root = workflow_lineage_root(identifier)
+        lineage_ids_by_root.setdefault(root, set()).add(identifier)
+        has_run_final = any(
+            (run_dir / "final.json").exists()
+            or (run_dir / "supplemental.json").exists()
+            for run_dir, metadata in runs
+            if metadata.get("workflow_id") == identifier
+        )
+        if has_run_final:
+            workflows_with_run_finals += 1
         path = workflow_path(identifier)
-        if path.exists() and read_json(path).get("status") == "superseded":
+        workflow_document = read_json(path) if path.exists() else {}
+        if (WORKFLOWS_DIR / f"{identifier}.final.json").exists() or (
+            workflow_document.get("status") == "completed"
+        ):
+            finalized += 1
+        if workflow_document.get("status") == "superseded":
             superseded += 1
+    lineage_outcomes: dict[str, int] = {}
+    for root, identifiers in lineage_ids_by_root.items():
+        lineage_runs = [
+            (run_dir, metadata)
+            for run_dir, metadata in runs
+            if str(metadata.get("workflow_id")) in identifiers
+        ]
+        latest_by_repository: dict[str, tuple[Path, dict[str, Any]]] = {}
+        for run_dir, metadata in lineage_runs:
+            if metadata.get("status") != "completed":
+                continue
+            repository = metadata.get("repository")
+            repository_id = str(
+                repository.get("id")
+                if isinstance(repository, dict)
+                else run_dir
+            )
+            current = latest_by_repository.get(repository_id)
+            if current is None or str(metadata.get("created_at") or "") > str(
+                current[1].get("created_at") or ""
+            ):
+                latest_by_repository[repository_id] = (run_dir, metadata)
+        final_statuses: list[str] = []
+        for run_dir, _ in latest_by_repository.values():
+            final_path = run_dir / "final.json"
+            if not final_path.exists():
+                final_path = run_dir / "supplemental.json"
+            if final_path.exists():
+                final_statuses.append(str(read_json(final_path).get("status")))
+        if final_statuses and len(final_statuses) == len(latest_by_repository):
+            if any(status in {"BLOCK", "SUPPLEMENTAL_BLOCK"} for status in final_statuses):
+                outcome = "BLOCK"
+            elif all(status == "SUPPLEMENTAL_CLEAN" for status in final_statuses):
+                outcome = "SUPPLEMENTAL_CLEAN"
+            elif any(status == "PASS_WITH_FINDINGS" for status in final_statuses):
+                outcome = "PASS_WITH_FINDINGS"
+            else:
+                outcome = "PASS_CLEAN"
+        else:
+            outcome = "IN_PROGRESS"
+        lineage_outcomes[outcome] = lineage_outcomes.get(outcome, 0) + 1
+        root_path = workflow_path(root)
+        root_policy = (
+            read_json(root_path).get("policy") if root_path.exists() else {}
+        )
+        mode = review_mode_from_policy(
+            root_policy if isinstance(root_policy, dict) else {}
+        )
+        mode_summary = review_modes.setdefault(mode, {})
+        for key, default in (
+            ("runs", 0),
+            ("completed_runs", 0),
+            ("failed_runs", 0),
+            ("reviewer_invocations", 0),
+            ("successful_invocations", 0),
+            ("reviewer_duration_seconds", 0.0),
+            ("reported_cost_usd", 0.0),
+            ("findings", 0),
+            ("test_gaps", 0),
+            ("decisions", {}),
+        ):
+            mode_summary.setdefault(key, default)
+        mode_summary["lineages"] = int(mode_summary.get("lineages") or 0) + 1
+        outcomes = mode_summary.setdefault("lineage_outcomes", {})
+        outcomes[outcome] = int(outcomes.get(outcome) or 0) + 1
+        lineage_metrics = workflow_metrics(lineage_runs)
+        mode_summary["lineage_cost_usd"] = round(
+            float(mode_summary.get("lineage_cost_usd") or 0)
+            + float(lineage_metrics["reported_cost_usd"]),
+            6,
+        )
+        mode_summary["lineage_duration_seconds"] = round(
+            float(mode_summary.get("lineage_duration_seconds") or 0)
+            + float(lineage_metrics["reviewer_duration_seconds"]),
+            3,
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": utc_now(),
@@ -3049,7 +3366,10 @@ def analytics_report(since_days: int) -> dict[str, Any]:
         "contract_valid_runs": contract_valid_runs,
         "partial_runs": partial_runs,
         "workflow_count": len(workflow_ids),
+        "lineage_count": len(lineage_ids_by_root),
+        "lineage_outcomes": dict(sorted(lineage_outcomes.items())),
         "finalized_workflows": finalized,
+        "workflows_with_run_finals": workflows_with_run_finals,
         "superseded_workflows": superseded,
         "failure_types": dict(sorted(failure_types.items())),
         "provider_failure_categories": dict(
@@ -3065,6 +3385,129 @@ def analytics_command(args: argparse.Namespace) -> int:
     if args.since_days < 1:
         raise ReviewError("--since-days must be at least 1.")
     print(json.dumps(analytics_report(args.since_days), indent=2))
+    return 0
+
+
+def recommend_mode_command(args: argparse.Namespace) -> int:
+    repo = resolve_repo(args.repo)
+    path_filters = normalize_path_filters(repo, args.path)
+    scope = resolve_scope(args, repo, path_filters)
+    paths = changed_paths(repo, scope, path_filters)
+    if not paths:
+        raise ReviewError(f"No changes found for {scope.label}.")
+    risks = sorted(set(args.risk))
+    documentation_only = all(
+        Path(path).suffix.lower() in {".md", ".rst"}
+        or Path(path).name.upper() in {"LICENSE", "NOTICE"}
+        for path in paths
+    )
+    tests_only = all(
+        re.search(
+            r"(?:^test[_-]|[_-]test\.|\.test\.|\.spec\.)",
+            Path(path).name.lower(),
+        )
+        is not None
+        or any(
+            part.lower() in {"test", "tests", "__tests__"}
+            for part in Path(path).parts
+        )
+        for path in paths
+    )
+    if risks:
+        mode = "deep"
+        reasons = [
+            "Explicit risk profiles fail closed to deep review: " + ", ".join(risks)
+        ]
+    elif documentation_only or tests_only:
+        mode = "fast"
+        reasons = [
+            "All changed paths are documentation or tests and no risk was selected."
+        ]
+    else:
+        mode = "balanced"
+        reasons = [
+            "Runtime-capable changes without an explicit high-risk profile use balanced."
+        ]
+    if len(paths) > 20 and mode == "fast":
+        mode = "balanced"
+        reasons.append("Broad scope raises the recommendation to balanced.")
+    print(
+        json.dumps(
+            {
+                "recommended_mode": mode,
+                "advisory_only": True,
+                "scope": dataclasses.asdict(scope),
+                "changed_paths": paths,
+                "risks": risks,
+                "reasons": reasons,
+                "command": (
+                    "mm-review workflow start --review-mode " + mode
+                ),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def rebuild_memory_command(_: argparse.Namespace) -> int:
+    os.umask(0o077)
+    runs = [
+        (
+            run_dir,
+            workflow_lineage_root(str(metadata.get("workflow_id") or "")),
+        )
+        for run_dir, metadata in all_run_metadata()
+        if (run_dir / "triage.json").exists()
+    ]
+    with exclusive_file_lock(evidence_memory_path()):
+        result = rebuild_evidence_memory(evidence_memory_path(), runs)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def memory_status_command(_: argparse.Namespace) -> int:
+    result = evidence_memory_status(evidence_memory_path())
+    metadata = all_run_metadata()
+    result["authoritative_run_artifacts"] = len(metadata)
+    result["retention"] = (
+        "append-only; no automatic artifact deletion; compact affects only the "
+        "rebuildable index"
+    )
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def memory_compact_command(_: argparse.Namespace) -> int:
+    with exclusive_file_lock(evidence_memory_path()):
+        result = compact_evidence_memory(evidence_memory_path())
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def memory_search_command(args: argparse.Namespace) -> int:
+    if args.limit < 1 or args.limit > 100:
+        raise ReviewError("--limit must be between 1 and 100.")
+    if not evidence_memory_path().exists():
+        rebuild_memory_command(args)
+    results = search_evidence_memory(
+        evidence_memory_path(),
+        args.query,
+        repository_id=args.repository_id,
+        kind=args.kind,
+        limit=args.limit,
+        minimum_similarity=args.minimum_similarity,
+    )
+    print(
+        json.dumps(
+            {
+                "query": args.query,
+                "count": len(results),
+                "results": results,
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -3106,10 +3549,13 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
     ]
     requires_confirmation = workflow_requires_confirmation(identifier)
     ready = bool(latest_runs) and not history_issues and not active_runs
-    if workflow_document.get("status") == "superseded":
+    persisted_state = workflow_document.get("status")
+    if persisted_state == "superseded":
         ready = False
     for run_dir, metadata in latest_runs:
         final_path = run_dir / "final.json"
+        if not final_path.exists():
+            final_path = run_dir / "supplemental.json"
         state = "not-finalized"
         fresh = False
         freshness_mode = "not-finalized"
@@ -3127,9 +3573,13 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                 commit = freshness.get("commit")
             except ReviewError:
                 fresh = False
-            state = "ready" if fresh and str(final_status).startswith("PASS") else "blocked"
+            passing_status = str(final_status).startswith("PASS") or (
+                str(final_status).startswith("SUPPLEMENTAL_")
+                and final_status != "SUPPLEMENTAL_BLOCK"
+            )
+            state = "ready" if fresh and passing_status else "blocked"
         phase = str(metadata.get("phase", "repair"))
-        confirmation_complete = phase == "confirmation"
+        confirmation_complete = phase in {"confirmation", "supplemental"}
         if requires_confirmation and not confirmation_complete:
             state = "confirmation-required"
         if state != "ready":
@@ -3146,19 +3596,40 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                 "freshness_mode": freshness_mode,
                 "commit": commit,
                 "final_status": final_status,
+                "accepts_reviews": not confirmation_complete,
             }
         )
+    if persisted_state == "superseded":
+        state = "superseded"
+    elif persisted_state == "completed":
+        state = "completed" if ready else "completed_stale"
+    elif active_runs:
+        state = "running"
+    elif ready:
+        state = "ready_to_finalize"
+    elif any(item["state"] == "blocked" for item in repositories):
+        state = "blocked"
+    elif any(
+        item["state"] == "confirmation-required" for item in repositories
+    ):
+        state = "confirmation_required"
+    else:
+        state = "active"
+    lineage_ids = workflow_lineage_ids(identifier)
     return {
         "workflow_id": identifier,
         "workflow": workflow_document,
         "ready": ready,
-        "state": workflow_document.get("status", "active"),
+        "state": state,
+        "lineage_root": lineage_ids[0] if lineage_ids else identifier,
+        "lineage_workflows": lineage_ids,
         "checked_at": utc_now(),
         "policy": workflow_document.get("policy") if requires_confirmation else None,
         "active_runs": active_runs,
         "history_complete": not history_issues,
         "history_issues": history_issues,
         "metrics": workflow_metrics(all_runs),
+        "lineage_metrics": workflow_metrics(workflow_lineage_runs(identifier)),
         "repositories": repositories,
     }, ready
 
@@ -3177,10 +3648,19 @@ def workflow_finalize_command(args: argparse.Namespace) -> int:
             "triaged and every repository's latest round must have a fresh "
             "PASS final.json."
         )
-    status["finalized_at"] = utc_now()
-    safe_write_json(
-        WORKFLOWS_DIR / f"{args.workflow_id}.final.json", status
-    )
+    finalized_at = utc_now()
+    status["finalized_at"] = finalized_at
+    status["state"] = "completed"
+    workflow_document_path = workflow_path(args.workflow_id)
+    final_path = WORKFLOWS_DIR / f"{args.workflow_id}.final.json"
+    with exclusive_file_locks((workflow_document_path, final_path)):
+        workflow_document = read_json(workflow_document_path)
+        if workflow_document.get("status") == "superseded":
+            raise ReviewError("A superseded workflow cannot be finalized.")
+        workflow_document["status"] = "completed"
+        workflow_document["completed_at"] = finalized_at
+        safe_write_json(final_path, status)
+        safe_write_json(workflow_document_path, workflow_document)
     print(f"Workflow PASS: {args.workflow_id}")
     return 0
 
@@ -3532,6 +4012,7 @@ def private_storage_permissions() -> tuple[bool, str]:
         RUNS_DIR,
         WORKFLOWS_DIR,
         SENSITIVE_SCANS_DIR,
+        evidence_memory_path(),
     ):
         if not path.exists():
             continue
@@ -3792,6 +4273,7 @@ def write_triage_decisions(
             )
         triage["updated_at"] = utc_now()
         safe_write_json(triage_path, triage)
+    refresh_evidence_run(run_dir)
     return triage_path
 
 
@@ -3943,10 +4425,17 @@ def finalize_command(args: argparse.Namespace) -> int:
         for item in test_gaps
         if isinstance(item, dict) and item.get("decision") == "deferred"
     ]
-    status = final_gate_status(
+    gate_status = final_gate_status(
         [item for item in findings if isinstance(item, dict)],
         [item for item in test_gaps if isinstance(item, dict)],
     )
+    status = gate_status
+    if phase == "supplemental":
+        status = {
+            "PASS_CLEAN": "SUPPLEMENTAL_CLEAN",
+            "PASS_WITH_FINDINGS": "SUPPLEMENTAL_WITH_FINDINGS",
+            "BLOCK": "SUPPLEMENTAL_BLOCK",
+        }[gate_status]
 
     final = {
         "schema_version": SCHEMA_VERSION,
@@ -3955,11 +4444,21 @@ def finalize_command(args: argparse.Namespace) -> int:
         "round": metadata.get("round"),
         "phase": phase,
         "status": status,
+        "authoritative_gate": phase != "supplemental",
+        "supplemental_of": metadata.get("supplemental_of"),
+        "supplemental_parent_run_id": metadata.get(
+            "supplemental_parent_run_id"
+        ),
+        "supplemental_parent_workflow_id": metadata.get(
+            "supplemental_parent_workflow_id"
+        ),
         "convergence": (
             "failed"
             if phase == "confirmation" and status == "BLOCK"
             else "confirmed"
             if phase == "confirmation" and status.startswith("PASS")
+            else "supplemental"
+            if phase == "supplemental"
             else "legacy"
         ),
         "finalized_at": utc_now(),
@@ -3976,15 +4475,23 @@ def finalize_command(args: argparse.Namespace) -> int:
             for item in accepted_test_gaps + deferred_test_gaps
         ],
     }
-    safe_write_json(run_dir / "final.json", final)
-    print(f"{status}: {run_dir / 'final.json'}")
-    return 0 if status.startswith("PASS") else 3
+    final_name = "supplemental.json" if phase == "supplemental" else "final.json"
+    final_path = run_dir / final_name
+    safe_write_json(final_path, final)
+    print(f"{status}: {final_path}")
+    successful = str(status).startswith("PASS") or status in {
+        "SUPPLEMENTAL_CLEAN",
+        "SUPPLEMENTAL_WITH_FINDINGS",
+    }
+    return 0 if successful else 3
 
 
 def verify_command(args: argparse.Namespace) -> int:
     run_dir = resolve_run_dir(args.run)
     metadata = read_json(run_dir / "metadata.json")
     final_path = run_dir / "final.json"
+    if not final_path.exists():
+        final_path = run_dir / "supplemental.json"
     if not final_path.exists():
         raise ReviewError(f"Run has not been finalized: {run_dir}")
     final = read_json(final_path)
@@ -4007,7 +4514,11 @@ def verify_command(args: argparse.Namespace) -> int:
             indent=2,
         )
     )
-    return 0 if fresh and str(status).startswith("PASS") else 3
+    successful = str(status).startswith("PASS") or status in {
+        "SUPPLEMENTAL_CLEAN",
+        "SUPPLEMENTAL_WITH_FINDINGS",
+    }
+    return 0 if fresh and successful else 3
 
 
 def recover_command(args: argparse.Namespace) -> int:
@@ -4300,6 +4811,7 @@ def persist_review_results(
     failed_reviewers: list[str] = []
     all_findings: list[dict[str, Any]] = []
     all_test_gaps: list[dict[str, Any]] = []
+    all_observations: list[dict[str, Any]] = []
     for name, item in reviewer_metadata.items():
         if not isinstance(item, dict) or "exit_code" not in item:
             continue
@@ -4319,6 +4831,7 @@ def persist_review_results(
             invalid_reports.append(str(name))
         all_findings.extend(parsed["findings"])
         all_test_gaps.extend(parsed["test_gaps"])
+        all_observations.extend(parsed.get("observations", []))
 
     attach_prior_matches(
         [*all_findings, *all_test_gaps],
@@ -4367,6 +4880,7 @@ def persist_review_results(
             "updated_at": utc_now(),
             "findings": [triage_entry(item) for item in all_findings],
             "test_gaps": [triage_entry(item) for item in all_test_gaps],
+            "observations": all_observations,
         },
     )
     completed_at = dt.datetime.now(dt.timezone.utc)
@@ -4417,6 +4931,7 @@ def persist_review_results(
         metadata.pop("failure", None)
         metadata.pop("terminal_error", None)
     safe_write_json(run_dir / "metadata.json", metadata)
+    refresh_evidence_run(run_dir)
     return sorted(failed_reviewers), sorted(invalid_reports)
 
 
@@ -4663,15 +5178,87 @@ def resume_review_locked(
 def run_review_command(args: argparse.Namespace) -> int:
     os.umask(0o077)
     config = load_config()
+    supplemental_parent: tuple[Path, dict[str, Any], dict[str, Any]] | None = None
+    if args.supplemental_of:
+        if args.workflow_id or args.reuse_contract:
+            raise ReviewError(
+                "--supplemental-of creates its own one-review workflow and cannot "
+                "be combined with --workflow-id or --reuse-contract."
+            )
+        if not args.task or not args.task.strip():
+            raise ReviewError("--supplemental-of requires a focused --task question.")
+        parent_dir = resolve_run_dir(args.supplemental_of)
+        parent_metadata = read_json(parent_dir / "metadata.json")
+        parent_final_path = parent_dir / "final.json"
+        if not parent_final_path.exists():
+            raise ReviewError("Supplemental review requires a finalized parent run.")
+        parent_final = read_json(parent_final_path)
+        if not str(parent_final.get("status") or "").startswith("PASS"):
+            raise ReviewError("Supplemental review requires a passing parent gate.")
+        parent_freshness = freshness_status(
+            parent_dir,
+            parent_metadata,
+            parent_final.get("source_fingerprint"),
+        )
+        if not parent_freshness["fresh"]:
+            raise ReviewError(
+                "The parent final is stale; create a normal successor workflow."
+            )
+        parent_repository = parent_metadata.get("repository")
+        parent_scope = parent_metadata.get("scope")
+        if not isinstance(parent_repository, dict) or not isinstance(parent_scope, dict):
+            raise ReviewError("The parent run has incomplete repository or scope data.")
+        args.repo = str(parent_repository.get("root"))
+        args.phase = "supplemental"
+        args.path = list(parent_metadata.get("path_filters") or [])
+        args.risk = list(parent_metadata.get("risks") or [])
+        args.review_profile = str(parent_metadata.get("review_profile") or "normal")
+        args.uncommitted = False
+        args.base = None
+        args.commit = None
+        if parent_freshness.get("commit"):
+            args.commit = str(parent_freshness["commit"])
+        else:
+            scope_kind = str(parent_scope.get("kind"))
+            args.uncommitted = scope_kind == "uncommitted"
+            args.base = parent_scope.get("value") if scope_kind == "base" else None
+            args.commit = (
+                parent_scope.get("value") if scope_kind == "commit" else None
+            )
+        supplemental_parent = (parent_dir, parent_metadata, parent_final)
     repo = resolve_repo(args.repo)
     repository = repository_metadata(repo)
     selected_workflow = args.workflow_id or workflow_id()
     if args.workflow_id:
         workflow_document = require_active_workflow(selected_workflow)
     else:
+        workflow_budget = float(config["workflow"]["max_budget_usd"])
+        if supplemental_parent:
+            parent_workflow_id = str(
+                supplemental_parent[1].get("workflow_id") or ""
+            )
+            parent_budget = workflow_budget_limit(parent_workflow_id)
+            if parent_budget is None:
+                raise ReviewError(
+                    "Supplemental review requires a parent workflow with a "
+                    "valid cumulative budget."
+                )
+            workflow_budget = parent_budget
         create_workflow(
             selected_workflow,
-            max_budget_usd=float(config["workflow"]["max_budget_usd"]),
+            max_budget_usd=workflow_budget,
+            workflow_kind=("supplemental" if supplemental_parent else "standard"),
+            supplemental_of=(str(supplemental_parent[0]) if supplemental_parent else None),
+            supplemental_parent_run_id=(
+                str(supplemental_parent[1].get("run_id") or "")
+                if supplemental_parent
+                else None
+            ),
+            supplemental_parent_workflow_id=(
+                str(supplemental_parent[1].get("workflow_id") or "")
+                if supplemental_parent
+                else None
+            ),
         )
         workflow_document = require_active_workflow(selected_workflow)
     if args.claude_effort is None:
@@ -4778,6 +5365,17 @@ def run_review_command(args: argparse.Namespace) -> int:
         "risks": sorted(set(args.risk)),
         "review_profile": args.review_profile,
         "task": args.task,
+        "supplemental_of": (
+            str(supplemental_parent[0]) if supplemental_parent else None
+        ),
+        "supplemental_parent_run_id": (
+            supplemental_parent[1].get("run_id") if supplemental_parent else None
+        ),
+        "supplemental_parent_workflow_id": (
+            supplemental_parent[1].get("workflow_id")
+            if supplemental_parent
+            else None
+        ),
         "isolated_snapshot": True,
         "patch_sha256": sha256_text(patch),
         "sensitive_override": bool(args.allow_sensitive_paths),
@@ -4791,6 +5389,16 @@ def run_review_command(args: argparse.Namespace) -> int:
     scan_token_value: dict[str, Any] | None = None
     try:
         before = fingerprint(repo, scope, paths, path_filters)
+        if supplemental_parent:
+            expected_content = supplemental_parent[1].get(
+                "result_content_fingerprint"
+            )
+            current_content = content_fingerprint(repo, paths)
+            if not expected_content or current_content != expected_content:
+                raise ReviewError(
+                    "Supplemental review source is not content-equivalent to the "
+                    "finalized parent snapshot. Create a normal successor workflow."
+                )
         if args.sensitive_scan_token:
             scan_token_path, scan_token_value = validate_sensitive_scan_token(
                 args.sensitive_scan_token,
@@ -5059,11 +5667,17 @@ def run_review_command(args: argparse.Namespace) -> int:
                 "Reviewer output failed the report contract: "
                 + ", ".join(sorted(set(invalid_reports)))
             )
-        print(
-            "Next: decide every finding and test gap with `mm-review decide` "
-            "or `decide-batch`. Repair rounds lead to another repair or the "
-            "mandatory confirmation round; only confirmation can be finalized."
-        )
+        if args.phase == "supplemental":
+            print(
+                "Next: decide every finding and test gap, then finalize this "
+                "supplemental evidence. It does not replace the parent gate."
+            )
+        else:
+            print(
+                "Next: decide every finding and test gap with `mm-review decide` "
+                "or `decide-batch`. Repair rounds lead to another repair or the "
+                "mandatory confirmation round; only confirmation can be finalized."
+            )
         return 0
     except KeyboardInterrupt:
         update_metadata(
@@ -5163,7 +5777,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     set_budget.add_argument("usd", type=float)
     set_workflow_budget = subparsers.add_parser(
-        "set-workflow-budget", help="Set the default cumulative workflow budget"
+        "set-workflow-budget", help="Set the default cumulative task-lineage budget"
     )
     set_workflow_budget.add_argument("usd", type=float)
     analytics = subparsers.add_parser(
@@ -5171,6 +5785,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analytics.add_argument(
         "--since-days", type=int, default=DEFAULT_ANALYTICS_DAYS
+    )
+    recommend = subparsers.add_parser(
+        "recommend",
+        help="Conservatively recommend fast, balanced, or deep without running providers",
+    )
+    recommend.add_argument("--repo", default=".")
+    recommend_scope = recommend.add_mutually_exclusive_group()
+    recommend_scope.add_argument("--uncommitted", action="store_true")
+    recommend_scope.add_argument("--base")
+    recommend_scope.add_argument("--commit")
+    recommend.add_argument("--path", action="append", default=[])
+    recommend.add_argument(
+        "--risk", action="append", default=[], choices=sorted(VALID_RISKS)
+    )
+    memory = subparsers.add_parser(
+        "memory",
+        help="Inspect or rebuild Codex-only evidence memory; never shown to reviewers",
+    )
+    memory_subparsers = memory.add_subparsers(
+        dest="memory_command", required=True
+    )
+    memory_subparsers.add_parser(
+        "status", help="Show private evidence-index status"
+    )
+    memory_subparsers.add_parser(
+        "rebuild", help="Rebuild the derived index from authoritative JSON artifacts"
+    )
+    memory_subparsers.add_parser(
+        "compact", help="Compact only the rebuildable index; keep all JSON artifacts"
+    )
+    memory_search = memory_subparsers.add_parser(
+        "search", help="Search prior triaged evidence for Codex verification"
+    )
+    memory_search.add_argument("query")
+    memory_search.add_argument("--repository-id")
+    memory_search.add_argument(
+        "--kind", choices=("finding", "test_gap")
+    )
+    memory_search.add_argument("--limit", type=int, default=20)
+    memory_search.add_argument(
+        "--minimum-similarity", type=float, default=0.35
     )
 
     workflow = subparsers.add_parser(
@@ -5250,6 +5905,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--task", help="Original intent and acceptance criteria for the change"
     )
     run_parser.add_argument(
+        "--supplemental-of",
+        help=(
+            "Run one fresh targeted review of an unchanged finalized snapshot; "
+            "the result is supplemental evidence, not a replacement final gate"
+        ),
+    )
+    run_parser.add_argument(
         "--reuse-contract",
         action="store_true",
         help=(
@@ -5286,7 +5948,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--phase",
         choices=RUN_PHASES,
         default="repair",
-        help="Repair or mandatory final confirmation phase (default: repair)",
+        help="Repair, confirmation, or supplemental phase (default: repair)",
     )
     run_parser.add_argument(
         "--review-profile",
@@ -5460,6 +6122,21 @@ def main() -> int:
             return set_workflow_budget_command(args)
         if args.command == "analytics":
             return analytics_command(args)
+        if args.command == "recommend":
+            return recommend_mode_command(args)
+        if args.command == "memory":
+            if args.memory_command == "status":
+                return memory_status_command(args)
+            if args.memory_command == "rebuild":
+                return rebuild_memory_command(args)
+            if args.memory_command == "compact":
+                return memory_compact_command(args)
+            if args.memory_command == "search":
+                if not 0 <= args.minimum_similarity <= 1:
+                    raise ReviewError(
+                        "--minimum-similarity must be between 0 and 1."
+                    )
+                return memory_search_command(args)
         if args.command == "workflow":
             if args.workflow_command == "start":
                 return workflow_start_command(args)
@@ -5505,6 +6182,22 @@ def main() -> int:
         if args.command == "attest-commit":
             return attest_commit_command(args)
         if args.command == "run":
+            if args.phase == "supplemental" and not args.supplemental_of:
+                raise ReviewError(
+                    "Use --supplemental-of <final-run> to start a supplemental review."
+                )
+            if args.supplemental_of and (
+                args.path
+                or args.risk
+                or args.review_profile != "normal"
+                or args.uncommitted
+                or args.base
+                or args.commit
+            ):
+                raise ReviewError(
+                    "--supplemental-of reuses the finalized source contract; do not "
+                    "override scope, paths, risks, or review profile."
+                )
             if args.with_claude and args.without_claude:
                 raise ReviewError("Choose only one of --with-claude/--without-claude.")
             if args.with_antigravity and args.without_antigravity:

@@ -7,6 +7,22 @@ All notable user-visible changes are documented here. This project follows
 
 ### Added
 
+- Add lineage-wide budget accounting so linked successors retain every
+  ancestor's reported spend and active reservations.
+- Add a private, dependency-free SQLite evidence index with rebuild, status,
+  and search commands; retrieval remains Codex-only and post-review.
+- Add one-round supplemental rechecks for focused questions about unchanged
+  finalized content, with explicit non-authoritative `supplemental.json` output.
+- Add conservative review-mode recommendations and lineage-level analytics for
+  outcomes, cost, duration, and single-repository run finals.
+- Add explicit workflow states and completion so finalized work no longer
+  appears indefinitely active.
+- Separate closed-workflow analytics from workflows that merely have a
+  repository run final, and reject `supersede --by` budget mismatches.
+- Normalize explicitly no-impact/no-action low-severity items into non-gating
+  observations instead of requiring false triage work, while retaining medium,
+  high, and blocker items as findings, persisting observations for audit, and
+  treating observation-only `PASS_WITH_FINDINGS` reports as clean.
 - Add pinned `fast`, `balanced`, and `deep` workflow modes that adapt repair
   limits and Claude effort while retaining mandatory confirmation.
 - Break out review-mode runtime, spend, success, finding, and test-gap metrics

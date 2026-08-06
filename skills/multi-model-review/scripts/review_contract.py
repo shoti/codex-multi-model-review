@@ -21,6 +21,7 @@ CLAUDE_REVIEW_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "additionalProperties": False,
                 "required": [
+                    "actionable",
                     "severity",
                     "title",
                     "location",
@@ -31,6 +32,7 @@ CLAUDE_REVIEW_SCHEMA: dict[str, Any] = {
                     "confidence",
                 ],
                 "properties": {
+                    "actionable": {"type": "boolean", "const": True},
                     "severity": {
                         "type": "string",
                         "enum": ["blocker", "high", "medium", "low"],
@@ -212,6 +214,24 @@ def parse_review_report(
         markdown_section(report, "Findings"),
         identifier_kind="finding",
     )
+    observations = [
+        item
+        for item in findings
+        if item.get("severity") == "low"
+        and re.search(
+            r"(?im)^-\s*Impact:\s*(?:none|no impact)\b",
+            str(item.get("report_excerpt") or ""),
+        )
+        and re.search(
+            r"(?im)^-\s*Smallest fix:\s*(?:none|no action|not needed)\b",
+            str(item.get("report_excerpt") or ""),
+        )
+    ]
+    if observations:
+        observation_ids = {str(item.get("id")) for item in observations}
+        findings = [
+            item for item in findings if str(item.get("id")) not in observation_ids
+        ]
     test_gap_section = markdown_section(report, "Test gaps")
     test_gaps = parse_severity_items(
         reviewer, test_gap_section, identifier_kind="test_gap"
@@ -243,10 +263,21 @@ def parse_review_report(
     }
     declared_verdict = verdict
     normalizations: list[str] = []
+    if observations:
+        normalizations.append(
+            "Moved explicitly non-actionable observations out of Findings."
+        )
     if verdict == "PASS_CLEAN" and (findings or test_gaps):
         verdict = "PASS_WITH_FINDINGS"
         normalizations.append(
             "Downgraded PASS_CLEAN because structured findings or test gaps exist."
+        )
+    elif verdict == "PASS_WITH_FINDINGS" and observations and not (
+        findings or test_gaps
+    ):
+        verdict = "PASS_CLEAN"
+        normalizations.append(
+            "Normalized observation-only PASS_WITH_FINDINGS to PASS_CLEAN."
         )
     return {
         "verdict": verdict,
@@ -257,6 +288,7 @@ def parse_review_report(
         "test_gap_counts": test_gap_counts,
         "test_gaps": test_gaps,
         "invalid_test_gap_severities": invalid_test_gap_severities,
+        "observations": observations,
     }
 
 

@@ -33,7 +33,9 @@ Codex Multi-Model Review turns that conversation into a durable workflow:
 - scope, paths, risks, profile, and task intent stay pinned across rounds;
 - provider failures, usage, decisions, and test gaps are persisted;
 - Claude output is schema-constrained and partial provider failures are resumable;
-- cumulative Claude spend is capped across the whole workflow, not only per call;
+- cumulative Claude spend is capped across the whole successor lineage, not only per call;
+- a private rebuildable evidence index helps Codex compare prior verified outcomes
+  after fresh reviewers finish, without biasing reviewer prompts;
 - a final PASS is valid only while its source fingerprint remains fresh.
 
 ```mermaid
@@ -49,6 +51,7 @@ flowchart TD
     G[Repair and focused tests]
     H[Mandatory confirmation round]
     I[Freshness-checked final gate<br/>PASS_CLEAN · PASS_WITH_FINDINGS · BLOCK]
+    J[Codex-only evidence memory<br/>verified decisions · lineage outcomes]
 
     A --> B
     B --> C
@@ -59,6 +62,8 @@ flowchart TD
     D2 --> E
     D3 --> E
     E --> F
+    J -. retrieved after fresh reports .-> F
+    F --> J
     F -->|accepted issue| G
     G --> B
     F -->|no source changes planned| H
@@ -156,7 +161,8 @@ The normal Codex-driven flow is:
 6. Repeat only when necessary, within the selected repair-round limit.
 7. Run one mandatory confirmation with no further source changes planned,
    reusing the pinned repair contract.
-8. Finalize and verify the freshness-checked gate.
+8. Finalize and verify the freshness-checked repository gate, then finalize the
+   workflow so its state becomes explicitly `completed`.
 9. If authorized later, attest the unchanged reviewed snapshot to its commit.
 
 Review mode is pinned with the workflow:
@@ -176,7 +182,14 @@ If one provider fails after another provider has produced a valid report, the
 run is preserved as `partial`. Resume that exact immutable snapshot instead of
 paying the successful provider again. If the task contract must change after a
 confirmation, explicitly supersede the closed workflow so the lineage remains
-auditable.
+auditable. The original budget and all prior spend follow that lineage; a
+successor is not a fresh credit allowance.
+When attaching an existing successor with `workflow supersede --by`, its budget
+must exactly match the current lineage cap; mismatched workflows are rejected.
+
+Before starting, `mm-review recommend` can conservatively suggest `fast`,
+`balanced`, or `deep` from the actual changed paths and explicit risks. The
+recommendation is advisory and any selected risk keeps the result at `deep`.
 
 Resume history is append-only: earlier attempt metadata and provider artifacts
 remain available, and every reported attempt cost counts toward the workflow
@@ -298,6 +311,47 @@ python3 "$RUNNER" workflow finalize <workflow-id>
 The explicit scope selector may be omitted. When present, it must resolve to
 the pinned scope; paths, risks, profile, and task cannot be re-specified.
 
+### Supplemental rechecks
+
+When a finalized snapshot is still fresh and the user asks one additional
+question, avoid paying for another repair-plus-confirmation pair:
+
+```bash
+python3 "$RUNNER" run \
+  --supplemental-of <finalized-run-directory> \
+  --task "Check this unchanged snapshot for the focused concern"
+python3 "$RUNNER" finalize \
+  --run <supplemental-run-directory> \
+  --codex-review "Focused recheck result"
+python3 "$RUNNER" verify --run <supplemental-run-directory>
+```
+
+This performs exactly one fresh review and writes `supplemental.json` with an
+explicitly non-authoritative status. It never replaces the parent `final.json`.
+Every supplemental sibling shares the parent's task-lineage cap and active
+reservations, so repeated rechecks cannot create new budget allowances.
+If it identifies a real issue requiring source changes, create a normal linked
+successor and run the full repair/confirmation workflow.
+
+### Evidence memory
+
+The authoritative record remains the private JSON artifacts. A derived local
+SQLite index makes their triaged evidence searchable by repository, finding
+kind, title similarity, lineage, decision, and verification:
+
+```bash
+python3 "$RUNNER" memory rebuild
+python3 "$RUNNER" memory status
+python3 "$RUNNER" memory search "duration threshold alert"
+python3 "$RUNNER" memory compact
+```
+
+Memory retrieval happens only after independent reports return and is never
+included in external reviewer prompts. The index is rebuildable and introduces
+no third-party dependency or network call. `compact` affects only the derived
+index; authoritative artifacts remain append-only and are never deleted
+automatically.
+
 ## Command reference
 
 | Command | Purpose |
@@ -311,14 +365,16 @@ the pinned scope; paths, risks, profile, and task cannot be re-specified.
 | `set-workflow-budget` | Set the default cumulative Claude USD cap for new workflows |
 | `workflow start/status/supersede/finalize` | Manage adaptive review mode and task lineage across repositories |
 | `scan` | Issue a one-shot fingerprint-bound approval after inspecting secret findings |
-| `run` | Execute one repair or confirmation round |
+| `run` | Execute a repair, confirmation, or exact-content supplemental round |
 | `resume` | Retry only failed reviewers from an unchanged partial run |
 | `decide` / `decide-batch` | Persist evidence-backed triage |
 | `finalize` | Produce a final gate |
 | `verify` | Confirm that the gate still matches current source |
 | `attest-commit` | Bind unchanged reviewed content to the checked-out commit |
 | `recover` | Mark an orphaned run failed after its process exits |
-| `analytics` | Summarize local workflow, review-mode, provider, failure, spend, and decision evidence |
+| `analytics` | Summarize local workflow, review-mode, provider, failure, spend, closure, run-final, and decision evidence |
+| `recommend` | Suggest a conservative review mode from current paths and explicit risks |
+| `memory status/rebuild/search/compact` | Maintain and query Codex-only verified evidence memory |
 
 Use `python3 .../mm_review.py <command> --help` for all flags.
 
@@ -331,6 +387,7 @@ Use `python3 .../mm_review.py <command> --help` for all flags.
 | Independent prompts | Reviewers do not receive one another's findings | All reviewers receive the same task contract and source |
 | Secret screening | Blocks likely credentials, sensitive paths, external symlinks, and common secret patterns | It scans changed material heuristically, not every unchanged tracked file |
 | Evidence-backed triage | Codex records why every item was accepted, fixed, rejected, deferred, or uncertain | Model agreement is not evidence |
+| Evidence memory | Codex can retrieve similar prior decisions after fresh reports finish | Historical evidence is never passed to reviewers and the JSON artifacts remain authoritative |
 | Freshness checks | Scoped source changes invalidate the final gate | A finalized confirmation is intentionally closed |
 | Approval boundary | Review results never authorize external actions | The user retains authority over commits, merges, deployments, migrations, and production changes |
 
@@ -361,6 +418,8 @@ Persistent local state is stored under:
 
 - `~/.codex/review-runs/`;
 - `~/.codex/review-runs/sensitive-scans/` for one-shot scan approvals;
+- `~/.codex/review-runs/evidence-memory.sqlite3` for rebuildable Codex-only
+  evidence search;
 - `~/.config/multi-model-review/config.json`;
 - `~/.config/multi-model-review/provider-health.json`.
 
@@ -378,10 +437,11 @@ repository secret scanner or deliberate source review.
 ## Cost controls
 
 Claude is enabled by default with a `$1.25` maximum per review invocation and a
-`$5.00` cumulative maximum per workflow. Before every call, the runner reduces
-the next Claude cap to the smaller of the per-review limit and the workflow's
-remaining budget. Each run atomically reserves its maximum under the workflow
-lock, so concurrent repositories cannot reserve the same dollars. It fails
+`$5.00` cumulative maximum per task lineage. Successor workflows inherit all
+ancestor spend. Before every call, the runner reduces
+the next Claude cap to the smaller of the per-review limit and the lineage's
+remaining budget. Each run atomically reserves its maximum while locking the
+lineage workflow documents, so concurrent repositories cannot reserve the same dollars. It fails
 closed when less than `$0.05` remains. Most workflows should converge well
 before the limit.
 
@@ -399,7 +459,7 @@ The reservation is released after provider results and reported usage are
 persisted. If the runner process is forcibly killed, its reservation remains
 conservatively unavailable rather than silently permitting overspend; inspect
 and recover the interrupted run before deciding whether to supersede the
-workflow with a new explicit budget.
+lineage with a new explicit budget.
 
 `doctor --live` performs provider calls and gives its Claude probe a `$0.10`
 cap. Plain `status` and `doctor` do not probe disabled providers. Antigravity
