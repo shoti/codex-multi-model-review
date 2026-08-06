@@ -32,6 +32,8 @@ Codex Multi-Model Review turns that conversation into a durable workflow:
 - repair rounds are bounded and followed by mandatory confirmation;
 - scope, paths, risks, profile, and task intent stay pinned across rounds;
 - provider failures, usage, decisions, and test gaps are persisted;
+- reviewers disclose incomplete coverage and unreviewed changed paths in a
+  structured contract that cannot disappear into free-form notes;
 - Claude output is schema-constrained and partial provider failures are resumable;
 - cumulative Claude spend is capped across the whole successor lineage, not only per call;
 - a private rebuildable evidence index helps Codex compare prior verified outcomes
@@ -165,6 +167,11 @@ The normal Codex-driven flow is:
    workflow so its state becomes explicitly `completed`.
 9. If authorized later, attest the unchanged reviewed snapshot to its commit.
 
+If the confirmation reviewer reports incomplete coverage, finalization stops.
+Run another independent review or inspect every disclosed path and limitation,
+then pass concrete `--coverage-verification` evidence. The final artifact keeps
+both the provider's limitation and Codex's compensation visible.
+
 Review mode is pinned with the workflow:
 
 | Mode | Use for | Repair policy |
@@ -184,6 +191,10 @@ paying the successful provider again. If the task contract must change after a
 confirmation, explicitly supersede the closed workflow so the lineage remains
 auditable. The original budget and all prior spend follow that lineage; a
 successor is not a fresh credit allowance.
+
+Secret and symlink checks that stop before any provider invocation are reported
+as `preflight_blocked`, separately from failed reviews and provider failures.
+Exact secret approvals remain one-shot and fingerprint-bound.
 When attaching an existing successor with `workflow supersede --by`, its budget
 must exactly match the current lineage cap; mismatched workflows are rejected.
 
@@ -400,9 +411,9 @@ evidence for future retrieval tuning without influencing reviewers.
 | `run` | Execute a repair, confirmation, or exact-content supplemental round |
 | `resume` | Retry only failed reviewers from an unchanged partial run |
 | `decide` / `decide-batch` | Persist evidence-backed triage and optional memory-candidate assessments |
-| `finalize` | Produce a final gate |
+| `finalize` | Produce a final gate, requiring Codex evidence for incomplete confirmation coverage |
 | `verify` | Confirm that the gate still matches current source |
-| `attest-commit` | Bind unchanged reviewed content to the checked-out commit |
+| `attest-commit` | Bind unchanged reviewed content or a clean reviewed `--base` branch to the checked-out commit |
 | `recover` | Mark an orphaned run failed after its process exits |
 | `analytics` | Summarize explicit versus inferred mode cohorts, workflow outcomes, tokens, artifact bytes, memory telemetry, failures, spend, and closure |
 | `recommend` | Suggest a conservative review mode from current paths and explicit risks |

@@ -81,9 +81,9 @@ mm-review run ... --sensitive-scan-token <returned-token>
 The approval is one-shot and bound to the exact repository, paths, findings,
 and source fingerprint. It never approves sensitive paths or external symlinks.
 
-4. Read every report and `review-summary.json`. Independently trace each finding
-   and test gap through the real runtime or side-effect path. Record every
-   disposition:
+4. Read every report and `review-summary.json`, including each reviewer's
+   structured coverage declaration. Independently trace each finding and test
+   gap through the real runtime or side-effect path. Record every disposition:
 
 ```bash
 mm-review decide --run <run-dir> --finding claude-001 \
@@ -181,6 +181,23 @@ mm-review finalize --run <run-dir> \
 mm-review verify --run <run-dir>
 ```
 
+If a successful confirmation reviewer explicitly reports incomplete coverage,
+finalization fails closed. Run another independent review, or inspect every
+named path and limitation yourself and persist concrete compensation:
+
+```bash
+mm-review finalize --run <run-dir> \
+  --codex-review "<final review result>" \
+  --verification "<command/check: result>" \
+  --coverage-verification "Read <paths> fully and traced <call paths>: <result>"
+```
+
+Coverage compensation is not a generic acknowledgement. It must identify the
+uncovered files or behavior and the evidence Codex checked. Provider coverage,
+unreviewed paths, and limitations remain visible in `review-summary.json` and
+`triage.json`; the final gate additionally records Codex's compensation.
+Aggregate coverage remains visible in workflow metrics and analytics.
+
 `finalize` accepts only the confirmation round for new workflows and produces
 `PASS_CLEAN`, `PASS_WITH_FINDINGS`, or `BLOCK`. It refuses stale source,
 pending findings/test gaps, accepted unresolved test gaps, risk-profiled runs
@@ -235,7 +252,10 @@ mm-review verify --run <run-dir>
 ```
 
 The runner proves the checked-out commit is task-scope content-equivalent to the
-reviewed working tree. A real scoped edit still invalidates the gate.
+reviewed working tree or clean `--base` branch. A real scoped edit still
+invalidates the gate. If attestation fails, report that failure explicitly;
+do not imply that the commit was bound merely because the branch head matches
+its remote.
 
 Do not commit, push, open a PR, deploy, or change production state unless the
 user separately authorizes it.
@@ -340,6 +360,9 @@ The runner:
 - pins each repository's scope, paths, risks, profile, and task across rounds;
 - requires Claude's JSON-schema output contract and safely normalizes
   contradictory verdicts;
+- requires structured reviewer coverage, persists notes and uncovered changed
+  paths, and blocks finalization until incomplete confirmation coverage is
+  independently rerun or explicitly compensated by Codex evidence;
 - caps Claude spend per review and cumulatively across the successor lineage
   with atomic per-run reservations, including concurrent repositories;
 - preserves valid reports when another provider fails and resumes only the
@@ -355,6 +378,8 @@ The runner:
   intentional contract change;
 - issues exact-fingerprint, one-shot approvals for inspected secret-scan
   findings and avoids duplicate patch/source diagnostics;
+- classifies preflight-blocked attempts separately from failed reviewer runs
+  without weakening any secret or symlink guard;
 - separates attempted from successful reviewer/model metrics and exposes active
   runs with PID/process state and elapsed time;
 - preserves exact repeated-finding links across successor ancestors and adds a
@@ -365,7 +390,8 @@ The runner:
 - exposes local analytics for adaptive modes, provider success/failure
   categories, partial resumes, spend, decisions, lineage-level outcomes, closed
   workflows, provider-reported tokens, artifact bytes, review phases/models,
-  and the distinct count of workflows with repository run finals.
+  structured coverage, preflight blocks, and the distinct count of workflows
+  with repository run finals.
 - separates explicit adaptive-mode cohorts from inferred legacy depth, reports
   lifecycle debt and unclassified runs, and records advisory budget evidence;
 - records optional Codex feedback about memory candidates so retrieval quality
