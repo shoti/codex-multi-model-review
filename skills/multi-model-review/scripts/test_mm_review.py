@@ -3400,6 +3400,279 @@ None.
                 {"PASS_CLEAN": 1},
             )
 
+    def test_analytics_separates_explicit_and_inferred_legacy_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflows = root / "workflows"
+            workflows.mkdir()
+            runs = []
+            for identifier, mode in (
+                ("wf-explicit", "balanced"),
+                ("wf-legacy", None),
+            ):
+                run_dir = root / identifier / "run"
+                run_dir.mkdir(parents=True)
+                metadata = {
+                    "run_id": f"run-{identifier}",
+                    "workflow_id": identifier,
+                    "created_at": MM.utc_now(),
+                    "status": "completed",
+                    "review_mode": mode,
+                    "repository": {"id": identifier},
+                    "reviewers": {},
+                }
+                MM.safe_write_json(
+                    run_dir / "triage.json", {"findings": [], "test_gaps": []}
+                )
+                MM.safe_write_json(run_dir / "final.json", {"status": "PASS_CLEAN"})
+                policy = (
+                    MM.workflow_policy(5.0, "balanced")
+                    if mode
+                    else {
+                        "max_repair_rounds": 3,
+                        "confirmation_required": True,
+                        "max_budget_usd": 5.0,
+                    }
+                )
+                MM.safe_write_json(
+                    workflows / f"{identifier}.json",
+                    {"workflow_id": identifier, "supersedes": [], "policy": policy},
+                )
+                runs.append((run_dir, metadata))
+            with (
+                mock.patch.object(MM, "RUNS_DIR", root),
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "all_run_metadata", return_value=runs),
+            ):
+                report = MM.analytics_report(7)
+        self.assertEqual(
+            report["lineage_mode_cohorts"]["explicit"]["balanced"]["lineages"],
+            1,
+        )
+        self.assertEqual(
+            report["lineage_mode_cohorts"]["inferred_legacy"]["deep"]["lineages"],
+            1,
+        )
+        self.assertNotIn("lineages", report["review_modes"].get("deep", {}))
+        report["run_statuses"]["unclassified"] = 2
+        report["metrics"].update(
+            {
+                "memory_candidate_items": 3,
+                "memory_candidate_matches": 4,
+                "memory_structural_matches": 1,
+                "memory_assessments": {"mixed": 1},
+            }
+        )
+        compact = MM.render_analytics_compact(report)
+        self.assertIn(
+            "Evidence memory: candidate-items=3; matches=4; structural=1; assessed=1",
+            compact,
+        )
+        self.assertIn("Run status warning: 2 legacy/unclassified records", compact)
+        self.assertIn("Mode cohorts: explicit=1; inferred-legacy=1", compact)
+
+    def test_budget_estimate_uses_comparable_history_without_changing_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs = []
+            for index, cost in enumerate((0.40, 0.50, 0.60, 0.70, 0.80, 0.90)):
+                run_dir = root / f"run-{index}"
+                run_dir.mkdir()
+                (run_dir / "change.patch").write_text("x" * 100, encoding="utf-8")
+                runs.append(
+                    (
+                        run_dir,
+                        {
+                            "created_at": MM.utc_now(),
+                            "review_mode": "balanced",
+                            "review_policy": {"claude_effort": "medium"},
+                            "reviewers": {
+                                "claude": {
+                                    "model": "sonnet",
+                                    "exit_code": 0,
+                                    "verdict": "PASS_CLEAN",
+                                    "usage": {"total_cost_usd": cost},
+                                    "failure_category": (
+                                        "budget_exhausted" if index == 5 else None
+                                    ),
+                                }
+                            },
+                        },
+                    )
+                )
+            missing_usage_dir = root / "run-missing-usage"
+            missing_usage_dir.mkdir()
+            (missing_usage_dir / "change.patch").write_text(
+                "x" * 100, encoding="utf-8"
+            )
+            runs.append(
+                (
+                    missing_usage_dir,
+                    {
+                        "created_at": MM.utc_now(),
+                        "review_mode": "balanced",
+                        "review_policy": {"claude_effort": "medium"},
+                        "reviewers": {
+                            "claude": {
+                                "model": "sonnet",
+                                "exit_code": 1,
+                                "failure_category": "budget_exhausted",
+                            }
+                        },
+                    },
+                )
+            )
+            with mock.patch.object(MM, "all_run_metadata", return_value=runs):
+                estimate = MM.historical_budget_estimate(
+                    provider="claude",
+                    model="sonnet",
+                    effort="medium",
+                    review_mode="balanced",
+                    patch_bytes=100,
+                    configured_budget_usd=0.50,
+                )
+        self.assertEqual(estimate["cohort"], "same_mode_model_effort_and_size")
+        self.assertEqual(estimate["evidence_attempt_count"], 7)
+        self.assertEqual(estimate["sample_count"], 6)
+        self.assertEqual(estimate["confidence"], "medium")
+        self.assertEqual(estimate["budget_exhausted_attempts"], 2)
+        self.assertTrue(estimate["configured_below_recommendation"])
+        self.assertFalse(estimate["automatic_policy_change"])
+        args = MM.build_parser().parse_args(["budget-estimate", "--uncommitted"])
+        self.assertEqual(args.review_mode, "balanced")
+
+    def test_workflow_audit_classifies_actionable_history_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflows = root / "workflows"
+            workflows.mkdir()
+            pending_dir = root / "repo" / "pending"
+            final_dir = root / "repo" / "final"
+            stale_dir = root / "repo" / "stale"
+            pending_dir.mkdir(parents=True)
+            final_dir.mkdir()
+            stale_dir.mkdir()
+            documents = {
+                "wf-20260806T000000Z-pending": {},
+                "wf-20260806T000001Z-final": {},
+                "wf-20200101T000000Z-stale": {},
+                "wf-20260806T000002Z-old": {"status": "superseded"},
+            }
+            for identifier, extra in documents.items():
+                MM.safe_write_json(
+                    workflows / f"{identifier}.json",
+                    {
+                        "workflow_id": identifier,
+                        "supersedes": [],
+                        "policy": MM.workflow_policy(),
+                        **extra,
+                    },
+                )
+            pending_metadata = {
+                "run_id": "run-pending",
+                "workflow_id": "wf-20260806T000000Z-pending",
+                "status": "completed",
+                "created_at": MM.utc_now(),
+            }
+            final_metadata = {
+                "run_id": "run-final",
+                "workflow_id": "wf-20260806T000001Z-final",
+                "status": "completed",
+                "created_at": MM.utc_now(),
+            }
+            stale_metadata = {
+                "run_id": None,
+                "workflow_id": "wf-20200101T000000Z-stale",
+                "created_at": "2020-01-01T00:00:00+00:00",
+            }
+            MM.safe_write_json(
+                pending_dir / "triage.json",
+                {
+                    "findings": [
+                        {
+                            "id": "claude-001",
+                            "kind": "finding",
+                            "decision": "pending",
+                        }
+                    ],
+                    "test_gaps": [],
+                },
+            )
+            MM.safe_write_json(final_dir / "final.json", {"status": "PASS_CLEAN"})
+            records = [
+                (pending_dir, pending_metadata),
+                (final_dir, final_metadata),
+                (stale_dir, stale_metadata),
+            ]
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "all_run_metadata", return_value=records),
+            ):
+                report = MM.workflow_audit_report(7)
+        states = {
+            entry["workflow_id"]: entry["state"] for entry in report["workflows"]
+        }
+        self.assertEqual(states["wf-20260806T000000Z-pending"], "needs_triage")
+        self.assertEqual(states["wf-20260806T000001Z-final"], "unclosed_run_final")
+        self.assertEqual(states["wf-20200101T000000Z-stale"], "stale_incomplete")
+        self.assertEqual(states["wf-20260806T000002Z-old"], "superseded")
+        self.assertEqual(report["unclassified_run_records"], 1)
+        self.assertFalse(report["mutated"])
+        compact = MM.render_workflow_audit_compact(report)
+        self.assertIn("Workflow audit: 4 workflows; stale threshold=7d", compact)
+        self.assertIn(
+            "wf-20260806T000000Z-pending: needs_triage; "
+            "decide pending or unresolved items",
+            compact,
+        )
+        self.assertIn(
+            "wf-20260806T000001Z-final: unclosed_run_final; "
+            "verify freshness and run workflow finalize",
+            compact,
+        )
+        args = MM.build_parser().parse_args(["workflow", "audit", "--format", "compact"])
+        self.assertEqual(args.output_format, "compact")
+
+    def test_memory_assessment_is_persisted_and_reported_separately(self) -> None:
+        triage = {
+            "findings": [
+                {
+                    "id": "claude-001",
+                    "kind": "finding",
+                    "severity": "low",
+                    "memory_matches": [
+                        {
+                            "similarity": 0.75,
+                            "matched_fields": ["title", "location"],
+                        }
+                    ],
+                }
+            ],
+            "test_gaps": [],
+        }
+        MM.apply_triage_decision(
+            triage,
+            identifier="claude-001",
+            decision="rejected",
+            evidence="Repository evidence disproves the finding.",
+            action=None,
+            verification=None,
+            memory_assessment="useful",
+        )
+        self.assertEqual(triage["findings"][0]["memory_assessment"], "useful")
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            MM.safe_write_json(run_dir / "triage.json", triage)
+            metrics = MM.workflow_metrics(
+                [(run_dir, {"status": "completed", "reviewers": {}})],
+                include_artifact_bytes=False,
+            )
+        self.assertEqual(metrics["memory_candidate_items"], 1)
+        self.assertEqual(metrics["memory_candidate_matches"], 1)
+        self.assertEqual(metrics["memory_structural_matches"], 1)
+        self.assertEqual(metrics["memory_assessments"], {"useful": 1})
+        self.assertEqual(metrics["memory_similarity_distribution"]["p50"], 0.75)
+
     def test_non_actionable_finding_is_preserved_as_observation(self) -> None:
         parsed = MM.parse_review_report(
             "claude",

@@ -190,6 +190,11 @@ must exactly match the current lineage cap; mismatched workflows are rejected.
 Before starting, `mm-review recommend` can conservatively suggest `fast`,
 `balanced`, or `deep` from the actual changed paths and explicit risks. The
 recommendation is advisory and any selected risk keeps the result at `deep`.
+`mm-review budget-estimate` separately compares the current patch with local
+provider history and reports a non-binding p90-based budget recommendation.
+It reports cost-bearing samples separately from all comparable attempts, so
+failures without usage data still count toward exhaustion evidence. It never
+changes effort, budgets, providers, or workflow policy automatically.
 
 Resume history is append-only: earlier attempt metadata and provider artifacts
 remain available, and every reported attempt cost counts toward the workflow
@@ -342,11 +347,18 @@ runner does not estimate missing provider usage or confuse bytes with tokens:
 ```bash
 python3 "$RUNNER" analytics --since-days 30 --format compact
 python3 "$RUNNER" workflow status <workflow-id> --format compact
+python3 "$RUNNER" workflow audit --stale-days 7 --format compact
+python3 "$RUNNER" budget-estimate --uncommitted --review-mode balanced
 ```
 
 Complete JSON remains the default for scripts and auditing. Compact output is
 opt-in, points back to full artifacts/evidence, and automatically falls back to
 JSON if it would emit more UTF-8 bytes.
+Analytics keeps explicit adaptive-mode lineages separate from modes inferred
+for legacy workflows, reports unclassified legacy run records, and exposes
+cost/duration/patch distributions. `workflow audit` is read-only: it identifies
+pending triage, unclosed run finals, failures, and stale incomplete work without
+rewriting or deleting evidence.
 
 ### Evidence memory
 
@@ -366,6 +378,11 @@ included in external reviewer prompts. The index is rebuildable and introduces
 no third-party dependency or network call. `compact` affects only the derived
 index; authoritative artifacts remain append-only and are never deleted
 automatically.
+When a triage item has `memory_matches`, Codex may add
+`--memory-assessment useful|irrelevant|mixed` to `decide`, or the equivalent
+`memory_assessment` field to `decide-batch`. Analytics reports candidate and
+assessment counts separately from exact repeated-title matches, providing
+evidence for future retrieval tuning without influencing reviewers.
 
 ## Command reference
 
@@ -378,17 +395,18 @@ automatically.
 | `set-effort` | Set Claude reasoning effort |
 | `set-budget` | Set Claude's per-review USD cap |
 | `set-workflow-budget` | Set the default cumulative Claude USD cap for new workflows |
-| `workflow start/status/supersede/finalize` | Manage adaptive review mode and task lineage; status supports opt-in compact output |
+| `workflow start/status/audit/supersede/finalize` | Manage adaptive review mode and task lineage; audit is read-only and status/audit support compact output |
 | `scan` | Issue a one-shot fingerprint-bound approval after inspecting secret findings |
 | `run` | Execute a repair, confirmation, or exact-content supplemental round |
 | `resume` | Retry only failed reviewers from an unchanged partial run |
-| `decide` / `decide-batch` | Persist evidence-backed triage |
+| `decide` / `decide-batch` | Persist evidence-backed triage and optional memory-candidate assessments |
 | `finalize` | Produce a final gate |
 | `verify` | Confirm that the gate still matches current source |
 | `attest-commit` | Bind unchanged reviewed content to the checked-out commit |
 | `recover` | Mark an orphaned run failed after its process exits |
-| `analytics` | Summarize workflow outcomes, provider/model/phase tokens, artifact bytes, failures, spend, and closure; supports opt-in compact output |
+| `analytics` | Summarize explicit versus inferred mode cohorts, workflow outcomes, tokens, artifact bytes, memory telemetry, failures, spend, and closure |
 | `recommend` | Suggest a conservative review mode from current paths and explicit risks |
+| `budget-estimate` | Report an advisory historical Claude budget estimate for the current scope without changing policy |
 | `memory status/rebuild/search/compact` | Maintain and query ranked Codex-only verified evidence; search supports opt-in compact output |
 
 Use `python3 .../mm_review.py <command> --help` for all flags.
