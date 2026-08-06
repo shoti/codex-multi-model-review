@@ -333,16 +333,31 @@ reservations, so repeated rechecks cannot create new budget allowances.
 If it identifies a real issue requiring source changes, create a normal linked
 successor and run the full repair/confirmation workflow.
 
+### Token-efficient inspection
+
+Provider-reported token counters are aggregated by provider, model, review
+mode, and phase; local artifact sizes are aggregated by mode and phase. The
+runner does not estimate missing provider usage or confuse bytes with tokens:
+
+```bash
+python3 "$RUNNER" analytics --since-days 30 --format compact
+python3 "$RUNNER" workflow status <workflow-id> --format compact
+```
+
+Complete JSON remains the default for scripts and auditing. Compact output is
+opt-in, points back to full artifacts/evidence, and automatically falls back to
+JSON if it would emit more UTF-8 bytes.
+
 ### Evidence memory
 
 The authoritative record remains the private JSON artifacts. A derived local
 SQLite index makes their triaged evidence searchable by repository, finding
-kind, title similarity, lineage, decision, and verification:
+kind, title, path, evidence, action, verification, lineage, and decision:
 
 ```bash
 python3 "$RUNNER" memory rebuild
 python3 "$RUNNER" memory status
-python3 "$RUNNER" memory search "duration threshold alert"
+python3 "$RUNNER" memory search "duration threshold alert" --format compact
 python3 "$RUNNER" memory compact
 ```
 
@@ -363,7 +378,7 @@ automatically.
 | `set-effort` | Set Claude reasoning effort |
 | `set-budget` | Set Claude's per-review USD cap |
 | `set-workflow-budget` | Set the default cumulative Claude USD cap for new workflows |
-| `workflow start/status/supersede/finalize` | Manage adaptive review mode and task lineage across repositories |
+| `workflow start/status/supersede/finalize` | Manage adaptive review mode and task lineage; status supports opt-in compact output |
 | `scan` | Issue a one-shot fingerprint-bound approval after inspecting secret findings |
 | `run` | Execute a repair, confirmation, or exact-content supplemental round |
 | `resume` | Retry only failed reviewers from an unchanged partial run |
@@ -372,9 +387,9 @@ automatically.
 | `verify` | Confirm that the gate still matches current source |
 | `attest-commit` | Bind unchanged reviewed content to the checked-out commit |
 | `recover` | Mark an orphaned run failed after its process exits |
-| `analytics` | Summarize local workflow, review-mode, provider, failure, spend, closure, run-final, and decision evidence |
+| `analytics` | Summarize workflow outcomes, provider/model/phase tokens, artifact bytes, failures, spend, and closure; supports opt-in compact output |
 | `recommend` | Suggest a conservative review mode from current paths and explicit risks |
-| `memory status/rebuild/search/compact` | Maintain and query Codex-only verified evidence memory |
+| `memory status/rebuild/search/compact` | Maintain and query ranked Codex-only verified evidence; search supports opt-in compact output |
 
 Use `python3 .../mm_review.py <command> --help` for all flags.
 

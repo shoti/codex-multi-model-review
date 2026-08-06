@@ -28,6 +28,66 @@ def title_similarity(left: Any, right: Any) -> float:
     return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
 
+def _field_relevance(query_tokens: set[str], value: Any) -> float:
+    """Score a field without letting one broad token dominate retrieval."""
+    if value is None:
+        return 0.0
+    normalized = normalized_text(value)
+    if not normalized:
+        return 0.0
+    field_tokens = set(normalized.split())
+    if not query_tokens or not field_tokens:
+        return 0.0
+    overlap = len(query_tokens & field_tokens)
+    if not overlap:
+        return 0.0
+    query_coverage = overlap / len(query_tokens)
+    field_precision = overlap / len(field_tokens)
+    jaccard = overlap / len(query_tokens | field_tokens)
+    coverage_weight = (
+        0.6 if len(query_tokens) >= 3 else 0.25 if len(query_tokens) == 2 else 0.1
+    )
+    return max(
+        jaccard,
+        coverage_weight * query_coverage
+        + (1.0 - coverage_weight) * field_precision,
+    )
+
+
+def evidence_relevance(query: Any, row: sqlite3.Row) -> tuple[float, list[str]]:
+    """Rank verified evidence across its searchable structured fields."""
+    query_tokens = set(normalized_text(query).split())
+    if not query_tokens:
+        return 0.0, []
+    field_weights = {
+        "title": 1.0,
+        "location": 0.9,
+        "evidence_text": 0.75,
+        "action_text": 0.75,
+        "verification_text": 0.7,
+    }
+    scores: list[float] = []
+    matched_fields: list[str] = []
+    for field, weight in field_weights.items():
+        relevance = _field_relevance(query_tokens, row[field])
+        if relevance <= 0:
+            continue
+        scores.append(relevance * weight)
+        matched_fields.append(
+            {
+                "evidence_text": "evidence",
+                "action_text": "action",
+                "verification_text": "verification",
+            }.get(field, field)
+        )
+    if not scores:
+        return 0.0, []
+    # Multiple independent matching fields are stronger than one prose hit,
+    # but keep the bounded score compatible with the existing 0..1 contract.
+    multi_field_bonus = min(0.08, 0.02 * (len(scores) - 1))
+    return min(1.0, max(scores) + multi_field_bonus), matched_fields
+
+
 def _connect(database_path: Path) -> sqlite3.Connection:
     database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     connection = sqlite3.connect(database_path, timeout=30)
@@ -227,12 +287,13 @@ def search(
         ).fetchall()
     ranked: list[dict[str, Any]] = []
     for row in rows:
-        similarity = title_similarity(query, row["title"])
+        similarity, matched_fields = evidence_relevance(query, row)
         if similarity < minimum_similarity:
             continue
         ranked.append(
             {
                 "similarity": round(similarity, 3),
+                "matched_fields": matched_fields,
                 "workflow_id": row["workflow_id"],
                 "lineage_root": row["lineage_root"],
                 "run_id": row["run_id"],
@@ -254,7 +315,12 @@ def search(
             }
         )
     ranked.sort(
-        key=lambda item: (item["similarity"], str(item["decided_at"])),
+        key=lambda item: (
+            item["similarity"],
+            str(item["decided_at"]),
+            str(item["run_id"]),
+            str(item["item_id"]),
+        ),
         reverse=True,
     )
     return ranked[:limit]
