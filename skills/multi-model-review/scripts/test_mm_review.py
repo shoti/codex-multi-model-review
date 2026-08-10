@@ -964,6 +964,85 @@ class RunnerUnitTests(unittest.TestCase):
             with self.assertRaisesRegex(MM.ReviewError, "task-scoped"):
                 MM.resolve_scope(args, repo, ("src",))
 
+    def test_base_snapshot_overlays_in_scope_revert_to_base_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            run_dir = root / "run"
+            repo.mkdir()
+            run_dir.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "secrets.env").write_text(
+                'password = "integration-only-value-73918426"\n',
+                encoding="utf-8",
+            )
+            run(["git", "add", "src/secrets.env"], cwd=repo)
+            run(["git", "commit", "-qm", "add base fixture"], cwd=repo)
+            base = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            (repo / "src" / "secrets.env").write_text(
+                "REDACTED = True\n", encoding="utf-8"
+            )
+            (repo / "unrelated.txt").write_text(
+                "branch\n", encoding="utf-8"
+            )
+            run(
+                [
+                    "git",
+                    "add",
+                    "src/feature.py",
+                    "src/secrets.env",
+                    "unrelated.txt",
+                ],
+                cwd=repo,
+            )
+            run(["git", "commit", "-qm", "branch changes"], cwd=repo)
+
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 1\n", encoding="utf-8"
+            )
+            (repo / "src" / "secrets.env").write_text(
+                'password = "integration-only-value-73918426"\n',
+                encoding="utf-8",
+            )
+            (repo / "unrelated.txt").write_text(
+                "local unrelated\n", encoding="utf-8"
+            )
+            scope = MM.Scope("base", base, "working tree against base")
+            paths = MM.changed_paths(repo, scope, ("src",))
+            self.assertEqual(paths, [])
+            overlay_paths = MM.snapshot_overlay_paths(
+                repo, scope, paths, ("src",)
+            )
+            self.assertEqual(
+                overlay_paths,
+                ["src/feature.py", "src/secrets.env"],
+            )
+
+            snapshot = MM.create_snapshot(
+                repo,
+                scope,
+                overlay_paths,
+                run_dir,
+            )
+
+            self.assertEqual(
+                (snapshot / "src" / "feature.py").read_text(encoding="utf-8"),
+                "VALUE = 1\n",
+            )
+            self.assertEqual(
+                (snapshot / "unrelated.txt").read_text(encoding="utf-8"),
+                "branch\n",
+            )
+            self.assertTrue(MM.is_sensitive_path("src/secrets.env"))
+            findings = MM.sensitive_content_findings(
+                snapshot, overlay_paths, ""
+            )
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].path, "src/secrets.env")
+
     def test_workflow_status_exposes_active_run(self) -> None:
         active = (
             Path("/private/tmp/running-review"),
@@ -2522,8 +2601,10 @@ None.
         self.assertEqual(status["remaining_before_run_usd"], 0.3)
         with (
             mock.patch.object(MM, "workflow_budget_limit", return_value=1.0),
-            mock.patch.object(MM, "workflow_spend", return_value=0.99),
-            self.assertRaisesRegex(MM.ReviewError, "exhausted"),
+            mock.patch.object(MM, "workflow_spend", return_value=0.8),
+            self.assertRaisesRegex(
+                MM.ReviewError, r"below the \$0.25 minimum"
+            ),
         ):
             MM.apply_workflow_budget([reviewer], "wf-test")
 
@@ -4299,7 +4380,7 @@ class RunnerEndToEndTests(unittest.TestCase):
                     "--review-mode",
                     "balanced",
                     "--max-budget-usd",
-                    "0.08",
+                    "0.80",
                 ],
                 cwd=repo,
                 env=environment,
@@ -4419,7 +4500,9 @@ class RunnerEndToEndTests(unittest.TestCase):
             supplemental_workflow["supplemental_parent_workflow_id"],
             workflow_identifier,
         )
-        self.assertEqual(supplemental_workflow["policy"]["max_budget_usd"], 0.08)
+        self.assertEqual(
+            supplemental_workflow["policy"]["max_budget_usd"], 0.8
+        )
 
     def test_commit_run_ignores_unrelated_dirty_paths_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4493,6 +4576,107 @@ class RunnerEndToEndTests(unittest.TestCase):
             self.assertEqual(metadata["excluded_changed_paths"], [])
             self.assertNotIn("dirty", patch)
             self.assertNotIn("local notes", patch)
+
+    def test_base_run_overlays_revert_and_excludes_unrelated_dirty_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            repo = root / "repo"
+            bin_dir = root / "bin"
+            home.mkdir()
+            repo.mkdir()
+            bin_dir.mkdir()
+            initialize_repo(repo)
+            base = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            (repo / "src" / "task.py").write_text(
+                "TASK = True\n", encoding="utf-8"
+            )
+            (repo / "unrelated.txt").write_text(
+                "branch\n", encoding="utf-8"
+            )
+            run(["git", "add", "src", "unrelated.txt"], cwd=repo)
+            run(["git", "commit", "-qm", "branch changes"], cwd=repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 1\n", encoding="utf-8"
+            )
+            (repo / "unrelated.txt").write_text(
+                "local unrelated\n", encoding="utf-8"
+            )
+            (repo / "REVIEW.md").write_text(
+                "local notes\n", encoding="utf-8"
+            )
+
+            fake_claude = bin_dir / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/bin/sh
+                    if [ "$1" = "--version" ]; then
+                      echo "fake-claude 1.0"
+                      exit 0
+                    fi
+                    test "$(cat src/feature.py)" = "VALUE = 1" || exit 3
+                    test "$(cat src/task.py)" = "TASK = True" || exit 4
+                    test "$(cat unrelated.txt)" = "branch" || exit 5
+                    test ! -e REVIEW.md || exit 6
+                    cat >/dev/null
+                    python3 -c 'import json; print(json.dumps({
+                      "result": "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n",
+                      "total_cost_usd": 0.01
+                    }))'
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+            completed = run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--base",
+                    base,
+                    "--path",
+                    "src",
+                    "--task",
+                    "Review the base-scoped feature change.",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+
+            self.assertIn("PASS_CLEAN", completed.stdout)
+            metadata_path = next(
+                (home / ".codex" / "review-runs").glob("*/*/metadata.json")
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            patch = (metadata_path.parent / "change.patch").read_text(
+                encoding="utf-8"
+            )
+            manifest = (metadata_path.parent / "manifest.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(metadata["status"], "completed")
+            self.assertEqual(metadata["scope"]["kind"], "base")
+            self.assertEqual(metadata["paths"], ["src/task.py"])
+            self.assertEqual(
+                metadata["snapshot_overlay_paths"],
+                ["src/feature.py", "src/task.py"],
+            )
+            self.assertNotIn("VALUE = 2", patch)
+            self.assertNotIn("local unrelated", patch)
+            self.assertIn("- src/feature.py", manifest)
+            self.assertIn("- src/task.py", manifest)
 
     def test_scan_token_flows_through_cli_and_is_consumed_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

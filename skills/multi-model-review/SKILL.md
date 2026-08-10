@@ -162,15 +162,15 @@ exact same cumulative cap; the command rejects a mismatched replacement.
    round:
 
 ```bash
-mm-review run --uncommitted \
-  --workflow-id <workflow-id> --phase confirmation --reuse-contract
+mm-review run --workflow-id <workflow-id> \
+  --phase confirmation --reuse-contract
 ```
 
 `--reuse-contract` loads the first completed repair's exact scope, paths,
 risks, profile, and task for that repository, preventing accidental
-confirmation drift. An explicit scope selector is accepted only when it
-resolves to that pinned scope, so the `--uncommitted` command above is safe and
-repeatable.
+confirmation drift. Omit the scope selector for a command that works with
+`--uncommitted`, `--base`, and `--commit` repair contracts. An explicit scope
+selector is accepted only when it resolves to the pinned scope.
 
 8. Triage the confirmation, perform Codex's final diff review, and finalize it:
 
@@ -351,8 +351,9 @@ The runner:
   parsed test gaps, Codex triage, source fingerprints, and final gates under
   `~/.codex/review-runs/` with private permissions;
 - blocks likely credential/key files, external symlinks, and high-confidence
-  secret patterns with redacted path/line/rule diagnostics and exact-match
-  waivers; external symlinks always fail closed and cannot be overridden;
+  secret patterns across the patch and every task-scoped working-tree overlay
+  with redacted path/line/rule diagnostics and exact-match waivers; external
+  symlinks always fail closed and cannot be overridden;
 - checks source freshness after reviewers run and whenever a PASS is verified;
 - recognizes an identical reviewed working tree after it becomes a commit;
 - blocks new/final rounds when earlier completed rounds are incompletely triaged;
@@ -365,6 +366,8 @@ The runner:
   independently rerun or explicitly compensated by Codex evidence;
 - caps Claude spend per review and cumulatively across the successor lineage
   with atomic per-run reservations, including concurrent repositories;
+- refuses to launch an overhead-only Claude attempt when less than $0.25
+  remains in the task-lineage budget;
 - preserves valid reports when another provider fails and resumes only the
   failed reviewers against the same immutable source under a full-transaction
   run lock;

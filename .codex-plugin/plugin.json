@@ -1,6 +1,6 @@
 {
   "name": "multi-model-review",
-  "version": "0.1.0+codex.20260806133010",
+  "version": "0.1.0+codex.20260810090744",
   "description": "Run resumable task-scoped reviews with cumulative budgets, locked Codex triage, mandatory confirmation, and fresh final gates.",
   "author": {
     "name": "Shoti",

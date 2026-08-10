@@ -312,8 +312,7 @@ When repair triage is complete, load the pinned contract for confirmation, then:
 
 ```bash
 python3 "$RUNNER" run --repo /path/to/repository \
-  --uncommitted --workflow-id <workflow-id> \
-  --phase confirmation --reuse-contract
+  --workflow-id <workflow-id> --phase confirmation --reuse-contract
 
 python3 "$RUNNER" finalize \
   --run <confirmation-run-directory> \
@@ -454,9 +453,10 @@ enabled provider.
 
 The snapshot contains the entire tracked Git tree at the reviewed revision,
 plus the task-scoped working-tree overlay. Path filters do not make unchanged
-tracked files private. Secret screening checks the patch and changed paths; an
-existing secret in an unchanged tracked file can still enter the snapshot.
-Inspect sensitive repositories before starting an external review.
+tracked files private. Secret screening checks the patch, net changed paths,
+and every task-scoped working-tree overlay path; an existing secret in a truly
+unchanged tracked file can still enter the snapshot. Inspect sensitive
+repositories before starting an external review.
 
 Persistent local state is stored under:
 
@@ -486,8 +486,9 @@ ancestor spend. Before every call, the runner reduces
 the next Claude cap to the smaller of the per-review limit and the lineage's
 remaining budget. Each run atomically reserves its maximum while locking the
 lineage workflow documents, so concurrent repositories cannot reserve the same dollars. It fails
-closed when less than `$0.05` remains. Most workflows should converge well
-before the limit.
+closed when less than `$0.25` remains instead of launching a predictably
+underfunded, overhead-only review. Most workflows should converge well before
+the limit.
 
 Every resume attempt is retained and charged to that cumulative calculation;
 a failed paid attempt cannot be hidden by a later successful retry. Use
