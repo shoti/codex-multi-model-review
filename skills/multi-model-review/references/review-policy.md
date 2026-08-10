@@ -126,6 +126,9 @@ triage set; changing any contributing decision makes the gate stale.
 `mm-review verify` must confirm the final gate is fresh. Every task must also
 run `mm-review workflow finalize` to close the workflow after confirming the
 latest round in each repository and the complete triage history.
+Final artifacts created before the structured Codex verdict contract are
+untrusted even if their stored status says PASS. Verification, workflow status,
+and workflow audit must fail closed and require a fresh structured review.
 
 A supplemental review is permitted only for an unchanged passing final and one
 focused additional question. It performs one fresh review and writes a

@@ -65,12 +65,18 @@ enabled. Codex remains implementer, finding verifier, and final gate.
    automatic.
    If secret screening reports intentional test material, inspect it using
    `mm-review scan` with the same scope and paths, then use its one-shot token.
+   The scan covers and fingerprints the complete outgoing repository snapshot,
+   including unchanged tracked files; direct IDs and broad overrides are not
+   accepted.
 2. Read every reviewer report completely.
    If a run is `partial`, keep the source unchanged and use `mm-review resume`
    so only failed reviewers are retried. If Claude exhausted its budget, pass
    a larger one-resume `--claude-max-budget-usd` and/or lower
    `--claude-effort` without reducing the existing budget; do not repeat a
    weaker cap blindly.
+   The runner protects a 10% provider-overrun reserve and refuses a call when
+   the safe provider allowance is below comparable successful history. Do not
+   bypass that stop with a smaller review.
 3. Independently trace every finding and test gap against the actual code path.
    Record every result with `mm-review decide` or one atomic
    `mm-review decide-batch`; model agreement alone is not evidence.

@@ -205,7 +205,10 @@ recommendation is advisory and any selected risk keeps the result at `deep`.
 provider history and reports a non-binding p90-based budget recommendation.
 It reports cost-bearing samples separately from all comparable attempts, so
 failures without usage data still count toward exhaustion evidence. It never
-changes effort, budgets, providers, or workflow policy automatically.
+changes effort, budgets, providers, or workflow policy automatically. The
+runner does enforce the comparable successful cohort's median as a minimum
+viable provider allowance; if the lineage cannot safely fund that amount, it
+stops before invoking Claude.
 
 Resume history is append-only: earlier attempt metadata and provider artifacts
 remain available, and every reported attempt cost counts toward the workflow
@@ -438,21 +441,21 @@ Use `python3 .../mm_review.py <command> --help` for all flags.
 | Immutable snapshot | Reviewers do not inspect a changing checkout | The tracked repository tree is passed to every enabled provider CLI |
 | Read-only sessions | Reviewers receive read/search-only tool policies | Provider and CLI implementations remain external dependencies |
 | Independent prompts | Reviewers do not receive one another's findings | All reviewers receive the same task contract and source |
-| Secret screening | Blocks likely credentials, sensitive paths, external symlinks, and common secret patterns | It scans changed material heuristically, not every unchanged tracked file |
+| Secret screening | Blocks likely credentials, sensitive paths, external symlinks, and common secret patterns across the complete outgoing snapshot | It remains heuristic and is not a substitute for a dedicated repository scanner |
 | Evidence-backed triage | Codex records why every item was accepted, fixed, rejected, deferred, or uncertain | Model agreement is not evidence |
 | Evidence memory | Codex can retrieve similar prior decisions after fresh reports finish | Historical evidence is never passed to reviewers and the JSON artifacts remain authoritative |
 | Freshness checks | Scoped source changes invalidate the final gate | A finalized confirmation is intentionally closed |
 | Approval boundary | Review results never authorize external actions | The user retains authority over commits, merges, deployments, migrations, and production changes |
 
-External symlinks always fail closed and cannot be waived. The broad sensitive
-path override should be used only after deliberately reviewing the entire
-snapshot.
+Sensitive paths and external symlinks always fail closed and cannot be waived.
+Direct reusable finding IDs and broad sensitive-path overrides are rejected.
 
 When a changed line matches a secret rule but is intentionally safe test data,
 run `scan --approve-findings` against the exact scope and paths first. The
 resulting token is one-shot and bound to the repository, task paths, findings,
-and source fingerprint. It cannot approve later edits, a broader review, a
-sensitive path, or an external symlink.
+task source fingerprint, and content fingerprint of every file sent externally.
+It cannot approve later edits, a broader review, a sensitive path, or an
+external symlink.
 
 ## Privacy and data handling
 
@@ -463,10 +466,9 @@ enabled provider.
 
 The snapshot contains the entire tracked Git tree at the reviewed revision,
 plus the task-scoped working-tree overlay. Path filters do not make unchanged
-tracked files private. Secret screening checks the patch, net changed paths,
-and every task-scoped working-tree overlay path; an existing secret in a truly
-unchanged tracked file can still enter the snapshot. Inspect sensitive
-repositories before starting an external review.
+tracked files private. Secret screening now checks every file in that complete
+outgoing snapshot plus deleted patch material, including unchanged tracked
+files. Inspect sensitive repositories before starting an external review.
 
 Persistent local state is stored under:
 
@@ -492,13 +494,13 @@ repository secret scanner or deliberate source review.
 
 Claude is enabled by default with a `$1.25` maximum per review invocation and a
 `$5.00` cumulative maximum per task lineage. Successor workflows inherit all
-ancestor spend. Before every call, the runner reduces
-the next Claude cap to the smaller of the per-review limit and the lineage's
-remaining budget. Each run atomically reserves its maximum while locking the
-lineage workflow documents, so concurrent repositories cannot reserve the same dollars. It fails
-closed when less than `$0.25` remains instead of launching a predictably
-underfunded, overhead-only review. Most workflows should converge well before
-the limit.
+ancestor spend. Before every call, the runner reduces the next Claude cap to
+fit the remaining lineage budget while protecting an additional 10% provider
+overrun reserve. Each run atomically reserves both amounts while locking the
+lineage workflow documents, so concurrent repositories cannot reserve the same
+dollars. It also refuses to launch when the safely available provider cap is
+below `$0.25` or below the median cost of a sufficiently large comparable
+successful cohort. Most workflows should converge well before the limit.
 
 Every resume attempt is retained and charged to that cumulative calculation;
 a failed paid attempt cannot be hidden by a later successful retry. Use
@@ -515,6 +517,9 @@ persisted. If the runner process is forcibly killed, its reservation remains
 conservatively unavailable rather than silently permitting overspend; inspect
 and recover the interrupted run before deciding whether to supersede the
 lineage with a new explicit budget.
+
+If provider-reported cost exceeds even the protected reservation, the run is
+recorded as `lineage_budget_exceeded` and cannot produce a passing gate.
 
 `doctor --live` performs provider calls and gives its Claude probe a `$0.10`
 cap. Plain `status` and `doctor` do not probe disabled providers. Antigravity

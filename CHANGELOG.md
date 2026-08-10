@@ -7,6 +7,14 @@ All notable user-visible changes are documented here. This project follows
 
 ### Added
 
+- Scan every file in the complete outgoing reviewer snapshot, bind approved
+  redacted findings to that snapshot's content fingerprint, and reject direct
+  reusable finding IDs and broad sensitive-path overrides.
+- Protect a 10% Claude provider-overrun reserve and enforce a history-backed
+  minimum viable provider budget before launch.
+- Classify legacy finals without the structured Codex verdict contract as
+  untrusted in verification, workflow status, and workflow audit.
+
 - Add structured reviewer coverage declarations, persist reviewer notes and
   unreviewed changed paths, expose coverage analytics, and require explicit
   Codex compensation before incomplete confirmation coverage can finalize.
@@ -72,6 +80,10 @@ All notable user-visible changes are documented here. This project follows
 - Validate the configured Kimi model alias before a review starts.
 
 ### Security
+
+- Fail runs closed when Claude reports cost beyond the protected reservation,
+  preserve other reviewers' reports as audit evidence, and give non-resumable
+  recovery guidance that matches the lifecycle contract.
 
 - Overlay task-scoped working-tree changes onto `--base` snapshots even when a
   branch file is reverted exactly to its base content, preventing reviewers
