@@ -135,8 +135,8 @@ focused additional question. It performs one fresh review and writes a
 non-authoritative `supplemental.json`. If Codex accepts an issue that requires a
 source change, open a normal linked successor and repeat repair plus
 confirmation. Supplemental evidence never replaces or upgrades the parent
-gate. All supplemental siblings share the parent task lineage's spend,
-reservations, and cumulative cap.
+gate. All supplemental siblings share the parent task lineage's provider
+attempts and active reservations.
 
 Committing an unchanged reviewed working tree is a state transition, not a code
 change. Use `mm-review attest-commit` to bind the final gate to the checked-out
@@ -166,7 +166,7 @@ earlier findings in reviewer prompts.
 only when:
 
 - the relevant changes are committed on a branch or available as a PR;
-- the user wants the additional cost and latency;
+- the user wants the additional provider-allowance use and latency;
 - uploading that branch to the configured Claude service is acceptable; and
 - the normal local read-only review is not sufficient for the risk.
 

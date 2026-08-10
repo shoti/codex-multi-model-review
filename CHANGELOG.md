@@ -7,6 +7,15 @@ All notable user-visible changes are documented here. This project follows
 
 ### Added
 
+- Add usage-aware `continue` and consolidated `gate` commands. Continuation is
+  read-only by default, can consume one provider-review step only with explicit
+  authorization or an `auto` provider-use policy, and never fabricates triage
+  or a Codex verdict.
+- Add provider authentication/resource metadata, quota cooldown evidence,
+  per-provider attempt ceilings and atomic reservations across successor
+  lineages, plus explicit `unknown` remaining allowance when a CLI does not
+  expose it.
+
 - Scan every file in the complete outgoing reviewer snapshot, bind approved
   redacted findings to that snapshot's content fingerprint, and reject direct
   reusable finding IDs and broad sensitive-path overrides.
@@ -54,8 +63,9 @@ All notable user-visible changes are documented here. This project follows
   legacy workflows, and report unclassified run records and distributions.
 - Add a read-only `workflow audit` that identifies pending triage, unclosed run
   finals, failed workflows, and stale incomplete work without mutating history.
-- Add advisory historical budget estimates for the current patch and record the
-  estimate before paid reviews without changing effort or caps automatically.
+- Add advisory historical API-equivalent estimates for the current patch and
+  record the estimate before allowance-consuming reviews without changing
+  effort or stops automatically.
 - Add explicit useful/irrelevant/mixed feedback for attached memory candidates
   and report memory recall, structural matches, similarity, and assessments.
 - Extract dependency-free token, artifact, and distribution primitives into a
@@ -79,11 +89,21 @@ All notable user-visible changes are documented here. This project follows
   decisions.
 - Validate the configured Kimi model alias before a review starts.
 
+### Changed
+
+- New workflows use provider attempts and observed quota/readiness state rather
+  than a cumulative dollar gate. Claude's required USD-denominated print-mode
+  cap is retained and labeled as a client-side API-price equivalent, not
+  subscription billing. Legacy workflows retain their original semantics for
+  verification compatibility.
+
 ### Security
 
-- Fail runs closed when Claude reports cost beyond the protected reservation,
-  preserve other reviewers' reports as audit evidence, and give non-resumable
-  recovery guidance that matches the lifecycle contract.
+- Fail runs closed when Claude reports an API-price equivalent beyond either
+  the protected legacy lineage reservation or, for allowance-aware workflows,
+  its per-call emergency stop plus the 10% safety reserve. Preserve other
+  reviewers' reports as audit evidence and give non-resumable recovery guidance
+  that matches the lifecycle contract.
 
 - Overlay task-scoped working-tree changes onto `--base` snapshots even when a
   branch file is reverted exactly to its base content, preventing reviewers

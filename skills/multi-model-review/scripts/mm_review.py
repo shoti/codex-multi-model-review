@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 import dataclasses
 import datetime as dt
 import errno
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -26,7 +27,7 @@ import tarfile
 import tempfile
 import threading
 import uuid
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 from review_contract import (
     CLAUDE_REVIEW_SCHEMA,
@@ -94,7 +95,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "model": "k3-256k",
         "allow_run_override": True,
     },
-    "workflow": {"max_budget_usd": 5.0},
+    "workflow": {
+        "max_budget_usd": 5.0,
+        "max_provider_attempts": 6,
+        "provider_use_policy": "explicit",
+    },
 }
 PROVIDERS = ("claude", "antigravity", "kimi")
 PROVIDER_BINARIES = {
@@ -104,7 +109,7 @@ PROVIDER_BINARIES = {
 }
 LEGACY_PROVIDER_ALIASES = {"gemini": "antigravity"}
 PROVIDER_CHOICES = (*PROVIDERS, *LEGACY_PROVIDER_ALIASES)
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 MAX_REPAIR_ROUNDS = 3
 RUN_PHASES = ("repair", "confirmation", "supplemental")
 DEFAULT_REVIEW_MODE = "balanced"
@@ -144,6 +149,7 @@ CLAUDE_BUDGET_SAFETY_RATIO = 0.10
 DEFAULT_ANALYTICS_DAYS = 7
 DEFAULT_BUDGET_EVIDENCE_DAYS = 30
 MIN_BUDGET_ESTIMATE_SAMPLES = 5
+PROVIDER_USE_POLICIES = {"explicit", "auto"}
 
 SENSITIVE_EXACT_NAMES = {
     ".env",
@@ -290,6 +296,8 @@ class ProviderReadiness:
     ready: bool
     detail: str
     models: tuple[str, ...] = ()
+    authentication_mode: str = "unknown"
+    usage_resource: str = "unknown"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -451,7 +459,25 @@ def load_config() -> dict[str, Any]:
         or workflow_budget <= 0
     ):
         raise ReviewError(
-            f"Workflow max_budget_usd in {CONFIG_PATH} must be a positive number."
+            f"Legacy workflow max_budget_usd in {CONFIG_PATH} must be a "
+            "positive number."
+        )
+    max_provider_attempts = config["workflow"].get("max_provider_attempts")
+    if (
+        not isinstance(max_provider_attempts, int)
+        or isinstance(max_provider_attempts, bool)
+        or max_provider_attempts < 1
+    ):
+        raise ReviewError(
+            f"Workflow max_provider_attempts in {CONFIG_PATH} must be a "
+            "positive integer."
+        )
+    provider_use_policy = config["workflow"].get("provider_use_policy")
+    if provider_use_policy not in PROVIDER_USE_POLICIES:
+        raise ReviewError(
+            f"Workflow provider_use_policy in {CONFIG_PATH} must be one of: "
+            + ", ".join(sorted(PROVIDER_USE_POLICIES))
+            + "."
         )
     return config
 
@@ -561,6 +587,18 @@ def materially_changes_claude_retry(
     return selected_budget > previous_budget or (
         lowers_effort and selected_budget >= previous_budget
     )
+
+
+def updated_claude_resume_policy(
+    policy: dict[str, Any], *, effort: str, api_equivalent_limit_usd: float
+) -> dict[str, Any]:
+    """Keep legacy and canonical Claude one-call stop fields synchronized."""
+    updated = dict(policy)
+    updated["claude_effort"] = effort
+    updated["claude_max_budget_usd"] = api_equivalent_limit_usd
+    updated["claude_api_equivalent_limit_usd"] = api_equivalent_limit_usd
+    updated["api_equivalent_usd_is_billing"] = False
+    return updated
 
 
 def provider_health() -> dict[str, Any]:
@@ -1689,7 +1727,7 @@ def reviewer_definitions(
         if blocked_until:
             raise ReviewError(
                 f"{reviewer.name} is in quota cooldown until {blocked_until}; "
-                "the runner will not spend another attempt before then."
+                "the runner will not consume another attempt before then."
             )
         if reviewer.name in {"antigravity", "kimi"}:
             readiness = provider_readiness(reviewer.name, reviewer.model)
@@ -2348,16 +2386,31 @@ def workflow_id() -> str:
 def workflow_policy(
     max_budget_usd: float = 5.0,
     review_mode: str = DEFAULT_REVIEW_MODE,
+    *,
+    usage_based: bool = False,
+    max_provider_attempts: int = 6,
+    provider_use_policy: str = "explicit",
 ) -> dict[str, Any]:
     mode = REVIEW_MODES[review_mode]
-    return {
+    policy = {
         "review_mode": review_mode,
         "max_repair_rounds": mode["max_repair_rounds"],
         "confirmation_required": True,
         "repair_effort": mode["repair_effort"],
         "confirmation_effort": mode["confirmation_effort"],
-        "max_budget_usd": max_budget_usd,
     }
+    if usage_based:
+        policy["usage_policy"] = {
+            "mode": "provider_allowance",
+            "provider_use": provider_use_policy,
+            "max_attempts_per_provider": max_provider_attempts,
+            "remaining_allowance": "provider_reported_or_unknown",
+            "api_equivalent_usd_is_billing": False,
+        }
+        policy["enforce_lineage_api_equivalent_cap"] = False
+    else:
+        policy["max_budget_usd"] = max_budget_usd
+    return policy
 
 
 def review_mode_from_policy(policy: dict[str, Any]) -> str:
@@ -2516,8 +2569,17 @@ def create_workflow(
     supplemental_of: str | None = None,
     supplemental_parent_run_id: str | None = None,
     supplemental_parent_workflow_id: str | None = None,
+    usage_based: bool = False,
+    max_provider_attempts: int = 6,
+    provider_use_policy: str = "explicit",
 ) -> None:
-    policy = workflow_policy(max_budget_usd, review_mode)
+    policy = workflow_policy(
+        max_budget_usd,
+        review_mode,
+        usage_based=usage_based,
+        max_provider_attempts=max_provider_attempts,
+        provider_use_policy=provider_use_policy,
+    )
     if workflow_kind == "supplemental":
         policy["confirmation_required"] = False
     safe_write_json(
@@ -2580,6 +2642,8 @@ def workflow_budget_limit(identifier: str) -> float | None:
     policy = read_json(path).get("policy")
     if not isinstance(policy, dict):
         return None
+    if policy.get("enforce_lineage_api_equivalent_cap") is False:
+        return None
     value = policy.get("max_budget_usd")
     if isinstance(value, (int, float)) and math.isfinite(float(value)) and value > 0:
         return float(value)
@@ -2593,6 +2657,196 @@ def workflow_spend(identifier: str) -> float:
         ).get("reported_cost_usd")
         or 0
     )
+
+
+def workflow_usage_policy(identifier: str) -> dict[str, Any] | None:
+    path = workflow_path(identifier)
+    if not path.exists():
+        return None
+    policy = read_json(path).get("policy")
+    usage_policy = policy.get("usage_policy") if isinstance(policy, dict) else None
+    return usage_policy if isinstance(usage_policy, dict) else None
+
+
+def workflow_provider_attempts(identifier: str) -> dict[str, int]:
+    counts = {provider: 0 for provider in PROVIDERS}
+    for _, metadata in workflow_lineage_runs(identifier):
+        reviewers = metadata.get("reviewers")
+        if not isinstance(reviewers, dict):
+            continue
+        for provider, reviewer in reviewers.items():
+            if provider not in counts or not isinstance(reviewer, dict):
+                continue
+            counts[provider] += len(reviewer_attempts(reviewer))
+    return counts
+
+
+def provider_usage_snapshot(
+    identifier: str, *, probe_readiness: bool = False
+) -> dict[str, Any]:
+    attempts = workflow_provider_attempts(identifier)
+    usage_policy = workflow_usage_policy(identifier) or {}
+    max_attempts = usage_policy.get("max_attempts_per_provider")
+    providers: dict[str, Any] = {}
+    config = load_config()
+    for provider in PROVIDERS:
+        model = str(config[provider].get("model") or "")
+        enabled = bool(config[provider].get("enabled"))
+        cooldown = active_provider_cooldown(provider)
+        if not enabled:
+            readiness = ProviderReadiness(True, "not probed while disabled")
+        elif probe_readiness:
+            readiness = provider_readiness(provider, model)
+        else:
+            authentication_mode = "unknown"
+            usage_resource = "provider_allowance"
+            if provider == "claude":
+                authentication_mode = (
+                    "api_billed" if os.environ.get("ANTHROPIC_API_KEY") else "unknown"
+                )
+                usage_resource = (
+                    "api_tokens"
+                    if authentication_mode == "api_billed"
+                    else "unknown"
+                )
+            readiness = ProviderReadiness(
+                cooldown is None,
+                (
+                    "no active quota cooldown; readiness not probed"
+                    if cooldown is None
+                    else f"quota cooldown until {cooldown}"
+                ),
+                authentication_mode=authentication_mode,
+                usage_resource=usage_resource,
+            )
+        providers[provider] = {
+            "enabled": enabled,
+            "ready": readiness.ready,
+            "detail": readiness.detail,
+            "authentication_mode": readiness.authentication_mode,
+            "usage_resource": readiness.usage_resource,
+            "attempts": attempts[provider],
+            "max_attempts": max_attempts,
+            "attempts_remaining": (
+                max(0, int(max_attempts) - attempts[provider])
+                if isinstance(max_attempts, int)
+                else None
+            ),
+            "quota_reset_at": cooldown,
+        }
+    return {
+        "mode": usage_policy.get("mode", "legacy_api_equivalent"),
+        "provider_use": usage_policy.get("provider_use", "explicit"),
+        "providers": providers,
+        "api_equivalent_usd_note": (
+            "Claude reports a client-side API-price equivalent. It is not "
+            "treated as subscription billing."
+        ),
+    }
+
+
+def reviewer_resource_metadata(reviewer: Reviewer) -> dict[str, str]:
+    authentication_mode = "unknown"
+    usage_resource = "provider_allowance"
+    if reviewer.name == "claude" and os.environ.get("ANTHROPIC_API_KEY"):
+        authentication_mode = "api_billed"
+        usage_resource = "api_tokens"
+    return {
+        "usage_resource": usage_resource,
+        "authentication_mode": authentication_mode,
+    }
+
+
+def _apply_provider_usage_policy(
+    reviewers: Sequence[Reviewer],
+    *,
+    identifier: str,
+    reservation_id: str | None,
+) -> tuple[list[Reviewer], dict[str, Any]]:
+    usage_policy = workflow_usage_policy(identifier)
+    if not usage_policy:
+        return list(reviewers), {}
+    if not reviewers:
+        return [], {
+            "mode": "provider_allowance",
+            "selected_providers": [],
+            "skipped_providers": {},
+            "api_equivalent_lineage_cap_enforced": False,
+        }
+    max_attempts = usage_policy.get("max_attempts_per_provider")
+    if not isinstance(max_attempts, int) or max_attempts < 1:
+        raise ReviewError(
+            f"Workflow {identifier} has an invalid provider-attempt policy."
+        )
+    lineage_root = workflow_lineage_root(identifier)
+    lineage_lock = WORKFLOWS_DIR / f"{lineage_root}.provider-usage"
+    lineage_ids = workflow_lineage_ids(identifier)
+    lineage_paths = [workflow_path(item) for item in lineage_ids]
+    with exclusive_file_lock(lineage_lock):
+        with exclusive_file_locks(lineage_paths):
+            workflow = require_active_workflow(identifier)
+            reservations = workflow.get("usage_reservations")
+            if not isinstance(reservations, dict):
+                reservations = {}
+            if reservation_id:
+                reservations.pop(reservation_id, None)
+            reserved_counts = {provider: 0 for provider in PROVIDERS}
+            for lineage_id in lineage_ids:
+                path = workflow_path(lineage_id)
+                if not path.exists():
+                    continue
+                document = workflow if lineage_id == identifier else read_json(path)
+                values = document.get("usage_reservations")
+                if not isinstance(values, dict):
+                    continue
+                for key, value in values.items():
+                    if key == reservation_id or not isinstance(value, dict):
+                        continue
+                    for provider in value.get("providers", []):
+                        if provider in reserved_counts:
+                            reserved_counts[provider] += 1
+            attempted = workflow_provider_attempts(identifier)
+            selected: list[Reviewer] = []
+            skipped: dict[str, str] = {}
+            for reviewer in reviewers:
+                used = attempted[reviewer.name] + reserved_counts[reviewer.name]
+                cooldown = active_provider_cooldown(reviewer.name)
+                if cooldown:
+                    skipped[reviewer.name] = f"quota cooldown until {cooldown}"
+                elif used >= max_attempts:
+                    skipped[reviewer.name] = (
+                        f"provider-attempt allowance exhausted ({used}/{max_attempts})"
+                    )
+                else:
+                    selected.append(reviewer)
+            if not selected:
+                detail = "; ".join(
+                    f"{provider}: {reason}" for provider, reason in sorted(skipped.items())
+                ) or "no provider is ready"
+                raise ReviewError(
+                    f"Workflow {identifier} cannot consume another provider "
+                    f"attempt: {detail}. Wait for quota reset, enable another "
+                    "provider, or explicitly supersede the workflow with a new "
+                    "usage policy."
+                )
+            if reservation_id:
+                reservations[reservation_id] = {
+                    "providers": [reviewer.name for reviewer in selected],
+                    "reserved_at": utc_now(),
+                    "runner_pid": os.getpid(),
+                }
+                workflow["usage_reservations"] = reservations
+                safe_write_json(workflow_path(identifier), workflow)
+    return selected, {
+        "mode": "provider_allowance",
+        "provider_use": usage_policy.get("provider_use", "explicit"),
+        "max_attempts_per_provider": max_attempts,
+        "attempts_before_run": attempted,
+        "reserved_before_run": reserved_counts,
+        "selected_providers": [reviewer.name for reviewer in selected],
+        "skipped_providers": skipped,
+        "api_equivalent_lineage_cap_enforced": False,
+    }
 
 
 def _adjust_workflow_budget(
@@ -2621,8 +2875,8 @@ def _adjust_workflow_budget(
         )
         if maximum_safe_provider_budget < minimum_required:
             raise ReviewError(
-                f"Workflow {identifier} has only ${remaining:.2f} unreserved "
-                "lineage budget, which permits at most "
+                f"Legacy workflow {identifier} has only ${remaining:.2f} "
+                "unreserved API-equivalent allowance, which permits at most "
                 f"${maximum_safe_provider_budget:.2f} for Claude after the "
                 f"{CLAUDE_BUDGET_SAFETY_RATIO:.0%} provider-overrun safety "
                 f"reserve. This is below the ${minimum_required:.2f} minimum "
@@ -2674,7 +2928,14 @@ def apply_workflow_budget(
     *,
     reservation_id: str | None = None,
     minimum_provider_budget_usd: float = MIN_CLAUDE_REVIEW_BUDGET_USD,
-) -> tuple[list[Reviewer], dict[str, float] | None]:
+) -> tuple[list[Reviewer], dict[str, Any] | None]:
+    if workflow_usage_policy(identifier):
+        selected, usage_status = _apply_provider_usage_policy(
+            reviewers,
+            identifier=identifier,
+            reservation_id=reservation_id,
+        )
+        return selected, usage_status
     if reservation_id is None:
         limit = workflow_budget_limit(identifier)
         if limit is None:
@@ -2753,12 +3014,22 @@ def release_workflow_budget_reservation(
         return
     with exclusive_file_lock(path):
         workflow = read_json(path)
+        changed = False
         reservations = workflow.get("budget_reservations")
-        if not isinstance(reservations, dict) or reservation_id not in reservations:
-            return
-        reservations.pop(reservation_id, None)
-        workflow["budget_reservations"] = reservations
-        safe_write_json(path, workflow)
+        if isinstance(reservations, dict) and reservation_id in reservations:
+            reservations.pop(reservation_id, None)
+            workflow["budget_reservations"] = reservations
+            changed = True
+        usage_reservations = workflow.get("usage_reservations")
+        if (
+            isinstance(usage_reservations, dict)
+            and reservation_id in usage_reservations
+        ):
+            usage_reservations.pop(reservation_id, None)
+            workflow["usage_reservations"] = usage_reservations
+            changed = True
+        if changed:
+            safe_write_json(path, workflow)
 
 
 def validate_workflow_phase(
@@ -2935,12 +3206,31 @@ def workflow_start_command(args: argparse.Namespace) -> int:
         else float(config["workflow"]["max_budget_usd"])
     )
     if not math.isfinite(max_budget_usd) or max_budget_usd <= 0:
-        raise ReviewError("Workflow budget must be a positive USD amount.")
+        raise ReviewError("Legacy workflow API-equivalent cap must be positive.")
+    if args.max_provider_attempts is not None and args.max_provider_attempts < 1:
+        raise ReviewError("--max-provider-attempts must be at least 1.")
+    if args.max_budget_usd is not None and (
+        args.max_provider_attempts is not None or args.provider_use_policy is not None
+    ):
+        raise ReviewError(
+            "--max-budget-usd selects legacy lineage behavior and cannot be "
+            "combined with provider-usage policy flags."
+        )
     create_workflow(
         identifier,
         name=args.name,
         max_budget_usd=max_budget_usd,
         review_mode=args.review_mode,
+        usage_based=args.max_budget_usd is None,
+        max_provider_attempts=(
+            args.max_provider_attempts
+            if args.max_provider_attempts is not None
+            else int(config["workflow"]["max_provider_attempts"])
+        ),
+        provider_use_policy=(
+            args.provider_use_policy
+            or str(config["workflow"]["provider_use_policy"])
+        ),
     )
     print(identifier)
     return 0
@@ -2968,6 +3258,8 @@ def workflow_supersede_command(args: argparse.Namespace) -> int:
         policy = old.get("policy") if isinstance(old.get("policy"), dict) else {}
         max_budget_usd = float(policy.get("max_budget_usd") or 5.0)
         review_mode = review_mode_from_policy(policy)
+        usage_policy = policy.get("usage_policy")
+        usage_policy = usage_policy if isinstance(usage_policy, dict) else None
         if args.by:
             if not replacement_path.exists():
                 raise ReviewError(
@@ -2980,14 +3272,27 @@ def workflow_supersede_command(args: argparse.Namespace) -> int:
                 if isinstance(replacement_policy, dict)
                 else None
             )
-            if not isinstance(replacement_budget, (int, float)) or not math.isclose(
-                float(replacement_budget), max_budget_usd
+            replacement_usage_policy = (
+                replacement_policy.get("usage_policy")
+                if isinstance(replacement_policy, dict)
+                else None
+            )
+            if usage_policy is not None:
+                if replacement_usage_policy != usage_policy:
+                    raise ReviewError(
+                        "Replacement workflow provider-usage policy must exactly "
+                        "match the current lineage policy. Create an inheriting "
+                        "successor without --by instead."
+                    )
+            elif (
+                not isinstance(replacement_budget, (int, float))
+                or not math.isclose(float(replacement_budget), max_budget_usd)
             ):
                 raise ReviewError(
-                    "Replacement workflow budget must exactly match the current "
-                    f"lineage cap (${max_budget_usd:.2f}); received "
-                    f"{replacement_budget!r}. Create an inheriting successor "
-                    "without --by instead."
+                    "Replacement workflow legacy API-equivalent cap must exactly "
+                    f"match the current lineage cap ({max_budget_usd:.2f}); "
+                    f"received {replacement_budget!r}. Create an inheriting "
+                    "successor without --by instead."
                 )
             supersedes = replacement_document.get("supersedes")
             if not isinstance(supersedes, list):
@@ -3003,6 +3308,17 @@ def workflow_supersede_command(args: argparse.Namespace) -> int:
                 max_budget_usd=max_budget_usd,
                 review_mode=review_mode,
                 supersedes=(args.workflow_id,),
+                usage_based=usage_policy is not None,
+                max_provider_attempts=int(
+                    usage_policy.get("max_attempts_per_provider", 6)
+                    if usage_policy
+                    else 6
+                ),
+                provider_use_policy=str(
+                    usage_policy.get("provider_use", "explicit")
+                    if usage_policy
+                    else "explicit"
+                ),
             )
         old.update(
             {
@@ -3128,10 +3444,25 @@ def attach_prior_matches(
 def latest_workflow_runs(
     identifier: str,
 ) -> list[tuple[Path, dict[str, Any]]]:
+    return latest_runs_by_repository(
+        item
+        for item in workflow_runs(identifier)
+        if item[1].get("status") == "completed"
+    )
+
+
+def latest_workflow_attempts(
+    identifier: str,
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Return each repository's latest attempt, including incomplete states."""
+    return latest_runs_by_repository(workflow_runs(identifier))
+
+
+def latest_runs_by_repository(
+    runs: Iterable[tuple[Path, dict[str, Any]]],
+) -> list[tuple[Path, dict[str, Any]]]:
     latest: dict[str, tuple[Path, dict[str, Any]]] = {}
-    for run_dir, metadata in workflow_runs(identifier):
-        if metadata.get("status") != "completed":
-            continue
+    for run_dir, metadata in runs:
         repository = metadata.get("repository")
         if not isinstance(repository, dict):
             continue
@@ -3716,6 +4047,10 @@ def analytics_report(since_days: int) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": utc_now(),
+        "usage_semantics": {
+            "reported_cost_usd": "provider API-price equivalent, not assumed billing",
+            "workflow_control": "provider attempts and observed quota state for schema 10+",
+        },
         "since_days": since_days,
         "run_attempts": len(runs),
         "contract_valid_runs": contract_valid_runs,
@@ -3786,6 +4121,7 @@ def render_analytics_compact(report: dict[str, Any]) -> str:
             f"{format_count(report.get('run_attempts'))} runs, "
             f"{format_count(metrics.get('reviewer_invocations'))} reviewer calls, "
             f"{format_count(metrics.get('failed_reviewer_invocations'))} failed, "
+            "API-equivalent="
             f"${float(metrics.get('reported_cost_usd') or 0):.2f}, "
             f"{float(metrics.get('reviewer_duration_seconds') or 0) / 3600:.2f}h"
         ),
@@ -4634,6 +4970,7 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
         "lineage_metrics": workflow_metrics(
             lineage_runs, artifact_bytes_by_run
         ),
+        "provider_usage": provider_usage_snapshot(identifier),
         "repositories": repositories,
     }, ready
 
@@ -4644,6 +4981,443 @@ def workflow_status_command(args: argparse.Namespace) -> int:
         status, args.output_format, render_workflow_status_compact(status)
     )
     return 0 if ready else 3
+
+
+def _current_run_source_changed(run_dir: Path, metadata: dict[str, Any]) -> bool:
+    repository = metadata.get("repository")
+    scope_value = metadata.get("scope")
+    if not isinstance(repository, dict) or not isinstance(scope_value, dict):
+        return False
+    repo = resolve_repo(str(repository.get("root")))
+    scope = Scope(
+        str(scope_value.get("kind")),
+        scope_value.get("value"),
+        str(scope_value.get("label")),
+    )
+    path_filters = tuple(str(item) for item in metadata.get("path_filters", []))
+    paths = changed_paths(repo, scope, path_filters)
+    return fingerprint(repo, scope, paths, path_filters) != metadata.get(
+        "source_fingerprint"
+    )
+
+
+def workflow_continue_plan(
+    identifier: str, *, probe_usage: bool = False
+) -> dict[str, Any]:
+    status, ready = workflow_status(identifier)
+    state = str(status.get("state") or "active")
+    usage = provider_usage_snapshot(identifier, probe_readiness=probe_usage)
+    plan: dict[str, Any] = {
+        "workflow_id": identifier,
+        "state": state,
+        "ready": ready,
+        "provider_usage": usage,
+        "actions": [],
+        "checked_at": utc_now(),
+    }
+    if state in {"completed", "completed_stale", "completed_untrusted"}:
+        plan["next"] = "COMPLETE" if state == "completed" else "BLOCKED"
+        return plan
+    if state == "superseded":
+        plan["next"] = "SUPERSEDED"
+        return plan
+    if status.get("active_runs"):
+        plan["next"] = "RUNNING"
+        return plan
+    latest_runs = latest_workflow_attempts(identifier)
+    if not latest_runs:
+        plan["next"] = "NEEDS_INITIAL_REVIEW"
+        plan["actions"].append(
+            {
+                "type": "initial_review",
+                "automatable": False,
+                "reason": (
+                    "The workflow has no repository contract yet. Start the "
+                    "first repair with repo, scope, paths, risks, and task."
+                ),
+                "command": (
+                    f"mm-review run --workflow-id {shlex.quote(identifier)} "
+                    "--phase repair --uncommitted --task \"<intent>\""
+                ),
+            }
+        )
+        return plan
+
+    priorities = {
+        "BLOCKED": 8,
+        "WAIT_FOR_PROVIDER": 7,
+        "NEEDS_RECOVERY": 6,
+        "NEEDS_TRIAGE": 5,
+        "NEEDS_CODEX_FINAL": 4,
+        "NEEDS_REVIEW": 3,
+        "READY_TO_GATE": 2,
+    }
+    next_state = "READY_TO_GATE"
+    for run_dir, metadata in latest_runs:
+        repository = metadata.get("repository")
+        repository = repository if isinstance(repository, dict) else {}
+        label = repository.get("name") or repository.get("root") or "unknown"
+        run_status = str(metadata.get("status") or "unknown")
+        action: dict[str, Any] = {
+            "repository": label,
+            "run_dir": str(run_dir),
+            "automatable": False,
+        }
+        candidate = "READY_TO_GATE"
+        failure = metadata.get("failure")
+        reviewer_failure = (
+            isinstance(failure, dict)
+            and failure.get("type") == "reviewer_failure"
+        )
+        if run_status == "partial" or (
+            run_status == "failed" and reviewer_failure
+        ):
+            failed_names = (
+                failure.get("reviewers", [])
+                if isinstance(failure, dict)
+                else []
+            )
+            providers = usage.get("providers")
+            providers = providers if isinstance(providers, dict) else {}
+            unavailable = [
+                str(name)
+                for name in failed_names
+                if not isinstance(providers.get(str(name)), dict)
+                or not providers[str(name)].get("ready")
+                or providers[str(name)].get("attempts_remaining") == 0
+            ]
+            if unavailable:
+                candidate = "WAIT_FOR_PROVIDER"
+                action.update(
+                    {
+                        "type": "wait_for_provider",
+                        "providers": unavailable,
+                        "reason": "A failed reviewer is still quota-blocked or unavailable.",
+                    }
+                )
+            else:
+                candidate = "NEEDS_REVIEW"
+                action.update(
+                    {
+                        "type": "resume",
+                        "automatable": True,
+                        "command": f"mm-review resume --run {shlex.quote(str(run_dir))}",
+                    }
+                )
+        elif run_status in {"failed", "preflight_blocked"}:
+            candidate = "NEEDS_RECOVERY"
+            action.update(
+                {
+                    "type": "manual_recovery",
+                    "reason": metadata.get("terminal_error") or metadata.get("failure"),
+                }
+            )
+        else:
+            issues = run_triage_issues(run_dir, metadata)
+            if issues:
+                candidate = "NEEDS_TRIAGE"
+                action.update(
+                    {
+                        "type": "triage",
+                        "reason": issues,
+                        "command": (
+                            f"mm-review decide --run {shlex.quote(str(run_dir))} ..."
+                        ),
+                    }
+                )
+            else:
+                phase = str(metadata.get("phase") or "repair")
+                if phase == "repair":
+                    triage_path = run_dir / "triage.json"
+                    triage = read_json(triage_path) if triage_path.exists() else {}
+                    changed_after_fix = any(
+                        item.get("decision") in {"fixed", "covered"}
+                        for item in triage_items(triage)
+                    ) and _current_run_source_changed(run_dir, metadata)
+                    completed_repairs = sum(
+                        1
+                        for _, item in workflow_runs(identifier)
+                        if isinstance(item.get("repository"), dict)
+                        and str(item["repository"].get("id"))
+                        == str(repository.get("id"))
+                        and item.get("status") == "completed"
+                        and item.get("phase", "repair") == "repair"
+                    )
+                    phase = (
+                        "repair"
+                        if changed_after_fix
+                        and completed_repairs < workflow_max_repair_rounds(identifier)
+                        else "confirmation"
+                    )
+                    candidate = "NEEDS_REVIEW"
+                    action.update(
+                        {
+                            "type": "review",
+                            "phase": phase,
+                            "automatable": True,
+                            "command": shlex.join(
+                                [
+                                    "mm-review",
+                                    "run",
+                                    "--repo",
+                                    str(repository.get("root")),
+                                    "--workflow-id",
+                                    identifier,
+                                    "--phase",
+                                    phase,
+                                    "--reuse-contract",
+                                ]
+                            ),
+                        }
+                    )
+                else:
+                    final_path = (
+                        run_dir / "supplemental.json"
+                        if phase == "supplemental"
+                        else run_dir / "final.json"
+                    )
+                    if not final_path.exists():
+                        candidate = "NEEDS_CODEX_FINAL"
+                        action.update(
+                            {
+                                "type": "codex_final",
+                                "command": (
+                                    f"mm-review gate {shlex.quote(identifier)} "
+                                    "--codex-verdict <verdict> --codex-review "
+                                    '"<evidence-backed final review>"'
+                                ),
+                            }
+                        )
+                    else:
+                        final = read_json(final_path)
+                        trusted, trust_issues = final_contract_trust(final)
+                        final_status = str(final.get("status") or "")
+                        if (
+                            not trusted
+                            or final_status in {"BLOCK", "SUPPLEMENTAL_BLOCK"}
+                        ):
+                            candidate = "BLOCKED"
+                            action.update(
+                                {
+                                    "type": "blocked_final",
+                                    "reason": trust_issues or final_status,
+                                }
+                            )
+                        else:
+                            action.update(
+                                {"type": "verify_and_close", "automatable": True}
+                            )
+        if candidate == "NEEDS_REVIEW" and probe_usage:
+            providers = usage.get("providers")
+            providers = providers if isinstance(providers, dict) else {}
+            available = [
+                provider
+                for provider, value in providers.items()
+                if isinstance(value, dict)
+                and value.get("enabled")
+                and value.get("ready")
+                and value.get("attempts_remaining") != 0
+            ]
+            if not available:
+                candidate = "WAIT_FOR_PROVIDER"
+                action = {
+                    **action,
+                    "type": "wait_for_provider",
+                    "automatable": False,
+                    "reason": (
+                        "No enabled reviewer currently has confirmed readiness "
+                        "and local attempt allowance."
+                    ),
+                }
+        plan["actions"].append(action)
+        if priorities.get(candidate, 0) > priorities.get(next_state, 0):
+            next_state = candidate
+    plan["next"] = next_state
+    return plan
+
+
+def render_continue_plan_compact(plan: dict[str, Any]) -> str:
+    lines = [
+        f"Workflow {plan.get('workflow_id')}: next={plan.get('next')}, "
+        f"state={plan.get('state')}"
+    ]
+    for action in plan.get("actions", []):
+        if not isinstance(action, dict):
+            continue
+        lines.append(
+            f"- {action.get('repository', 'workflow')}: {action.get('type')}"
+            + (f"; {action.get('command')}" if action.get("command") else "")
+        )
+    lines.append("Use --format json for provider allowance and readiness evidence.")
+    return "\n".join(lines)
+
+
+def _execute_continue_action(identifier: str, action: dict[str, Any]) -> str:
+    command = action.get("command")
+    if not isinstance(command, str):
+        raise ReviewError("Continuation action has no executable command.")
+    argv = shlex.split(command)
+    if argv and argv[0] == "mm-review":
+        argv = argv[1:]
+    parsed = build_parser().parse_args(argv)
+    output = io.StringIO()
+    # Capture nested command output so JSON mode remains machine-readable.
+    with redirect_stdout(output):
+        if parsed.command == "resume":
+            resume_review_command(parsed)
+        elif parsed.command == "run":
+            usage = provider_usage_snapshot(identifier, probe_readiness=True)
+            providers = usage.get("providers")
+            providers = providers if isinstance(providers, dict) else {}
+            for provider in PROVIDERS:
+                value = providers.get(provider)
+                available = (
+                    isinstance(value, dict)
+                    and value.get("enabled")
+                    and value.get("ready")
+                    and value.get("attempts_remaining") != 0
+                )
+                setattr(parsed, f"with_{provider}", bool(available))
+                setattr(parsed, f"without_{provider}", not bool(available))
+            run_review_command(parsed)
+        else:
+            raise ReviewError(f"Unsupported continuation action: {parsed.command}")
+    return output.getvalue().strip()
+
+
+def continue_command(args: argparse.Namespace) -> int:
+    usage_policy = workflow_usage_policy(args.workflow_id) or {}
+    execute = args.execute_review or usage_policy.get("provider_use") == "auto"
+    plan = workflow_continue_plan(args.workflow_id, probe_usage=True)
+    executable = [
+        action
+        for action in plan.get("actions", [])
+        if isinstance(action, dict)
+        and action.get("automatable")
+        and action.get("type") in {"review", "resume"}
+    ][:1]
+    if execute and executable:
+        logs = [
+            _execute_continue_action(args.workflow_id, action)
+            for action in executable
+        ]
+        plan = workflow_continue_plan(args.workflow_id, probe_usage=True)
+        plan["execution_log"] = logs
+    print_structured_output(
+        plan, args.output_format, render_continue_plan_compact(plan)
+    )
+    return 0 if plan.get("next") == "COMPLETE" else 3
+
+
+def gate_command(args: argparse.Namespace) -> int:
+    logs: list[str] = []
+    plan = workflow_continue_plan(args.workflow_id, probe_usage=True)
+    if args.execute_review:
+        executable = [
+            action
+            for action in plan.get("actions", [])
+            if isinstance(action, dict)
+            and action.get("automatable")
+            and action.get("type") in {"review", "resume"}
+        ][:1]
+        for action in executable:
+            logs.append(_execute_continue_action(args.workflow_id, action))
+        if executable:
+            plan = workflow_continue_plan(args.workflow_id, probe_usage=True)
+
+    codex_actions = [
+        action
+        for action in plan.get("actions", [])
+        if isinstance(action, dict) and action.get("type") == "codex_final"
+    ]
+    if codex_actions and bool(args.codex_verdict) != bool(args.codex_review):
+        raise ReviewError(
+            "Provide both --codex-verdict and --codex-review, or neither."
+        )
+    if len(codex_actions) > 1 and args.codex_verdict and args.codex_review:
+        pending = ", ".join(
+            str(action.get("run_dir") or "unknown") for action in codex_actions
+        )
+        raise ReviewError(
+            "Multiple repositories are awaiting independent Codex finals. "
+            "A single --codex-verdict/--codex-review cannot be applied safely "
+            f"to all of them. Finalize one run at a time first: {pending}"
+        )
+    if not codex_actions and (args.codex_verdict or args.codex_review):
+        raise ReviewError(
+            "No confirmation run is awaiting a Codex final verdict. Inspect "
+            "`mm-review gate <workflow-id>` without verdict arguments first."
+        )
+    if codex_actions and args.codex_verdict and args.codex_review:
+        for action in codex_actions:
+            command = [
+                "finalize",
+                "--run",
+                str(action["run_dir"]),
+                "--codex-verdict",
+                args.codex_verdict,
+                "--codex-review",
+                args.codex_review,
+            ]
+            for verification in args.verification:
+                command.extend(["--verification", verification])
+            for verification in args.coverage_verification:
+                command.extend(["--coverage-verification", verification])
+            output = io.StringIO()
+            with redirect_stdout(output):
+                finalize_command(build_parser().parse_args(command))
+            logs.append(output.getvalue().strip())
+        plan = workflow_continue_plan(args.workflow_id, probe_usage=True)
+
+    latest_runs = latest_workflow_runs(args.workflow_id)
+    if plan.get("next") == "READY_TO_GATE" or plan.get("state") == "completed":
+        for run_dir, metadata in latest_runs:
+            phase = str(metadata.get("phase") or "repair")
+            final_path = (
+                run_dir / "supplemental.json"
+                if phase == "supplemental"
+                else run_dir / "final.json"
+            )
+            if not final_path.exists():
+                continue
+            output = io.StringIO()
+            with redirect_stdout(output):
+                if args.attest_commit and phase == "supplemental":
+                    print(
+                        "Commit attestation skipped for non-authoritative "
+                        f"supplemental evidence: {run_dir}"
+                    )
+                elif args.attest_commit:
+                    attest_commit_command(
+                        build_parser().parse_args(
+                            ["attest-commit", "--run", str(run_dir), "--commit", "HEAD"]
+                        )
+                    )
+                verify_command(
+                    build_parser().parse_args(["verify", "--run", str(run_dir)])
+                )
+            logs.append(output.getvalue().strip())
+        workflow_document = read_json(workflow_path(args.workflow_id))
+        if workflow_document.get("status") != "completed":
+            output = io.StringIO()
+            with redirect_stdout(output):
+                workflow_finalize_command(
+                    build_parser().parse_args(
+                        ["workflow", "finalize", args.workflow_id]
+                    )
+                )
+            logs.append(output.getvalue().strip())
+        plan = workflow_continue_plan(args.workflow_id, probe_usage=True)
+
+    result = {
+        **plan,
+        "gate": "PASS" if plan.get("next") == "COMPLETE" else "INCOMPLETE",
+        "execution_log": logs,
+    }
+    print_structured_output(
+        result, args.output_format, render_continue_plan_compact(result)
+    )
+    return 0 if result["gate"] == "PASS" else 3
 
 
 def render_workflow_status_compact(status: dict[str, Any]) -> str:
@@ -4658,7 +5432,8 @@ def render_workflow_status_compact(status: dict[str, Any]) -> str:
         (
             f"Runs: {format_count(metrics.get('run_count'))}; "
             f"reviewer calls={format_count(metrics.get('reviewer_invocations'))}; "
-            f"cost=${float(metrics.get('reported_cost_usd') or 0):.2f}; "
+            "Claude API-equivalent="
+            f"${float(metrics.get('reported_cost_usd') or 0):.2f}; "
             f"duration={float(metrics.get('reviewer_duration_seconds') or 0):.1f}s"
         ),
     ]
@@ -4691,6 +5466,22 @@ def render_workflow_status_compact(status: dict[str, Any]) -> str:
     if isinstance(issues, list) and issues:
         lines.append("History issues:")
         lines.extend(f"- {issue}" for issue in issues)
+    provider_usage = status.get("provider_usage")
+    if isinstance(provider_usage, dict):
+        providers = provider_usage.get("providers")
+        if isinstance(providers, dict):
+            lines.append("Provider usage:")
+            for provider, value in providers.items():
+                if not isinstance(value, dict) or not value.get("enabled"):
+                    continue
+                remaining = value.get("attempts_remaining")
+                lines.append(
+                    f"- {provider}: auth={value.get('authentication_mode')}, "
+                    f"resource={value.get('usage_resource')}, "
+                    f"attempts={value.get('attempts')}, "
+                    f"remaining={remaining if remaining is not None else 'unknown'}, "
+                    f"ready={value.get('ready')}"
+                )
     lines.append("Use --format json for complete workflow policy and metrics.")
     return "\n".join(lines)
 
@@ -4786,6 +5577,52 @@ def kimi_provider_readiness(command: str, model: str | None) -> ProviderReadines
     )
 
 
+def claude_authentication_mode(command: str = "claude") -> tuple[str, str]:
+    """Return a redacted best-effort billing mode, never credential material."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return (
+            "api_billed",
+            "ANTHROPIC_API_KEY overrides Claude subscription authentication",
+        )
+    try:
+        completed = subprocess.run(
+            [command, "auth", "status"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown", "authentication mode could not be inspected"
+    if completed.returncode != 0:
+        return "unknown", "authentication status is unavailable"
+    raw = completed.stdout.strip()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = None
+    searchable = json.dumps(payload, sort_keys=True).lower() if payload else raw.lower()
+    if any(
+        marker in searchable
+        for marker in ("api_key", "apikey", "console", "anthropic console")
+    ):
+        return "api_billed", "Claude Console or API-key authentication"
+    if any(
+        marker in searchable
+        for marker in (
+            "subscription",
+            "claude.ai",
+            "oauth",
+            '"pro"',
+            '"max"',
+            '"team"',
+            '"enterprise"',
+        )
+    ):
+        return "subscription", "Claude subscription authentication"
+    return "unknown", "authenticated; billing mode was not reported"
+
+
 def provider_readiness(
     provider: str, model: str | None = None
 ) -> ProviderReadiness:
@@ -4812,11 +5649,29 @@ def provider_readiness(
         return dataclasses.replace(
             readiness,
             detail=readiness.detail + suffix,
+            usage_resource="provider_allowance",
+        )
+    if provider == "claude":
+        authentication_mode, authentication_detail = claude_authentication_mode(
+            command
+        )
+        return ProviderReadiness(
+            True,
+            f"CLI available; {authentication_detail}" + suffix,
+            authentication_mode=authentication_mode,
+            usage_resource=(
+                "included_plan_allowance"
+                if authentication_mode == "subscription"
+                else "api_tokens"
+                if authentication_mode == "api_billed"
+                else "unknown"
+            ),
         )
     if provider != "antigravity":
         return ProviderReadiness(
             True,
             "CLI available; authentication checked on invocation" + suffix,
+            usage_resource="provider_allowance",
         )
     agent = antigravity_agent_readiness()
     if not agent.ready:
@@ -4843,6 +5698,7 @@ def provider_readiness(
             True,
             f"{agent.detail}; authenticated; {len(models)} models available{suffix}",
             models,
+            usage_resource="provider_allowance",
         )
     detail_lines = (completed.stderr or completed.stdout).strip().splitlines()
     detail = (
@@ -4866,7 +5722,8 @@ def status_command(_: argparse.Namespace) -> int:
         if provider == "claude":
             policy = (
                 f", effort={config[provider].get('effort')}, "
-                f"max_budget_usd={config[provider].get('max_budget_usd')}"
+                "api_equivalent_stop_usd="
+                f"{config[provider].get('max_budget_usd')}"
             )
         command = PROVIDER_BINARIES[provider]
         readiness = (
@@ -4878,13 +5735,19 @@ def status_command(_: argparse.Namespace) -> int:
         print(
             f"{provider}: {state}, model={model}{policy}, "
             f"CLI={cli_version}, "
-            f"readiness={readiness.detail}"
+            f"readiness={readiness.detail}, "
+            f"auth={readiness.authentication_mode}, "
+            f"usage_resource={readiness.usage_resource}"
         )
         if enabled and not readiness.ready:
             ready = False
     print(
-        "workflow: "
-        f"max_budget_usd={config['workflow'].get('max_budget_usd')}"
+        "workflow: provider_use_policy="
+        f"{config['workflow'].get('provider_use_policy')}, "
+        "max_provider_attempts="
+        f"{config['workflow'].get('max_provider_attempts')}, "
+        "legacy_api_equivalent_cap_usd="
+        f"{config['workflow'].get('max_budget_usd')}"
     )
     print(f"Review artifacts: {RUNS_DIR}")
     return 0 if ready else 3
@@ -4931,21 +5794,50 @@ def set_effort_command(args: argparse.Namespace) -> int:
 
 def set_budget_command(args: argparse.Namespace) -> int:
     if not math.isfinite(args.usd) or args.usd <= 0:
-        raise ReviewError("Claude budget must be a positive USD amount.")
+        raise ReviewError(
+            "Claude API-equivalent usage limit must be a positive USD-denominated "
+            "amount; this unit does not imply subscription billing."
+        )
     config = load_config()
     config["claude"]["max_budget_usd"] = args.usd
     write_config(config)
-    print(f"claude max budget set to ${args.usd:.2f} in {CONFIG_PATH}")
+    print(
+        "claude API-equivalent emergency stop set to "
+        f"${args.usd:.2f} in {CONFIG_PATH}; subscription billing is not implied"
+    )
     return 0
 
 
 def set_workflow_budget_command(args: argparse.Namespace) -> int:
     if not math.isfinite(args.usd) or args.usd <= 0:
-        raise ReviewError("Workflow budget must be a positive USD amount.")
+        raise ReviewError("Legacy workflow API-equivalent cap must be positive.")
     config = load_config()
     config["workflow"]["max_budget_usd"] = args.usd
     write_config(config)
-    print(f"workflow max budget set to ${args.usd:.2f} in {CONFIG_PATH}")
+    print(
+        "legacy workflow API-equivalent cap set to "
+        f"${args.usd:.2f} in {CONFIG_PATH}; new workflows use provider attempts"
+    )
+    return 0
+
+
+def set_provider_attempt_limit_command(args: argparse.Namespace) -> int:
+    if args.attempts < 1:
+        raise ReviewError("Provider attempt limit must be at least 1.")
+    config = load_config()
+    config["workflow"]["max_provider_attempts"] = args.attempts
+    write_config(config)
+    print(
+        f"workflow provider-attempt limit set to {args.attempts} in {CONFIG_PATH}"
+    )
+    return 0
+
+
+def set_provider_use_policy_command(args: argparse.Namespace) -> int:
+    config = load_config()
+    config["workflow"]["provider_use_policy"] = args.policy
+    write_config(config)
+    print(f"workflow provider-use policy set to {args.policy} in {CONFIG_PATH}")
     return 0
 
 
@@ -6221,6 +7113,16 @@ def persist_review_results(
         latest = {
             "model": definition.model,
             "cli_version": definition.cli_version,
+            "authentication_mode": (
+                previous.get("authentication_mode", "unknown")
+                if isinstance(previous, dict)
+                else "unknown"
+            ),
+            "usage_resource": (
+                previous.get("usage_resource", "unknown")
+                if isinstance(previous, dict)
+                else "unknown"
+            ),
             "started_at": result.started_at,
             "completed_at": result.completed_at,
             "duration_seconds": round(result.duration_seconds, 3),
@@ -6349,6 +7251,35 @@ def persist_review_results(
         if isinstance(workflow_budget, dict)
         else None
     )
+    workflow_usage = metadata.get("workflow_usage")
+    review_policy = metadata.get("review_policy")
+    per_call_stop = (
+        review_policy.get("claude_api_equivalent_limit_usd")
+        if isinstance(review_policy, dict)
+        else None
+    )
+    if not isinstance(per_call_stop, (int, float)) or isinstance(
+        per_call_stop, bool
+    ):
+        per_call_stop = (
+            review_policy.get("claude_max_budget_usd")
+            if isinstance(review_policy, dict)
+            else None
+        )
+    protected_per_call_stop = (
+        float(per_call_stop) * (1 + CLAUDE_BUDGET_SAFETY_RATIO)
+        if isinstance(per_call_stop, (int, float))
+        and not isinstance(per_call_stop, bool)
+        and isinstance(workflow_usage, dict)
+        and workflow_usage.get("mode") == "provider_allowance"
+        else None
+    )
+    protected_limit = (
+        reserved_for_run
+        if isinstance(reserved_for_run, (int, float))
+        and not isinstance(reserved_for_run, bool)
+        else protected_per_call_stop
+    )
     claude_result = result_by_name.get("claude")
     claude_cost = (
         claude_result.usage.get("total_cost_usd")
@@ -6356,22 +7287,34 @@ def persist_review_results(
         else None
     )
     budget_exceeded = bool(
-        isinstance(reserved_for_run, (int, float))
-        and not isinstance(reserved_for_run, bool)
+        isinstance(protected_limit, (int, float))
+        and not isinstance(protected_limit, bool)
         and isinstance(claude_cost, (int, float))
         and not isinstance(claude_cost, bool)
-        and float(claude_cost) > float(reserved_for_run) + 0.000001
+        and float(claude_cost) > float(protected_limit) + 0.000001
     )
     if budget_exceeded:
+        usage_based_overrun = protected_per_call_stop is not None and not isinstance(
+            reserved_for_run, (int, float)
+        )
         status = "failed"
         failure = {
-            "type": "lineage_budget_exceeded",
+            "type": (
+                "provider_api_equivalent_stop_exceeded"
+                if usage_based_overrun
+                else "lineage_budget_exceeded"
+            ),
             "provider": "claude",
             "reported_cost_usd": round(float(claude_cost), 6),
-            "protected_reservation_usd": round(float(reserved_for_run), 6),
+            "protected_reservation_usd": round(float(protected_limit), 6),
             "message": (
-                "Provider-reported cost exceeded the protected lineage "
-                "reservation; this run cannot produce a passing gate."
+                "Provider-reported API-price equivalent exceeded the protected "
+                + (
+                    "per-call emergency stop plus safety reserve"
+                    if usage_based_overrun
+                    else "legacy lineage reservation"
+                )
+                + "; this run cannot produce a passing gate."
             ),
         }
         if "claude" not in failed_reviewers:
@@ -6417,10 +7360,19 @@ def persist_review_results(
 
 def reviewer_failure_guidance(run_dir: Path, metadata: dict[str, Any]) -> str:
     failure = metadata.get("failure")
-    if isinstance(failure, dict) and failure.get("type") == "lineage_budget_exceeded":
+    if isinstance(failure, dict) and failure.get("type") in {
+        "lineage_budget_exceeded",
+        "provider_api_equivalent_stop_exceeded",
+    }:
+        usage_stop = failure.get("type") == "provider_api_equivalent_stop_exceeded"
         return (
-            "Claude's reported cost exceeded the protected lineage budget "
-            "reservation, so this run failed closed and cannot be resumed. "
+            "Claude's reported API-price equivalent exceeded the protected "
+            + (
+                "per-call emergency stop safety reserve"
+                if usage_stop
+                else "legacy lineage allowance reservation"
+            )
+            + ", so this run failed closed and cannot be resumed. "
             "Other successful reports remain audit evidence. Start a fresh "
             "review round only if the unchanged workflow's remaining budget "
             f"guard permits it; inspect {run_dir}."
@@ -6564,8 +7516,11 @@ def resume_review_locked(
                 str(selected_budget),
             ]
         )
-        resume_policy["claude_effort"] = selected_effort
-        resume_policy["claude_max_budget_usd"] = selected_budget
+        resume_policy = updated_claude_resume_policy(
+            resume_policy,
+            effort=selected_effort,
+            api_equivalent_limit_usd=selected_budget,
+        )
     antigravity = reviewer_metadata.get("antigravity")
     if "antigravity" in failed_names and isinstance(antigravity, dict):
         command.extend(
@@ -6594,6 +7549,23 @@ def resume_review_locked(
             budget_estimates, "claude"
         ),
     )
+    selected_names = {reviewer.name for reviewer in reviewers}
+    skipped_names = [name for name in failed_names if name not in selected_names]
+    if skipped_names:
+        release_workflow_budget_reservation(
+            str(metadata["workflow_id"]), str(metadata["run_id"])
+        )
+        skipped = budget.get("skipped_providers") if isinstance(budget, dict) else {}
+        skipped = skipped if isinstance(skipped, dict) else {}
+        detail = "; ".join(
+            f"{name}: {skipped.get(name, 'provider is unavailable')}"
+            for name in skipped_names
+        )
+        raise ReviewError(
+            "Cannot resume all failed reviewers because some were not eligible "
+            f"for another provider attempt: {detail}. Wait for quota reset or "
+            "use `mm-review continue <workflow-id>` to inspect the safe next action."
+        )
 
     snapshot_dir = run_dir / "snapshot"
     try:
@@ -6646,7 +7618,18 @@ def resume_review_locked(
                 "resumed_at": utc_now(),
                 "heartbeat_at": utc_now(),
                 "runner_pid": os.getpid(),
-                "workflow_budget": budget,
+                "workflow_usage": (
+                    budget
+                    if isinstance(budget, dict)
+                    and budget.get("mode") == "provider_allowance"
+                    else None
+                ),
+                "workflow_budget": (
+                    budget
+                    if not isinstance(budget, dict)
+                    or budget.get("mode") != "provider_allowance"
+                    else None
+                ),
                 "budget_estimates": budget_estimates,
                 "review_policy": resume_policy,
                 "resumed_reviewers": failed_names,
@@ -6801,17 +7784,31 @@ def run_review_command(args: argparse.Namespace) -> int:
         workflow_document = require_active_workflow(selected_workflow)
     else:
         workflow_budget = float(config["workflow"]["max_budget_usd"])
+        workflow_usage_policy_value: dict[str, Any] | None = None
         if supplemental_parent:
             parent_workflow_id = str(
                 supplemental_parent[1].get("workflow_id") or ""
             )
+            workflow_usage_policy_value = workflow_usage_policy(parent_workflow_id)
             parent_budget = workflow_budget_limit(parent_workflow_id)
-            if parent_budget is None:
+            if parent_budget is None and workflow_usage_policy_value is None:
                 raise ReviewError(
                     "Supplemental review requires a parent workflow with a "
-                    "valid cumulative budget."
+                    "valid provider-usage policy."
                 )
-            workflow_budget = parent_budget
+            if parent_budget is not None:
+                workflow_budget = parent_budget
+            elif workflow_path(parent_workflow_id).exists():
+                parent_policy = read_json(workflow_path(parent_workflow_id)).get(
+                    "policy"
+                )
+                raw_equivalent = (
+                    parent_policy.get("max_budget_usd")
+                    if isinstance(parent_policy, dict)
+                    else None
+                )
+                if isinstance(raw_equivalent, (int, float)):
+                    workflow_budget = float(raw_equivalent)
         create_workflow(
             selected_workflow,
             max_budget_usd=workflow_budget,
@@ -6826,6 +7823,20 @@ def run_review_command(args: argparse.Namespace) -> int:
                 str(supplemental_parent[1].get("workflow_id") or "")
                 if supplemental_parent
                 else None
+            ),
+            usage_based=(
+                supplemental_parent is None
+                or workflow_usage_policy_value is not None
+            ),
+            max_provider_attempts=int(
+                workflow_usage_policy_value.get("max_attempts_per_provider", 6)
+                if workflow_usage_policy_value
+                else config["workflow"]["max_provider_attempts"]
+            ),
+            provider_use_policy=str(
+                workflow_usage_policy_value.get("provider_use", "explicit")
+                if workflow_usage_policy_value
+                else config["workflow"]["provider_use_policy"]
             ),
         )
         workflow_document = require_active_workflow(selected_workflow)
@@ -7154,13 +8165,31 @@ def run_review_command(args: argparse.Namespace) -> int:
                         if args.claude_max_budget_usd is not None
                         else config["claude"].get("max_budget_usd", 1.25)
                     ),
+                    "claude_api_equivalent_limit_usd": (
+                        args.claude_max_budget_usd
+                        if args.claude_max_budget_usd is not None
+                        else config["claude"].get("max_budget_usd", 1.25)
+                    ),
+                    "api_equivalent_usd_is_billing": False,
                 },
-                "workflow_budget": workflow_budget,
+                "workflow_usage": (
+                    workflow_budget
+                    if isinstance(workflow_budget, dict)
+                    and workflow_budget.get("mode") == "provider_allowance"
+                    else None
+                ),
+                "workflow_budget": (
+                    workflow_budget
+                    if not isinstance(workflow_budget, dict)
+                    or workflow_budget.get("mode") != "provider_allowance"
+                    else None
+                ),
                 "budget_estimates": budget_estimates,
                 "reviewers": {
                     reviewer.name: {
                         "model": reviewer.model,
                         "cli_version": reviewer.cli_version,
+                        **reviewer_resource_metadata(reviewer),
                     }
                     for reviewer in reviewers
                 },
@@ -7175,7 +8204,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             if recommendation is None:
                 continue
             message = (
-                f"Budget evidence: {provider} configured "
+                f"API-equivalent evidence: {provider} configured "
                 f"${float(estimate['configured_budget_usd']):.2f}; "
                 f"historical p90=${float(estimate['cost_distribution_usd']['p90']):.2f}; "
                 f"recommended=${float(recommendation):.2f}; "
@@ -7184,7 +8213,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             print(message, flush=True)
             if estimate["configured_below_recommendation"]:
                 print(
-                    "Budget warning: the configured cap is below the historical "
+                    "Usage-stop warning: the configured cap is below the historical "
                     "recommendation. No effort, budget, or provider setting was "
                     "changed automatically.",
                     flush=True,
@@ -7398,15 +8427,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     set_effort.add_argument("effort", choices=sorted(CLAUDE_EFFORTS))
     set_budget = subparsers.add_parser(
-        "set-budget", help="Set Claude's per-review maximum budget in USD"
+        "set-budget",
+        help=(
+            "Deprecated alias: set Claude's per-review API-equivalent "
+            "emergency stop"
+        ),
     )
     set_budget.add_argument("usd", type=float)
+    set_usage_limit = subparsers.add_parser(
+        "set-claude-usage-limit",
+        help=(
+            "Set Claude's per-review API-equivalent emergency stop; this does "
+            "not imply subscription billing"
+        ),
+    )
+    set_usage_limit.add_argument("usd", type=float)
     set_workflow_budget = subparsers.add_parser(
-        "set-workflow-budget", help="Set the default cumulative task-lineage budget"
+        "set-workflow-budget",
+        help="Deprecated: set the legacy cumulative API-equivalent cap",
     )
     set_workflow_budget.add_argument("usd", type=float)
+    set_provider_attempt_limit = subparsers.add_parser(
+        "set-provider-attempt-limit",
+        help="Set the default per-provider attempt ceiling for a workflow lineage",
+    )
+    set_provider_attempt_limit.add_argument("attempts", type=int)
+    set_provider_use_policy = subparsers.add_parser(
+        "set-provider-use-policy",
+        help="Choose whether continuation requires explicit provider execution",
+    )
+    set_provider_use_policy.add_argument(
+        "policy", choices=sorted(PROVIDER_USE_POLICIES)
+    )
     analytics = subparsers.add_parser(
-        "analytics", help="Summarize recent review outcomes, failures, and spend"
+        "analytics",
+        help="Summarize review outcomes, provider usage, failures, and closure",
     )
     analytics.add_argument(
         "--since-days", type=int, default=DEFAULT_ANALYTICS_DAYS
@@ -7488,6 +8543,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format; compact links matches while JSON keeps complete evidence",
     )
 
+    continuation = subparsers.add_parser(
+        "continue",
+        help=(
+            "Inspect a workflow and perform its next provider-review step only "
+            "when explicitly authorized or configured for automatic use"
+        ),
+    )
+    continuation.add_argument("workflow_id")
+    continuation.add_argument(
+        "--execute-review",
+        action="store_true",
+        help="Consume available provider allowance for the next review step",
+    )
+    continuation.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "compact"),
+        default="json",
+    )
+
+    gate = subparsers.add_parser(
+        "gate",
+        help=(
+            "Consolidate Codex finalization, verification, optional commit "
+            "attestation, and workflow closure"
+        ),
+    )
+    gate.add_argument("workflow_id")
+    gate.add_argument(
+        "--execute-review",
+        action="store_true",
+        help="Run a missing repair, confirmation, or partial resume first",
+    )
+    gate.add_argument("--codex-verdict", choices=GATE_STATUSES)
+    gate.add_argument("--codex-review")
+    gate.add_argument("--verification", action="append", default=[])
+    gate.add_argument("--coverage-verification", action="append", default=[])
+    gate.add_argument(
+        "--attest-commit",
+        action="store_true",
+        help="Attest each finalized repository run to its checked-out HEAD",
+    )
+    gate.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "compact"),
+        default="json",
+    )
+
     workflow = subparsers.add_parser(
         "workflow", help="Manage a review workflow spanning one or more repositories"
     )
@@ -7498,7 +8602,24 @@ def build_parser() -> argparse.ArgumentParser:
         "start", help="Create and print a workflow ID"
     )
     workflow_start.add_argument("--name", help="Optional human-readable task name")
-    workflow_start.add_argument("--max-budget-usd", type=float)
+    workflow_start.add_argument(
+        "--max-budget-usd",
+        type=float,
+        help=(
+            "Deprecated compatibility mode: create a legacy lineage with the "
+            "old API-equivalent cap; omit for provider-usage behavior"
+        ),
+    )
+    workflow_start.add_argument(
+        "--max-provider-attempts",
+        type=int,
+        help="Per-provider attempt ceiling across this workflow lineage",
+    )
+    workflow_start.add_argument(
+        "--provider-use-policy",
+        choices=sorted(PROVIDER_USE_POLICIES),
+        help="Override explicit versus automatic provider execution",
+    )
     workflow_start.add_argument(
         "--review-mode",
         choices=sorted(REVIEW_MODES),
@@ -7824,10 +8945,14 @@ def main() -> int:
             return set_model_command(args)
         if args.command == "set-effort":
             return set_effort_command(args)
-        if args.command == "set-budget":
+        if args.command in {"set-budget", "set-claude-usage-limit"}:
             return set_budget_command(args)
         if args.command == "set-workflow-budget":
             return set_workflow_budget_command(args)
+        if args.command == "set-provider-attempt-limit":
+            return set_provider_attempt_limit_command(args)
+        if args.command == "set-provider-use-policy":
+            return set_provider_use_policy_command(args)
         if args.command == "analytics":
             return analytics_command(args)
         if args.command == "budget-estimate":
@@ -7844,6 +8969,14 @@ def main() -> int:
             return budget_estimate_command(args)
         if args.command == "recommend":
             return recommend_mode_command(args)
+        if args.command == "continue":
+            return continue_command(args)
+        if args.command == "gate":
+            if args.codex_review and len(args.codex_review) > MAX_NOTE_CHARS:
+                raise ReviewError(
+                    f"--codex-review must be at most {MAX_NOTE_CHARS} characters."
+                )
+            return gate_command(args)
         if args.command == "memory":
             if args.memory_command == "status":
                 return memory_status_command(args)

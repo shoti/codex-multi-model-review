@@ -1,7 +1,7 @@
 {
   "name": "multi-model-review",
-  "version": "0.1.0+codex.20260810183732",
-  "description": "Run resumable task-scoped reviews with cumulative budgets, locked Codex triage, mandatory confirmation, and fresh final gates.",
+  "version": "0.1.0+codex.20260810211947",
+  "description": "Run resumable task-scoped reviews with provider-allowance controls, locked Codex triage, mandatory confirmation, and fresh final gates.",
   "author": {
     "name": "Shoti",
     "url": "https://github.com/shoti"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Multi-Model Review",
     "shortDescription": "Auditable multi-model review",
-    "longDescription": "Codex implements and verifies. Structured Claude, optional Antigravity, and optional Kimi inspect immutable repository snapshots in read-only sessions. Workflows enforce cumulative budgets, preserve and resume partial results, pin task scope, record typed failures and evidence-backed triage, require confirmation, and verify commit-aware freshness.",
+    "longDescription": "Codex implements and verifies. Structured Claude, optional Antigravity, and optional Kimi inspect immutable repository snapshots in read-only sessions. Workflows use provider-allowance and readiness controls, preserve and resume partial results, pin task scope, record typed failures and evidence-backed triage, require confirmation, and verify commit-aware freshness.",
     "developerName": "Shoti",
     "category": "Developer Tools",
     "capabilities": [
@@ -30,7 +30,7 @@
       "Freshness-checked final gates"
     ],
     "defaultPrompt": [
-      "Review my task-scoped changes with a cumulative Claude budget, decide every finding and test gap, then complete a mandatory confirmation gate.",
+      "Review my task-scoped changes with provider-allowance controls, decide every finding and test gap, then complete a mandatory confirmation gate.",
       "Run an independent Claude review with locked triage and verify the resulting commit.",
       "Do a usage-audited multi-repository final review before merge."
     ]

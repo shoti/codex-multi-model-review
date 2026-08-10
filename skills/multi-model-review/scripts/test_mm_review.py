@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import io
 import json
@@ -153,6 +154,21 @@ class RunnerUnitTests(unittest.TestCase):
                 selected_budget=0.75,
             )
         )
+
+    def test_claude_resume_policy_updates_canonical_api_equivalent_stop(self) -> None:
+        updated = MM.updated_claude_resume_policy(
+            {
+                "claude_effort": "medium",
+                "claude_max_budget_usd": 1.25,
+                "claude_api_equivalent_limit_usd": 1.25,
+            },
+            effort="low",
+            api_equivalent_limit_usd=1.75,
+        )
+        self.assertEqual(updated["claude_effort"], "low")
+        self.assertEqual(updated["claude_max_budget_usd"], 1.75)
+        self.assertEqual(updated["claude_api_equivalent_limit_usd"], 1.75)
+        self.assertFalse(updated["api_equivalent_usd_is_billing"])
 
     def test_non_finite_budget_is_rejected_from_config_and_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -621,6 +637,579 @@ class RunnerUnitTests(unittest.TestCase):
                 self.assertIsNone(
                     MM.workflow_phase_effort("wf-legacy", "repair")
                 )
+
+    def test_new_workflow_uses_provider_allowance_not_lineage_dollars(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
+            args = MM.build_parser().parse_args(
+                [
+                    "workflow",
+                    "start",
+                    "--name",
+                    "usage-aware",
+                    "--max-provider-attempts",
+                    "4",
+                ]
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "load_config", return_value=config),
+                redirect_stdout(output),
+            ):
+                MM.workflow_start_command(args)
+                identifier = output.getvalue().strip()
+                document = MM.read_json(workflows / f"{identifier}.json")
+                self.assertIsNone(MM.workflow_budget_limit(identifier))
+        usage_policy = document["policy"]["usage_policy"]
+        self.assertEqual(usage_policy["mode"], "provider_allowance")
+        self.assertEqual(usage_policy["max_attempts_per_provider"], 4)
+        self.assertFalse(document["policy"]["enforce_lineage_api_equivalent_cap"])
+        self.assertNotIn("max_budget_usd", document["policy"])
+
+    def test_claude_authentication_mode_distinguishes_subscription_and_api(self) -> None:
+        subscription = subprocess.CompletedProcess(
+            ["claude", "auth", "status"],
+            0,
+            stdout='{"loggedIn":true,"authMethod":"oauth","subscriptionType":"max"}',
+            stderr="",
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(MM.subprocess, "run", return_value=subscription),
+        ):
+            self.assertEqual(MM.claude_authentication_mode()[0], "subscription")
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "redacted"}, clear=True):
+            self.assertEqual(MM.claude_authentication_mode()[0], "api_billed")
+
+    def test_claude_authentication_mode_fails_closed_to_unknown(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(MM.subprocess, "run", side_effect=OSError("missing")),
+        ):
+            self.assertEqual(MM.claude_authentication_mode()[0], "unknown")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(
+                MM.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(["claude"], 10),
+            ),
+        ):
+            self.assertEqual(MM.claude_authentication_mode()[0], "unknown")
+        invalid = subprocess.CompletedProcess(
+            ["claude", "auth", "status"],
+            0,
+            stdout="authenticated but format changed",
+            stderr="",
+        )
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(MM.subprocess, "run", return_value=invalid),
+        ):
+            self.assertEqual(MM.claude_authentication_mode()[0], "unknown")
+
+    def test_non_probed_claude_usage_does_not_assume_subscription(self) -> None:
+        config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
+        config["claude"]["enabled"] = True
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(MM, "load_config", return_value=config),
+            mock.patch.object(
+                MM,
+                "workflow_provider_attempts",
+                return_value={provider: 0 for provider in MM.PROVIDERS},
+            ),
+            mock.patch.object(MM, "workflow_usage_policy", return_value={}),
+            mock.patch.object(MM, "active_provider_cooldown", return_value=None),
+        ):
+            usage = MM.provider_usage_snapshot(
+                "wf-test", probe_readiness=False
+            )
+        claude = usage["providers"]["claude"]
+        self.assertEqual(claude["authentication_mode"], "unknown")
+        self.assertEqual(claude["usage_resource"], "unknown")
+
+    def test_provider_usage_policy_skips_exhausted_provider(self) -> None:
+        claude = MM.Reviewer(
+            "claude", ("claude", "--max-budget-usd", "1.25"), {}, "sonnet", "fake"
+        )
+        kimi = MM.Reviewer("kimi", ("kimi",), {}, "k3", "fake")
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(
+                    MM,
+                    "workflow_provider_attempts",
+                    return_value={"claude": 2, "antigravity": 0, "kimi": 0},
+                ),
+            ):
+                MM.create_workflow(
+                    "wf-usage",
+                    usage_based=True,
+                    max_provider_attempts=2,
+                )
+                selected, usage = MM.apply_workflow_budget(
+                    [claude, kimi], "wf-usage", reservation_id="run-1"
+                )
+                document = MM.read_json(workflows / "wf-usage.json")
+        self.assertEqual([reviewer.name for reviewer in selected], ["kimi"])
+        self.assertIn("claude", usage["skipped_providers"])
+        self.assertEqual(
+            document["usage_reservations"]["run-1"]["providers"], ["kimi"]
+        )
+
+    def test_provider_usage_policy_fails_when_every_provider_is_exhausted(self) -> None:
+        reviewers = [
+            MM.Reviewer("claude", ("claude",), {}, "sonnet", "fake"),
+            MM.Reviewer("kimi", ("kimi",), {}, "k3", "fake"),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(
+                    MM,
+                    "workflow_provider_attempts",
+                    return_value={provider: 2 for provider in MM.PROVIDERS},
+                ),
+                mock.patch.object(MM, "active_provider_cooldown", return_value=None),
+            ):
+                MM.create_workflow(
+                    "wf-exhausted",
+                    usage_based=True,
+                    max_provider_attempts=2,
+                )
+                with self.assertRaisesRegex(
+                    MM.ReviewError, "provider-attempt allowance exhausted"
+                ):
+                    MM.apply_workflow_budget(
+                        reviewers, "wf-exhausted", reservation_id="run-1"
+                    )
+                document = MM.read_json(workflows / "wf-exhausted.json")
+        self.assertNotIn("usage_reservations", document)
+
+    def test_continue_zero_run_is_read_only_and_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary) / "workflows"
+            runs = Path(temporary) / "runs"
+            config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
+            config["claude"]["enabled"] = False
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "RUNS_DIR", runs),
+                mock.patch.object(MM, "load_config", return_value=config),
+            ):
+                MM.create_workflow("wf-empty", usage_based=True)
+                plan = MM.workflow_continue_plan("wf-empty")
+        self.assertEqual(plan["next"], "NEEDS_INITIAL_REVIEW")
+        self.assertFalse(plan["actions"][0]["automatable"])
+        self.assertIn("mm-review run", plan["actions"][0]["command"])
+
+    def test_continue_and_gate_surface_real_partial_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflows = root / "workflows"
+            runs = root / "runs"
+            run_dir = runs / "repo-1" / "run-1"
+            run_dir.mkdir(parents=True)
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "RUNS_DIR", runs),
+            ):
+                MM.create_workflow("wf-partial", usage_based=True)
+                MM.safe_write_json(
+                    run_dir / "metadata.json",
+                    {
+                        "schema_version": 10,
+                        "workflow_id": "wf-partial",
+                        "run_id": "run-partial",
+                        "status": "partial",
+                        "round": 1,
+                        "phase": "repair",
+                        "created_at": MM.utc_now(),
+                        "repository": {
+                            "id": "repo-1",
+                            "name": "partial-repo",
+                            "root": str(root / "repo"),
+                        },
+                        "reviewers": {"claude": {"exit_code": 1}},
+                        "failure": {
+                            "type": "reviewer_failure",
+                            "reviewers": ["claude"],
+                        },
+                    },
+                )
+                usage = {
+                    "providers": {
+                        "claude": {
+                            "enabled": True,
+                            "ready": True,
+                            "attempts_remaining": 2,
+                        }
+                    }
+                }
+                with mock.patch.object(
+                    MM, "provider_usage_snapshot", return_value=usage
+                ):
+                    plan = MM.workflow_continue_plan(
+                        "wf-partial", probe_usage=True
+                    )
+                    args = MM.build_parser().parse_args(
+                        ["gate", "wf-partial"]
+                    )
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        result = MM.gate_command(args)
+        self.assertEqual(plan["next"], "NEEDS_REVIEW")
+        self.assertEqual(plan["actions"][0]["type"], "resume")
+        self.assertEqual(plan["actions"][0]["run_dir"], str(run_dir))
+        self.assertEqual(result, 3)
+        gate = json.loads(output.getvalue())
+        self.assertEqual(gate["gate"], "INCOMPLETE")
+        self.assertEqual(gate["next"], "NEEDS_REVIEW")
+
+    def test_continue_requires_execution_authority_by_default(self) -> None:
+        plan = {
+            "workflow_id": "wf-test",
+            "state": "active",
+            "next": "NEEDS_REVIEW",
+            "actions": [
+                {
+                    "type": "review",
+                    "automatable": True,
+                    "command": "mm-review run --workflow-id wf-test",
+                }
+            ],
+        }
+        args = MM.build_parser().parse_args(["continue", "wf-test"])
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                MM, "workflow_continue_plan", return_value=plan
+            ) as continue_plan,
+            mock.patch.object(
+                MM,
+                "workflow_usage_policy",
+                return_value={"provider_use": "explicit"},
+            ),
+            mock.patch.object(MM, "_execute_continue_action") as execute,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(MM.continue_command(args), 3)
+        execute.assert_not_called()
+        continue_plan.assert_called_once_with("wf-test", probe_usage=True)
+        self.assertEqual(json.loads(output.getvalue())["next"], "NEEDS_REVIEW")
+
+    def test_continue_auto_policy_executes_one_review_step(self) -> None:
+        before = {
+            "workflow_id": "wf-test",
+            "state": "active",
+            "next": "NEEDS_REVIEW",
+            "actions": [
+                {
+                    "type": "review",
+                    "automatable": True,
+                    "command": "mm-review run --workflow-id wf-test",
+                }
+            ],
+        }
+        after = {
+            "workflow_id": "wf-test",
+            "state": "active",
+            "next": "NEEDS_TRIAGE",
+            "actions": [],
+        }
+        args = MM.build_parser().parse_args(["continue", "wf-test"])
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                MM, "workflow_continue_plan", side_effect=[before, after]
+            ) as continue_plan,
+            mock.patch.object(
+                MM,
+                "workflow_usage_policy",
+                return_value={"provider_use": "auto"},
+            ),
+            mock.patch.object(
+                MM, "_execute_continue_action", return_value="review ran"
+            ) as execute,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(MM.continue_command(args), 3)
+        execute.assert_called_once()
+        self.assertEqual(
+            continue_plan.call_args_list,
+            [
+                mock.call("wf-test", probe_usage=True),
+                mock.call("wf-test", probe_usage=True),
+            ],
+        )
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["next"], "NEEDS_TRIAGE")
+        self.assertEqual(payload["execution_log"], ["review ran"])
+
+    def test_execute_continue_action_selects_only_ready_providers(self) -> None:
+        action = {
+            "type": "review",
+            "command": (
+                "mm-review run --repo /tmp/repo --workflow-id wf-test "
+                "--phase confirmation --reuse-contract"
+            ),
+        }
+        usage = {
+            "providers": {
+                "claude": {
+                    "enabled": True,
+                    "ready": True,
+                    "attempts_remaining": 2,
+                },
+                "antigravity": {
+                    "enabled": False,
+                    "ready": False,
+                    "attempts_remaining": 2,
+                },
+                "kimi": {
+                    "enabled": True,
+                    "ready": True,
+                    "attempts_remaining": 0,
+                },
+            }
+        }
+        captured: list[argparse.Namespace] = []
+
+        def run_review(args: argparse.Namespace) -> int:
+            captured.append(args)
+            print("review executed")
+            return 0
+
+        with (
+            mock.patch.object(
+                MM, "provider_usage_snapshot", return_value=usage
+            ) as snapshot,
+            mock.patch.object(MM, "run_review_command", side_effect=run_review),
+        ):
+            output = MM._execute_continue_action("wf-test", action)
+        snapshot.assert_called_once_with("wf-test", probe_readiness=True)
+        self.assertEqual(output, "review executed")
+        self.assertEqual(len(captured), 1)
+        args = captured[0]
+        self.assertTrue(args.with_claude)
+        self.assertFalse(args.with_antigravity)
+        self.assertFalse(args.with_kimi)
+        self.assertTrue(args.without_antigravity)
+        self.assertTrue(args.without_kimi)
+        self.assertTrue(args.reuse_contract)
+        self.assertEqual(args.phase, "confirmation")
+
+    def test_gate_reports_manual_blocker_without_mutating(self) -> None:
+        plan = {
+            "workflow_id": "wf-test",
+            "state": "active",
+            "next": "NEEDS_TRIAGE",
+            "actions": [{"type": "triage", "automatable": False}],
+        }
+        args = MM.build_parser().parse_args(["gate", "wf-test"])
+        output = io.StringIO()
+        with (
+            mock.patch.object(MM, "workflow_continue_plan", return_value=plan),
+            mock.patch.object(MM, "latest_workflow_runs", return_value=[]),
+            mock.patch.object(MM, "workflow_finalize_command") as finalize,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(MM.gate_command(args), 3)
+        finalize.assert_not_called()
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["gate"], "INCOMPLETE")
+        self.assertEqual(payload["next"], "NEEDS_TRIAGE")
+
+    def test_gate_rejects_one_verdict_for_multiple_pending_finals(self) -> None:
+        actions = [
+            {
+                "type": "codex_final",
+                "run_dir": f"/tmp/repository-{index}",
+                "automatable": False,
+            }
+            for index in (1, 2)
+        ]
+        plan = {
+            "workflow_id": "wf-test",
+            "state": "active",
+            "next": "NEEDS_CODEX_FINAL",
+            "actions": actions,
+        }
+        args = MM.build_parser().parse_args(
+            [
+                "gate",
+                "wf-test",
+                "--codex-verdict",
+                "PASS_CLEAN",
+                "--codex-review",
+                "reviewed",
+            ]
+        )
+        with (
+            mock.patch.object(MM, "workflow_continue_plan", return_value=plan),
+            mock.patch.object(MM, "finalize_command") as finalize,
+        ):
+            with self.assertRaisesRegex(
+                MM.ReviewError, "Multiple repositories are awaiting"
+            ):
+                MM.gate_command(args)
+        finalize.assert_not_called()
+
+    def test_gate_skips_commit_attestation_for_supplemental_evidence(self) -> None:
+        ready = {
+            "workflow_id": "wf-test",
+            "state": "ready_to_finalize",
+            "next": "READY_TO_GATE",
+            "actions": [],
+        }
+        complete = {
+            "workflow_id": "wf-test",
+            "state": "completed",
+            "next": "COMPLETE",
+            "actions": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflows = root / "workflows"
+            run_dir = root / "run"
+            run_dir.mkdir()
+            MM.safe_write_json(
+                run_dir / "supplemental.json",
+                {"status": "SUPPLEMENTAL_CLEAN"},
+            )
+            MM.safe_write_json(
+                workflows / "wf-test.json",
+                {"workflow_id": "wf-test", "status": "completed"},
+            )
+            args = MM.build_parser().parse_args(
+                ["gate", "wf-test", "--attest-commit"]
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(
+                    MM, "workflow_continue_plan", side_effect=[ready, complete]
+                ),
+                mock.patch.object(
+                    MM,
+                    "latest_workflow_runs",
+                    return_value=[(run_dir, {"phase": "supplemental"})],
+                ),
+                mock.patch.object(MM, "attest_commit_command") as attest,
+                mock.patch.object(MM, "verify_command", return_value=0),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(MM.gate_command(args), 0)
+        attest.assert_not_called()
+        payload = json.loads(output.getvalue())
+        self.assertIn(
+            "attestation skipped",
+            " ".join(payload["execution_log"]).lower(),
+        )
+
+    def test_gate_success_finalizes_verifies_attests_and_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflows = root / "workflows"
+            run_dir = root / "confirmation"
+            run_dir.mkdir()
+            MM.safe_write_json(
+                workflows / "wf-test.json",
+                {"workflow_id": "wf-test", "status": "active"},
+            )
+            initial = {
+                "workflow_id": "wf-test",
+                "state": "confirmation_required",
+                "next": "NEEDS_CODEX_FINAL",
+                "actions": [
+                    {
+                        "type": "codex_final",
+                        "run_dir": str(run_dir),
+                        "automatable": False,
+                    }
+                ],
+            }
+            ready = {
+                "workflow_id": "wf-test",
+                "state": "ready_to_finalize",
+                "next": "READY_TO_GATE",
+                "actions": [],
+            }
+            complete = {
+                "workflow_id": "wf-test",
+                "state": "completed",
+                "next": "COMPLETE",
+                "actions": [],
+            }
+            events: list[str] = []
+
+            def finalize(args: argparse.Namespace) -> int:
+                events.append("finalize")
+                self.assertEqual(args.codex_verdict, "PASS_CLEAN")
+                self.assertEqual(args.verification, ["131 tests passed"])
+                MM.safe_write_json(
+                    run_dir / "final.json", {"status": "PASS_CLEAN"}
+                )
+                return 0
+
+            def attest(_args: argparse.Namespace) -> int:
+                events.append("attest")
+                return 0
+
+            def verify(_args: argparse.Namespace) -> int:
+                events.append("verify")
+                return 0
+
+            def close(_args: argparse.Namespace) -> int:
+                events.append("close")
+                return 0
+
+            args = MM.build_parser().parse_args(
+                [
+                    "gate",
+                    "wf-test",
+                    "--codex-verdict",
+                    "PASS_CLEAN",
+                    "--codex-review",
+                    "All evidence checked.",
+                    "--verification",
+                    "131 tests passed",
+                    "--attest-commit",
+                ]
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(
+                    MM,
+                    "workflow_continue_plan",
+                    side_effect=[initial, ready, complete],
+                ),
+                mock.patch.object(
+                    MM,
+                    "latest_workflow_runs",
+                    return_value=[(run_dir, {"phase": "confirmation"})],
+                ),
+                mock.patch.object(MM, "finalize_command", side_effect=finalize),
+                mock.patch.object(
+                    MM, "attest_commit_command", side_effect=attest
+                ),
+                mock.patch.object(MM, "verify_command", side_effect=verify),
+                mock.patch.object(
+                    MM, "workflow_finalize_command", side_effect=close
+                ),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(MM.gate_command(args), 0)
+        self.assertEqual(events, ["finalize", "attest", "verify", "close"])
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["gate"], "PASS")
+        self.assertEqual(payload["next"], "COMPLETE")
 
     def test_initial_commit_is_equivalent_to_reviewed_unborn_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3007,6 +3596,71 @@ None.
         self.assertIn("cannot be resumed", guidance)
         self.assertIn("fresh review round", guidance)
 
+    def test_provider_cost_beyond_usage_stop_reserve_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            report = run_dir / "claude.md"
+            error = run_dir / "claude.stderr.log"
+            report.write_text(
+                "# Verdict\nPASS_CLEAN\n\n# Findings\nNone.\n\n"
+                "# Test gaps\nNone.\n\n# Coverage\n- Complete: yes\n"
+                "- Unreviewed changed paths: []\n- Limitations: []\n\n"
+                "# Notes\nNone.\n",
+                encoding="utf-8",
+            )
+            error.write_text("", encoding="utf-8")
+            now = MM.utc_now()
+            metadata = {
+                "run_id": "run-usage-overrun",
+                "workflow_id": "wf-usage-overrun",
+                "repository": {"id": "repo-1"},
+                "created_at": now,
+                "started_at": now,
+                "risks": [],
+                "workflow_usage": {"mode": "provider_allowance"},
+                "workflow_budget": None,
+                "review_policy": {
+                    "claude_api_equivalent_limit_usd": 1.25,
+                    "api_equivalent_usd_is_billing": False,
+                },
+            }
+            reviewer = MM.Reviewer(
+                "claude", ("claude",), {}, "sonnet", "fake"
+            )
+            result = MM.ReviewResult(
+                "claude",
+                0,
+                report,
+                error,
+                now,
+                now,
+                0.1,
+                False,
+                {"total_cost_usd": 1.40},
+                None,
+            )
+            with mock.patch.object(MM, "workflow_lineage_runs", return_value=[]):
+                failures, invalid = MM.persist_review_results(
+                    run_dir=run_dir,
+                    metadata=metadata,
+                    reviewers=[reviewer],
+                    results=[result],
+                )
+            persisted = MM.read_json(run_dir / "metadata.json")
+            guidance = MM.reviewer_failure_guidance(run_dir, persisted)
+        self.assertEqual(failures, ["claude"])
+        self.assertEqual(invalid, [])
+        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(
+            persisted["failure"]["type"],
+            "provider_api_equivalent_stop_exceeded",
+        )
+        self.assertAlmostEqual(
+            persisted["failure"]["protected_reservation_usd"], 1.375
+        )
+        self.assertIn("per-call emergency stop", guidance)
+        self.assertNotIn("mm-review resume", guidance)
+
     def test_workflow_supersede_links_both_documents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workflows = Path(temporary)
@@ -3070,6 +3724,42 @@ None.
                     MM.workflow_supersede_command(args)
                 old = MM.read_json(workflows / "wf-old.json")
                 replacement = MM.read_json(workflows / "wf-large.json")
+        self.assertNotIn("superseded_by", old)
+        self.assertEqual(replacement["supersedes"], [])
+
+    def test_workflow_supersede_by_rejects_different_provider_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            with mock.patch.object(MM, "WORKFLOWS_DIR", workflows):
+                MM.create_workflow(
+                    "wf-old",
+                    usage_based=True,
+                    max_provider_attempts=4,
+                    provider_use_policy="explicit",
+                )
+                MM.create_workflow(
+                    "wf-replacement",
+                    usage_based=True,
+                    max_provider_attempts=6,
+                    provider_use_policy="explicit",
+                )
+                args = MM.build_parser().parse_args(
+                    [
+                        "workflow",
+                        "supersede",
+                        "wf-old",
+                        "--by",
+                        "wf-replacement",
+                        "--reason",
+                        "contract changed",
+                    ]
+                )
+                with self.assertRaisesRegex(
+                    MM.ReviewError, "provider-usage policy must exactly match"
+                ):
+                    MM.workflow_supersede_command(args)
+                old = MM.read_json(workflows / "wf-old.json")
+                replacement = MM.read_json(workflows / "wf-replacement.json")
         self.assertNotIn("superseded_by", old)
         self.assertEqual(replacement["supersedes"], [])
 
@@ -3363,6 +4053,175 @@ None.
                 MM.resume_review_locked(
                     run_dir, claude_max_budget_usd=1.25
                 )
+
+    def test_resume_rejects_mixed_exhausted_and_available_reviewers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            repo = root / "repo"
+            run_dir.mkdir()
+            repo.mkdir()
+            (run_dir / "change.patch").write_text("patch", encoding="utf-8")
+            reviewers = {
+                name: {
+                    "exit_code": 1,
+                    "failure_category": "provider_failure",
+                    "model": model,
+                }
+                for name, model in (("claude", "sonnet"), ("kimi", "k3"))
+            }
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "schema_version": 10,
+                    "run_id": "run-mixed",
+                    "status": "partial",
+                    "failure": {
+                        "type": "reviewer_failure",
+                        "reviewers": ["claude", "kimi"],
+                    },
+                    "reviewers": reviewers,
+                    "repository": {"root": str(repo), "id": "repo-1"},
+                    "scope": {
+                        "kind": "uncommitted",
+                        "value": None,
+                        "label": "changes",
+                    },
+                    "path_filters": [],
+                    "paths": ["src/a.py"],
+                    "source_fingerprint": "fingerprint",
+                    "workflow_id": "wf-active",
+                    "review_policy": {},
+                },
+            )
+            selected = MM.Reviewer("kimi", ("kimi",), {}, "k3", "fake")
+            with (
+                mock.patch.object(MM, "require_active_workflow"),
+                mock.patch.object(MM, "resolve_repo", return_value=repo),
+                mock.patch.object(MM, "changed_paths", return_value=["src/a.py"]),
+                mock.patch.object(
+                    MM, "snapshot_overlay_paths", return_value=["src/a.py"]
+                ),
+                mock.patch.object(MM, "fingerprint", return_value="fingerprint"),
+                mock.patch.object(MM, "workflow_runs", return_value=[]),
+                mock.patch.object(
+                    MM,
+                    "reviewer_definitions",
+                    return_value=[
+                        MM.Reviewer(
+                            "claude", ("claude",), {}, "sonnet", "fake"
+                        ),
+                        selected,
+                    ],
+                ),
+                mock.patch.object(MM, "reviewer_budget_estimates", return_value={}),
+                mock.patch.object(
+                    MM, "minimum_viable_reviewer_budget", return_value=0.25
+                ),
+                mock.patch.object(
+                    MM,
+                    "apply_workflow_budget",
+                    return_value=(
+                        [selected],
+                        {
+                            "mode": "provider_allowance",
+                            "skipped_providers": {
+                                "claude": (
+                                    "provider-attempt allowance exhausted (2/2)"
+                                )
+                            },
+                        },
+                    ),
+                ),
+                mock.patch.object(
+                    MM, "release_workflow_budget_reservation"
+                ) as release,
+                mock.patch.object(MM, "invoke_reviewer") as invoke,
+                self.assertRaisesRegex(
+                    MM.ReviewError,
+                    "not eligible for another provider attempt: claude: "
+                    "provider-attempt allowance exhausted",
+                ),
+            ):
+                MM.resume_review_locked(run_dir)
+        release.assert_called_once_with("wf-active", "run-mixed")
+        invoke.assert_not_called()
+
+    def test_resume_failure_releases_provider_usage_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflows = root / "workflows"
+            run_dir = root / "run"
+            repo = root / "repo"
+            run_dir.mkdir()
+            repo.mkdir()
+            (run_dir / "change.patch").write_text("patch", encoding="utf-8")
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "schema_version": 10,
+                    "run_id": "run-reserved",
+                    "status": "failed",
+                    "failure": {
+                        "type": "reviewer_failure",
+                        "reviewers": ["kimi"],
+                    },
+                    "reviewers": {
+                        "kimi": {
+                            "exit_code": 1,
+                            "failure_category": "provider_failure",
+                            "model": "k3",
+                        }
+                    },
+                    "repository": {"root": str(repo), "id": "repo-1"},
+                    "scope": {
+                        "kind": "uncommitted",
+                        "value": None,
+                        "label": "changes",
+                    },
+                    "path_filters": [],
+                    "paths": ["src/a.py"],
+                    "source_fingerprint": "fingerprint",
+                    "workflow_id": "wf-active",
+                    "review_policy": {},
+                },
+            )
+            kimi = MM.Reviewer("kimi", ("kimi",), {}, "k3", "fake")
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "resolve_repo", return_value=repo),
+                mock.patch.object(MM, "changed_paths", return_value=["src/a.py"]),
+                mock.patch.object(
+                    MM, "snapshot_overlay_paths", return_value=["src/a.py"]
+                ),
+                mock.patch.object(MM, "fingerprint", return_value="fingerprint"),
+                mock.patch.object(MM, "workflow_runs", return_value=[]),
+                mock.patch.object(
+                    MM,
+                    "workflow_provider_attempts",
+                    return_value={provider: 0 for provider in MM.PROVIDERS},
+                ),
+                mock.patch.object(MM, "active_provider_cooldown", return_value=None),
+                mock.patch.object(MM, "reviewer_definitions", return_value=[kimi]),
+                mock.patch.object(MM, "reviewer_budget_estimates", return_value={}),
+                mock.patch.object(
+                    MM, "minimum_viable_reviewer_budget", return_value=0.25
+                ),
+                mock.patch.object(
+                    MM,
+                    "create_snapshot",
+                    side_effect=MM.ReviewError("snapshot fingerprint mismatch"),
+                ),
+            ):
+                MM.create_workflow(
+                    "wf-active", usage_based=True, max_provider_attempts=2
+                )
+                with self.assertRaisesRegex(
+                    MM.ReviewError, "snapshot fingerprint mismatch"
+                ):
+                    MM.resume_review_locked(run_dir)
+                workflow = MM.read_json(workflows / "wf-active.json")
+        self.assertEqual(workflow.get("usage_reservations"), {})
 
     def test_concurrent_resume_commands_do_not_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4594,26 +5453,43 @@ None.
         self.assertTrue(result["advisory_only"])
 
     def test_workflow_status_distinguishes_ready_to_finalize_and_completed(self) -> None:
-        run_dir = Path("/private/tmp/finalized-review")
         metadata = {
             "workflow_id": "wf-done",
+            "run_id": "run-done",
             "repository": {"id": "repo-one"},
             "status": "completed",
             "round": 2,
             "phase": "confirmation",
         }
         with tempfile.TemporaryDirectory() as temporary:
-            workflows = Path(temporary)
+            root = Path(temporary)
+            workflows = root / "workflows"
+            run_dir = root / "finalized-review"
+            run_dir.mkdir()
+            workflow_document = {
+                "workflow_id": "wf-done",
+                "supersedes": [],
+                "policy": MM.workflow_policy(),
+            }
+            final_document = {
+                "schema_version": 8,
+                "status": "PASS_CLEAN",
+                "source_fingerprint": "x",
+                "codex_verdict": "PASS_CLEAN",
+                "triage_status": "PASS_CLEAN",
+                "triage_sha256s": {"run-done": "a" * 64},
+            }
             MM.safe_write_json(
                 workflows / "wf-done.json",
-                {
-                    "workflow_id": "wf-done",
-                    "supersedes": [],
-                    "policy": MM.workflow_policy(),
-                },
+                workflow_document,
+            )
+            MM.safe_write_json(run_dir / "final.json", final_document)
+            MM.safe_write_json(
+                run_dir / "triage.json", {"findings": [], "test_gaps": []}
             )
             with (
                 mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "CONFIG_PATH", root / "missing-config.json"),
                 mock.patch.object(MM, "workflow_runs", return_value=[(run_dir, metadata)]),
                 mock.patch.object(
                     MM, "workflow_lineage_runs", return_value=[(run_dir, metadata)]
@@ -4622,8 +5498,6 @@ None.
                     MM, "workflow_lineage_ids", return_value=["wf-done"]
                 ),
                 mock.patch.object(MM, "latest_workflow_runs", return_value=[(run_dir, metadata)]),
-                mock.patch.object(Path, "exists", return_value=True),
-                mock.patch.object(MM, "read_json") as read_json,
                 mock.patch.object(
                     MM,
                     "freshness_status",
@@ -4635,22 +5509,6 @@ None.
                     return_value=MM.empty_artifact_bytes(),
                 ) as artifact_bytes,
             ):
-                workflow_document = {
-                    "workflow_id": "wf-done",
-                    "supersedes": [],
-                    "policy": MM.workflow_policy(),
-                }
-                final_document = {
-                    "schema_version": 8,
-                    "status": "PASS_CLEAN",
-                    "source_fingerprint": "x",
-                    "codex_verdict": "PASS_CLEAN",
-                    "triage_status": "PASS_CLEAN",
-                    "triage_sha256s": {"run-done": "a" * 64},
-                }
-                read_json.side_effect = lambda path: (
-                    final_document if path.name == "final.json" else workflow_document
-                )
                 with mock.patch.object(MM, "final_triage_is_fresh", return_value=True):
                     status, ready = MM.workflow_status("wf-done")
             self.assertTrue(ready)
@@ -5047,7 +5905,7 @@ None.
 
 
 class RunnerEndToEndTests(unittest.TestCase):
-    def test_supplemental_recheck_uses_one_review_and_preserves_parent_gate(self) -> None:
+    def test_supplemental_recheck_preserves_legacy_parent_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             home = root / "home"
@@ -5218,9 +6076,8 @@ class RunnerEndToEndTests(unittest.TestCase):
             supplemental_workflow["supplemental_parent_workflow_id"],
             workflow_identifier,
         )
-        self.assertEqual(
-            supplemental_workflow["policy"]["max_budget_usd"], 0.8
-        )
+        self.assertEqual(supplemental_workflow["policy"]["max_budget_usd"], 0.8)
+        self.assertNotIn("usage_policy", supplemental_workflow["policy"])
 
     def test_commit_run_ignores_unrelated_dirty_paths_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
