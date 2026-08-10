@@ -316,6 +316,7 @@ python3 "$RUNNER" run --repo /path/to/repository \
 
 python3 "$RUNNER" finalize \
   --run <confirmation-run-directory> \
+  --codex-verdict PASS_CLEAN \
   --codex-review "Final diff review found no remaining defect." \
   --verification "Focused tests: passed"
 
@@ -325,6 +326,14 @@ python3 "$RUNNER" workflow finalize <workflow-id>
 
 The explicit scope selector may be omitted. When present, it must resolve to
 the pinned scope; paths, risks, profile, and task cannot be re-specified.
+`--codex-verdict` is required and accepts `PASS_CLEAN`, `PASS_WITH_FINDINGS`,
+or `BLOCK`. The machine gate uses the more conservative result of Codex's
+verdict and the complete triage history for that repository's workflow.
+Deferred items from earlier rounds and superseded task-lineage ancestors remain
+in the final artifact under run-qualified IDs until a later matching decision
+resolves them. Verification also hashes that complete triage set, so a later
+decision change makes the final gate stale instead of silently changing its
+meaning.
 
 ### Supplemental rechecks
 
@@ -337,6 +346,7 @@ python3 "$RUNNER" run \
   --task "Check this unchanged snapshot for the focused concern"
 python3 "$RUNNER" finalize \
   --run <supplemental-run-directory> \
+  --codex-verdict PASS_CLEAN \
   --codex-review "Focused recheck result"
 python3 "$RUNNER" verify --run <supplemental-run-directory>
 ```

@@ -1257,6 +1257,149 @@ None.
             "PASS_CLEAN",
         )
 
+    def test_lineage_deferral_is_carried_until_matching_resolution(self) -> None:
+        ancestor_metadata = {
+            "run_id": "run-ancestor",
+            "workflow_id": "wf-ancestor",
+        }
+        current_metadata = {
+            "run_id": "run-current",
+            "workflow_id": "wf-current",
+        }
+        effective = MM.effective_finalization_items(
+            [
+                (
+                    {
+                        "id": "claude-001",
+                        "kind": "finding",
+                        "title": "Resolved ancestor issue",
+                        "decision": "deferred",
+                    },
+                    Path("/ancestor"),
+                    ancestor_metadata,
+                ),
+                (
+                    {
+                        "id": "claude-002",
+                        "kind": "finding",
+                        "title": "Still deferred ancestor issue",
+                        "decision": "deferred",
+                    },
+                    Path("/ancestor"),
+                    ancestor_metadata,
+                ),
+                (
+                    {
+                        "id": "claude-001",
+                        "kind": "finding",
+                        "title": "Resolved ancestor issue",
+                        "decision": "rejected",
+                    },
+                    Path("/current"),
+                    current_metadata,
+                ),
+            ],
+            "wf-current",
+        )
+        decisions_by_title = {
+            str(item[0]["title"]): item[0]["decision"] for item in effective
+        }
+        self.assertEqual(
+            decisions_by_title,
+            {
+                "Resolved ancestor issue": "rejected",
+                "Still deferred ancestor issue": "deferred",
+            },
+        )
+
+    def test_ambiguous_lineage_deferrals_are_not_silently_resolved(self) -> None:
+        effective = MM.effective_finalization_items(
+            [
+                (
+                    {
+                        "id": "claude-001",
+                        "kind": "finding",
+                        "title": "Shared ancestor issue",
+                        "decision": "deferred",
+                    },
+                    Path("/ancestor-one"),
+                    {"run_id": "run-ancestor-one", "workflow_id": "wf-one"},
+                ),
+                (
+                    {
+                        "id": "claude-002",
+                        "kind": "finding",
+                        "title": "Shared ancestor issue",
+                        "decision": "deferred",
+                    },
+                    Path("/ancestor-two"),
+                    {"run_id": "run-ancestor-two", "workflow_id": "wf-two"},
+                ),
+                (
+                    {
+                        "id": "claude-003",
+                        "kind": "finding",
+                        "title": "Shared ancestor issue",
+                        "decision": "rejected",
+                    },
+                    Path("/current"),
+                    {"run_id": "run-current", "workflow_id": "wf-current"},
+                ),
+            ],
+            "wf-current",
+        )
+
+        self.assertEqual(
+            [(item[2]["run_id"], item[0]["decision"]) for item in effective],
+            [
+                ("run-ancestor-one", "deferred"),
+                ("run-ancestor-two", "deferred"),
+                ("run-current", "rejected"),
+            ],
+        )
+
+    def test_legacy_final_triage_freshness_uses_singular_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            triage_path = run_dir / "triage.json"
+            metadata = {"run_id": "run-legacy"}
+            MM.safe_write_json(triage_path, {"findings": [], "test_gaps": []})
+            final = {
+                "triage_sha256": MM.sha256_text(
+                    triage_path.read_text(encoding="utf-8")
+                )
+            }
+
+            self.assertTrue(MM.final_triage_is_fresh(run_dir, metadata, final))
+
+            MM.safe_write_json(
+                triage_path,
+                {"findings": [{"id": "claude-001"}], "test_gaps": []},
+            )
+            self.assertFalse(MM.final_triage_is_fresh(run_dir, metadata, final))
+
+            triage_path.unlink()
+            self.assertTrue(MM.final_triage_is_fresh(run_dir, metadata, final))
+
+    def test_conservative_gate_preserves_pass_with_findings_both_ways(self) -> None:
+        self.assertEqual(
+            MM.conservative_gate_status("PASS_CLEAN", "PASS_WITH_FINDINGS"),
+            "PASS_WITH_FINDINGS",
+        )
+        self.assertEqual(
+            MM.conservative_gate_status("PASS_WITH_FINDINGS", "PASS_CLEAN"),
+            "PASS_WITH_FINDINGS",
+        )
+        for other_status in ("PASS_CLEAN", "PASS_WITH_FINDINGS"):
+            self.assertEqual(
+                MM.conservative_gate_status("BLOCK", other_status),
+                "BLOCK",
+            )
+            self.assertEqual(
+                MM.conservative_gate_status(other_status, "BLOCK"),
+                "BLOCK",
+            )
+
     def test_antigravity_reviewer_is_headless_read_only_and_model_optional(
         self,
     ) -> None:
@@ -2046,6 +2189,8 @@ None.
                     "finalize",
                     "--run",
                     str(run_dir),
+                    "--codex-verdict",
+                    "PASS_CLEAN",
                     "--codex-review",
                     "No reachable defect found.",
                 ]
@@ -2067,6 +2212,8 @@ None.
                     "finalize",
                     "--run",
                     str(run_dir),
+                    "--codex-verdict",
+                    "PASS_CLEAN",
                     "--codex-review",
                     "No reachable defect found.",
                     "--coverage-verification",
@@ -4249,6 +4396,293 @@ None.
             self.assertFalse(status["repositories"][0]["accepts_reviews"])
             self.assertEqual(artifact_bytes.call_count, 1)
 
+    def test_codex_block_overrides_clean_reviewer_triage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "run_id": "run-codex-block",
+                    "status": "completed",
+                    "phase": "confirmation",
+                    "source_fingerprint": "same",
+                    "risks": [],
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {"findings": [], "test_gaps": []},
+            )
+            args = MM.build_parser().parse_args(
+                [
+                    "finalize",
+                    "--run",
+                    str(run_dir),
+                    "--codex-verdict",
+                    "BLOCK",
+                    "--codex-review",
+                    "Codex reproduced a high-severity defect.",
+                ]
+            )
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM,
+                    "freshness_status",
+                    return_value={"fresh": True, "mode": "working-tree"},
+                ),
+            ):
+                result = MM.finalize_command(args)
+            final = MM.read_json(run_dir / "final.json")
+        self.assertEqual(result, 3)
+        self.assertEqual(final["triage_status"], "PASS_CLEAN")
+        self.assertEqual(final["codex_verdict"], "BLOCK")
+        self.assertEqual(final["status"], "BLOCK")
+        self.assertEqual(final["convergence"], "failed")
+
+    def test_same_run_title_collision_preserves_triage_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "run_id": "run-title-collision",
+                    "status": "completed",
+                    "phase": "confirmation",
+                    "source_fingerprint": "same",
+                    "risks": [],
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {
+                    "findings": [
+                        {
+                            "id": "claude-001",
+                            "kind": "finding",
+                            "title": "Missing auth check",
+                            "severity": "high",
+                            "decision": "accepted",
+                        },
+                        {
+                            "id": "claude-002",
+                            "kind": "finding",
+                            "title": "missing auth-check!",
+                            "severity": "low",
+                            "decision": "rejected",
+                        },
+                    ],
+                    "test_gaps": [],
+                },
+            )
+            args = MM.build_parser().parse_args(
+                [
+                    "finalize",
+                    "--run",
+                    str(run_dir),
+                    "--codex-verdict",
+                    "PASS_CLEAN",
+                    "--codex-review",
+                    "Codex found no additional issue.",
+                ]
+            )
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM,
+                    "freshness_status",
+                    return_value={"fresh": True, "mode": "working-tree"},
+                ),
+            ):
+                result = MM.finalize_command(args)
+            final = MM.read_json(run_dir / "final.json")
+        self.assertEqual(result, 3)
+        self.assertEqual(final["triage_status"], "BLOCK")
+        self.assertEqual(final["codex_verdict"], "PASS_CLEAN")
+        self.assertEqual(final["status"], "BLOCK")
+        self.assertEqual(
+            final["remaining_finding_ids"],
+            ["run-title-collision:claude-001"],
+        )
+
+    def test_finalize_deduplicates_symlink_equivalent_run_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "physical-run"
+            alias_dir = root / "run-alias"
+            run_dir.mkdir()
+            alias_dir.symlink_to(run_dir, target_is_directory=True)
+            metadata = {
+                "run_id": "run-symlink",
+                "workflow_id": "wf-symlink",
+                "repository": {"id": "repo-symlink", "root": "/repo"},
+                "status": "completed",
+                "phase": "confirmation",
+                "round": 2,
+                "source_fingerprint": "same",
+                "risks": [],
+            }
+            MM.safe_write_json(run_dir / "metadata.json", metadata)
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {"findings": [], "test_gaps": []},
+            )
+            args = MM.build_parser().parse_args(
+                [
+                    "finalize",
+                    "--run",
+                    str(alias_dir),
+                    "--codex-verdict",
+                    "PASS_CLEAN",
+                    "--codex-review",
+                    "No defect found.",
+                ]
+            )
+            with (
+                mock.patch.object(
+                    MM, "resolve_run_dir", return_value=alias_dir.resolve()
+                ),
+                mock.patch.object(
+                    MM,
+                    "freshness_status",
+                    return_value={"fresh": True, "mode": "working-tree"},
+                ),
+                mock.patch.object(
+                    MM, "workflow_requires_confirmation", return_value=True
+                ),
+                mock.patch.object(
+                    MM, "workflow_ancestry_ids", return_value=["wf-symlink"]
+                ),
+                mock.patch.object(
+                    MM,
+                    "workflow_runs",
+                    return_value=[(alias_dir, metadata), (run_dir, metadata)],
+                ),
+            ):
+                result = MM.finalize_command(args)
+            final = MM.read_json(run_dir / "final.json")
+        self.assertEqual(result, 0)
+        self.assertEqual(final["status"], "PASS_CLEAN")
+        self.assertEqual(list(final["triage_sha256s"]), ["run-symlink"])
+
+    def test_final_gate_retains_deferred_items_from_prior_workflow_rounds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repair_dir = root / "repair"
+            confirmation_dir = root / "confirmation"
+            repair_dir.mkdir()
+            confirmation_dir.mkdir()
+            repository = {"id": "repo-one", "root": "/repo"}
+            repair_metadata = {
+                "run_id": "run-repair",
+                "workflow_id": "wf-history",
+                "repository": repository,
+                "status": "completed",
+                "phase": "repair",
+                "round": 1,
+            }
+            confirmation_metadata = {
+                "run_id": "run-confirmation",
+                "workflow_id": "wf-history",
+                "repository": repository,
+                "status": "completed",
+                "phase": "confirmation",
+                "round": 2,
+                "source_fingerprint": "same",
+                "risks": [],
+            }
+            MM.safe_write_json(repair_dir / "metadata.json", repair_metadata)
+            MM.safe_write_json(
+                repair_dir / "triage.json",
+                {
+                    "findings": [
+                        {
+                            "id": "claude-001",
+                            "kind": "finding",
+                            "title": "Deferred audit issue",
+                            "severity": "low",
+                            "decision": "deferred",
+                        }
+                    ],
+                    "test_gaps": [
+                        {
+                            "id": "claude-test-001",
+                            "kind": "test_gap",
+                            "title": "Deferred integration coverage",
+                            "severity": "medium",
+                            "decision": "deferred",
+                        }
+                    ],
+                },
+            )
+            MM.safe_write_json(
+                confirmation_dir / "metadata.json", confirmation_metadata
+            )
+            MM.safe_write_json(
+                confirmation_dir / "triage.json",
+                {"findings": [], "test_gaps": []},
+            )
+            args = MM.build_parser().parse_args(
+                [
+                    "finalize",
+                    "--run",
+                    str(confirmation_dir),
+                    "--codex-verdict",
+                    "PASS_CLEAN",
+                    "--codex-review",
+                    "No additional defect found in confirmation.",
+                ]
+            )
+            workflow_runs = [
+                (repair_dir, repair_metadata),
+                (confirmation_dir, confirmation_metadata),
+            ]
+            with (
+                mock.patch.object(
+                    MM, "resolve_run_dir", return_value=confirmation_dir
+                ),
+                mock.patch.object(
+                    MM,
+                    "freshness_status",
+                    return_value={"fresh": True, "mode": "working-tree"},
+                ),
+                mock.patch.object(
+                    MM, "workflow_requires_confirmation", return_value=True
+                ),
+                mock.patch.object(
+                    MM, "workflow_runs", return_value=workflow_runs
+                ),
+            ):
+                result = MM.finalize_command(args)
+                final = MM.read_json(confirmation_dir / "final.json")
+                triage_fresh_before = MM.final_triage_is_fresh(
+                    confirmation_dir, confirmation_metadata, final
+                )
+                repair_triage = MM.read_json(repair_dir / "triage.json")
+                repair_triage["findings"][0]["decision"] = "rejected"
+                MM.safe_write_json(repair_dir / "triage.json", repair_triage)
+                triage_fresh_after = MM.final_triage_is_fresh(
+                    confirmation_dir, confirmation_metadata, final
+                )
+        self.assertEqual(result, 0)
+        self.assertTrue(triage_fresh_before)
+        self.assertFalse(triage_fresh_after)
+        self.assertEqual(final["triage_status"], "PASS_WITH_FINDINGS")
+        self.assertEqual(final["codex_verdict"], "PASS_CLEAN")
+        self.assertEqual(final["status"], "PASS_WITH_FINDINGS")
+        self.assertEqual(
+            final["remaining_finding_ids"], ["run-repair:claude-001"]
+        )
+        self.assertEqual(
+            final["remaining_test_gap_ids"],
+            ["run-repair:claude-test-001"],
+        )
+        self.assertEqual(final["remaining_findings"][0]["round"], 1)
+        self.assertEqual(final["remaining_test_gaps"][0]["severity"], "medium")
+        self.assertEqual(
+            set(final["triage_sha256s"]), {"run-repair", "run-confirmation"}
+        )
+
     def test_supplemental_final_is_explicitly_non_authoritative(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)
@@ -4274,6 +4708,8 @@ None.
                     "finalize",
                     "--run",
                     str(run_dir),
+                    "--codex-verdict",
+                    "PASS_CLEAN",
                     "--codex-review",
                     "Focused recheck passed.",
                 ]
@@ -4435,6 +4871,8 @@ class RunnerEndToEndTests(unittest.TestCase):
                     "finalize",
                     "--run",
                     str(confirmation_dir),
+                    "--codex-verdict",
+                    "PASS_CLEAN",
                     "--codex-review",
                     "Parent gate passed.",
                 ],
@@ -4468,6 +4906,8 @@ class RunnerEndToEndTests(unittest.TestCase):
                     "finalize",
                     "--run",
                     str(supplemental_dir),
+                    "--codex-verdict",
+                    "PASS_CLEAN",
                     "--codex-review",
                     "Supplemental question passed.",
                 ],
@@ -5050,6 +5490,8 @@ class RunnerEndToEndTests(unittest.TestCase):
                     "finalize",
                     "--run",
                     str(run_dir),
+                    "--codex-verdict",
+                    "PASS_CLEAN",
                     "--codex-review",
                     "Final diff review found no remaining defects.",
                     "--verification",
@@ -5150,6 +5592,8 @@ class RunnerEndToEndTests(unittest.TestCase):
                     "finalize",
                     "--run",
                     str(run_dir),
+                    "--codex-verdict",
+                    "PASS_CLEAN",
                     "--codex-review",
                     "Confirmation review found no remaining defects.",
                     "--verification",
