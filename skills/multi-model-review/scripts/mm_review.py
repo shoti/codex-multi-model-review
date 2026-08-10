@@ -104,7 +104,7 @@ PROVIDER_BINARIES = {
 }
 LEGACY_PROVIDER_ALIASES = {"gemini": "antigravity"}
 PROVIDER_CHOICES = (*PROVIDERS, *LEGACY_PROVIDER_ALIASES)
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 MAX_REPAIR_ROUNDS = 3
 RUN_PHASES = ("repair", "confirmation", "supplemental")
 DEFAULT_REVIEW_MODE = "balanced"
@@ -140,6 +140,7 @@ DOCTOR_TIMEOUT_SECONDS = 90
 DOCTOR_CLAUDE_BUDGET_USD = 0.10
 DEFAULT_QUOTA_COOLDOWN_MINUTES = 60
 MIN_CLAUDE_REVIEW_BUDGET_USD = 0.25
+CLAUDE_BUDGET_SAFETY_RATIO = 0.10
 DEFAULT_ANALYTICS_DAYS = 7
 DEFAULT_BUDGET_EVIDENCE_DAYS = 30
 MIN_BUDGET_ESTIMATE_SAMPLES = 5
@@ -1102,6 +1103,7 @@ def create_sensitive_scan_token(
     path_filters: Sequence[str],
     paths: Sequence[str],
     source_fingerprint: str,
+    review_snapshot_fingerprint: str,
     findings: Sequence[SensitiveFinding],
 ) -> str:
     token = f"scan-{uuid.uuid4().hex}"
@@ -1118,6 +1120,7 @@ def create_sensitive_scan_token(
             "path_filters": list(path_filters),
             "paths": list(paths),
             "source_fingerprint": source_fingerprint,
+            "review_snapshot_fingerprint": review_snapshot_fingerprint,
             "allowed_sensitive_findings": [
                 finding.identifier for finding in findings
             ],
@@ -1134,6 +1137,7 @@ def validate_sensitive_scan_token(
     path_filters: Sequence[str],
     paths: Sequence[str],
     source_fingerprint: str,
+    review_snapshot_fingerprint: str,
 ) -> tuple[Path, dict[str, Any]]:
     path = sensitive_scan_path(token)
     if not path.exists():
@@ -1148,6 +1152,7 @@ def validate_sensitive_scan_token(
         "path_filters": list(path_filters),
         "paths": list(paths),
         "source_fingerprint": source_fingerprint,
+        "review_snapshot_fingerprint": review_snapshot_fingerprint,
     }
     mismatches = [key for key, item in expected.items() if value.get(key) != item]
     if mismatches:
@@ -1344,6 +1349,15 @@ def create_snapshot(
         else:
             shutil.copy2(source, target, follow_symlinks=False)
     return snapshot_dir
+
+
+def snapshot_review_paths(snapshot_dir: Path) -> list[str]:
+    """List every file or symlink observable by an external reviewer."""
+    return sorted(
+        str(path.relative_to(snapshot_dir))
+        for path in snapshot_dir.rglob("*")
+        if path.is_file() or path.is_symlink()
+    )
 
 
 def clear_ephemeral_snapshot(run_dir: Path) -> None:
@@ -2588,36 +2602,68 @@ def _adjust_workflow_budget(
     limit: float,
     spent: float,
     reserved: float,
+    minimum_provider_budget_usd: float = MIN_CLAUDE_REVIEW_BUDGET_USD,
 ) -> tuple[list[Reviewer], dict[str, float], float]:
     remaining = max(0.0, limit - spent - reserved)
     adjusted: list[Reviewer] = []
     reserved_for_run = 0.0
+    provider_budget = 0.0
+    safety_reserve = 0.0
     for reviewer in reviewers:
         if reviewer.name != "claude":
             adjusted.append(reviewer)
             continue
-        if remaining < MIN_CLAUDE_REVIEW_BUDGET_USD:
+        minimum_required = max(
+            MIN_CLAUDE_REVIEW_BUDGET_USD, minimum_provider_budget_usd
+        )
+        maximum_safe_provider_budget = remaining / (
+            1 + CLAUDE_BUDGET_SAFETY_RATIO
+        )
+        if maximum_safe_provider_budget < minimum_required:
             raise ReviewError(
-                f"Workflow {identifier} has only ${remaining:.2f} left of its "
-                f"${limit:.2f} lineage budget (${spent:.2f} reported, "
-                f"${reserved:.2f} reserved), below the "
-                f"${MIN_CLAUDE_REVIEW_BUDGET_USD:.2f} minimum for a paid "
-                "Claude review. No provider was started. A successor inherits "
-                "the same cap; start a separate workflow with a larger "
-                "explicitly approved budget only when intentionally beginning "
-                "a new review lineage."
+                f"Workflow {identifier} has only ${remaining:.2f} unreserved "
+                "lineage budget, which permits at most "
+                f"${maximum_safe_provider_budget:.2f} for Claude after the "
+                f"{CLAUDE_BUDGET_SAFETY_RATIO:.0%} provider-overrun safety "
+                f"reserve. This is below the ${minimum_required:.2f} minimum "
+                "viable provider budget for this review. "
+                f"The workflow cap is ${limit:.2f} "
+                f"(${spent:.2f} reported, ${reserved:.2f} reserved). "
+                "No provider was started. A successor inherits the same cap; "
+                "start a separate workflow with a larger explicitly approved "
+                "budget only when intentionally beginning a new review lineage."
             )
         command = list(reviewer.command)
         budget_index = command.index("--max-budget-usd") + 1
         requested = float(command[budget_index])
-        reserved_for_run = round(min(requested, remaining), 6)
-        command[budget_index] = str(reserved_for_run)
+        provider_budget = round(
+            min(requested, maximum_safe_provider_budget), 6
+        )
+        if provider_budget < minimum_required:
+            raise ReviewError(
+                f"Workflow {identifier} would cap Claude at "
+                f"${provider_budget:.2f}, below the ${minimum_required:.2f} "
+                "minimum viable provider budget for this review. No provider "
+                "was started. Increase the explicitly approved budget in a new "
+                "workflow rather than launching a predictably underfunded run."
+            )
+        safety_reserve = round(
+            provider_budget * CLAUDE_BUDGET_SAFETY_RATIO, 6
+        )
+        reserved_for_run = round(provider_budget + safety_reserve, 6)
+        command[budget_index] = str(provider_budget)
         adjusted.append(dataclasses.replace(reviewer, command=tuple(command)))
     return adjusted, {
         "max_budget_usd": round(limit, 6),
         "spent_before_run_usd": round(spent, 6),
         "reserved_before_run_usd": round(reserved, 6),
         "remaining_before_run_usd": round(remaining, 6),
+        "minimum_provider_budget_usd": round(
+            max(MIN_CLAUDE_REVIEW_BUDGET_USD, minimum_provider_budget_usd), 6
+        ),
+        "provider_budget_for_run_usd": round(provider_budget, 6),
+        "provider_overrun_safety_ratio": CLAUDE_BUDGET_SAFETY_RATIO,
+        "provider_overrun_safety_reserve_usd": round(safety_reserve, 6),
         "reserved_for_run_usd": reserved_for_run,
     }, reserved_for_run
 
@@ -2627,6 +2673,7 @@ def apply_workflow_budget(
     identifier: str,
     *,
     reservation_id: str | None = None,
+    minimum_provider_budget_usd: float = MIN_CLAUDE_REVIEW_BUDGET_USD,
 ) -> tuple[list[Reviewer], dict[str, float] | None]:
     if reservation_id is None:
         limit = workflow_budget_limit(identifier)
@@ -2638,6 +2685,7 @@ def apply_workflow_budget(
             limit=limit,
             spent=workflow_spend(identifier),
             reserved=0.0,
+            minimum_provider_budget_usd=minimum_provider_budget_usd,
         )
         return adjusted, status
 
@@ -2684,6 +2732,7 @@ def apply_workflow_budget(
                 limit=limit,
                 spent=workflow_spend(identifier),
                 reserved=reserved,
+                minimum_provider_budget_usd=minimum_provider_budget_usd,
             )
             if reserved_for_run:
                 reservations[reservation_id] = {
@@ -3904,6 +3953,10 @@ def historical_budget_estimate(
                     "budget_exhausted": (
                         attempt.get("failure_category") == "budget_exhausted"
                     ),
+                    "successful": (
+                        reviewer_attempt_succeeded(attempt)
+                        and attempt.get("failure_category") != "budget_exhausted"
+                    ),
                 }
             )
 
@@ -3944,6 +3997,11 @@ def historical_budget_estimate(
         for item in selected
         if item["cost_usd"] is not None
     )
+    successful_distribution = numeric_distribution(
+        item["cost_usd"]
+        for item in selected
+        if item["cost_usd"] is not None and item["successful"]
+    )
     p50 = float(distribution.get("p50") or 0)
     p90 = float(distribution.get("p90") or 0)
     recommended = (
@@ -3953,6 +4011,16 @@ def historical_budget_estimate(
     )
     count = int(distribution["count"])
     confidence = "high" if count >= 20 else "medium" if count >= 5 else "low"
+    successful_p50 = float(successful_distribution.get("p50") or 0)
+    successful_count = int(successful_distribution["count"])
+    minimum_viable = (
+        math.ceil(
+            max(successful_p50, MIN_CLAUDE_REVIEW_BUDGET_USD) * 100
+        )
+        / 100
+        if successful_count >= MIN_BUDGET_ESTIMATE_SAMPLES
+        else MIN_CLAUDE_REVIEW_BUDGET_USD
+    )
     return {
         "advisory_only": True,
         "provider": provider,
@@ -3966,16 +4034,53 @@ def historical_budget_estimate(
         "evidence_attempt_count": len(selected),
         "sample_count": count,
         "cost_distribution_usd": distribution,
+        "successful_cost_distribution_usd": successful_distribution,
         "budget_exhausted_attempts": sum(
             1 for item in selected if item["budget_exhausted"]
         ),
         "configured_budget_usd": round(configured_budget_usd, 6),
         "recommended_budget_usd": recommended,
+        "minimum_viable_budget_usd": minimum_viable,
         "configured_below_recommendation": (
             recommended is not None and configured_budget_usd < recommended
         ),
+        "minimum_viable_launch_guard_enforced": True,
         "automatic_policy_change": False,
     }
+
+
+def reviewer_budget_estimates(
+    reviewers: Sequence[Reviewer],
+    *,
+    review_mode: str | None,
+    patch_bytes: int,
+) -> dict[str, dict[str, Any]]:
+    estimates: dict[str, dict[str, Any]] = {}
+    for reviewer in reviewers:
+        if reviewer.name != "claude":
+            continue
+        configured_budget = float(
+            reviewer_command_value(reviewer, "--max-budget-usd") or 0
+        )
+        estimates[reviewer.name] = historical_budget_estimate(
+            provider=reviewer.name,
+            model=reviewer.model,
+            effort=reviewer_command_value(reviewer, "--effort"),
+            review_mode=review_mode,
+            patch_bytes=patch_bytes,
+            configured_budget_usd=configured_budget,
+        )
+    return estimates
+
+
+def minimum_viable_reviewer_budget(
+    estimates: dict[str, dict[str, Any]], provider: str
+) -> float:
+    estimate = estimates.get(provider)
+    value = estimate.get("minimum_viable_budget_usd") if estimate else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return MIN_CLAUDE_REVIEW_BUDGET_USD
+    return max(MIN_CLAUDE_REVIEW_BUDGET_USD, float(value))
 
 
 def reviewer_command_value(reviewer: Reviewer, flag: str) -> str | None:
@@ -4214,6 +4319,7 @@ def workflow_audit_report(stale_days: int) -> dict[str, Any]:
         runs = runs_by_workflow.get(identifier, [])
         unresolved: list[str] = []
         run_finals = 0
+        untrusted_finals: list[dict[str, Any]] = []
         unclassified_runs = 0
         latest_activity = workflow_timestamp(identifier)
         for run_dir, metadata in runs:
@@ -4226,10 +4332,20 @@ def workflow_audit_report(stale_days: int) -> dict[str, Any]:
                 if latest_activity is None or candidate > latest_activity:
                     latest_activity = candidate
                 break
-            if (run_dir / "final.json").exists() or (
-                run_dir / "supplemental.json"
-            ).exists():
+            run_final_path = run_dir / "final.json"
+            if not run_final_path.exists():
+                run_final_path = run_dir / "supplemental.json"
+            if run_final_path.exists():
                 run_finals += 1
+                trusted, issues = final_contract_trust(read_json(run_final_path))
+                if not trusted:
+                    untrusted_finals.append(
+                        {
+                            "path": str(run_final_path),
+                            "run_id": metadata.get("run_id") or run_dir.name,
+                            "issues": issues,
+                        }
+                    )
             triage_path = run_dir / "triage.json"
             if not triage_path.exists():
                 continue
@@ -4244,11 +4360,15 @@ def workflow_audit_report(stale_days: int) -> dict[str, Any]:
                     unresolved.append(
                         f"{metadata.get('run_id') or run_dir.name}:{item.get('id')}"
                     )
-        workflow_final = (WORKFLOWS_DIR / f"{identifier}.final.json").exists()
+        workflow_final_path = WORKFLOWS_DIR / f"{identifier}.final.json"
+        workflow_final = workflow_final_path.exists()
         persisted_status = str(document.get("status") or "active")
         if persisted_status == "superseded":
             state = "superseded"
             action = "none"
+        elif untrusted_finals:
+            state = "legacy_untrusted_final"
+            action = "start a fresh structured review; legacy finals cannot gate"
         elif persisted_status == "completed" or workflow_final:
             state = "completed"
             action = "none"
@@ -4294,6 +4414,7 @@ def workflow_audit_report(stale_days: int) -> dict[str, Any]:
                 "persisted_status": persisted_status,
                 "run_count": len(runs),
                 "run_finals": run_finals,
+                "untrusted_finals": untrusted_finals,
                 "unclassified_runs": unclassified_runs,
                 "unresolved_items": unresolved,
                 "latest_activity": (
@@ -4410,9 +4531,14 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
         commit = None
         final_status = None
         triage_fresh = False
+        final_contract_trusted = False
+        final_contract_issues: list[str] = []
         if final_path.exists():
             final = read_json(final_path)
             final_status = final.get("status")
+            final_contract_trusted, final_contract_issues = final_contract_trust(
+                final
+            )
             try:
                 freshness = freshness_status(
                     run_dir, metadata, final.get("source_fingerprint")
@@ -4423,7 +4549,7 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                 triage_fresh = final_triage_is_fresh(
                     run_dir, metadata, final
                 )
-                fresh = fresh and triage_fresh
+                fresh = fresh and triage_fresh and final_contract_trusted
             except ReviewError:
                 fresh = False
             passing_status = str(final_status).startswith("PASS") or (
@@ -4448,6 +4574,8 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                 "fresh": fresh,
                 "freshness_mode": freshness_mode,
                 "triage_fresh": triage_fresh,
+                "final_contract_trusted": final_contract_trusted,
+                "final_contract_issues": final_contract_issues,
                 "commit": commit,
                 "final_status": final_status,
                 "accepts_reviews": not confirmation_complete,
@@ -4456,7 +4584,15 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
     if persisted_state == "superseded":
         state = "superseded"
     elif persisted_state == "completed":
-        state = "completed" if ready else "completed_stale"
+        state = (
+            "completed"
+            if ready
+            else "completed_untrusted"
+            if any(
+                item["final_contract_issues"] for item in repositories
+            )
+            else "completed_stale"
+        )
     elif active_runs:
         state = "running"
     elif ready:
@@ -5416,6 +5552,34 @@ def final_triage_is_fresh(
     return True
 
 
+def final_contract_trust(final: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Return whether a final carries the structured Codex gate contract."""
+    issues: list[str] = []
+    schema_version = final.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version < 8
+    ):
+        issues.append("schema_version must be 8 or newer")
+    if final.get("codex_verdict") not in GATE_STATUSES:
+        issues.append("codex_verdict is missing or invalid")
+    if final.get("triage_status") not in GATE_STATUSES:
+        issues.append("triage_status is missing or invalid")
+    triage_sha256s = final.get("triage_sha256s")
+    if not isinstance(triage_sha256s, dict) or not triage_sha256s or any(
+        not isinstance(key, str)
+        or not key
+        or not isinstance(value, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", value)
+        for key, value in (
+            triage_sha256s.items() if isinstance(triage_sha256s, dict) else []
+        )
+    ):
+        issues.append("triage_sha256s is missing or invalid")
+    return not issues, issues
+
+
 def effective_finalization_items(
     items: Sequence[tuple[dict[str, Any], Path, dict[str, Any]]],
     workflow_identifier: str,
@@ -5732,12 +5896,13 @@ def verify_command(args: argparse.Namespace) -> int:
     if not final_path.exists():
         raise ReviewError(f"Run has not been finalized: {run_dir}")
     final = read_json(final_path)
+    final_contract_trusted, final_contract_issues = final_contract_trust(final)
     freshness = freshness_status(
         run_dir, metadata, final.get("source_fingerprint")
     )
     source_fresh = bool(freshness["fresh"])
     triage_fresh = final_triage_is_fresh(run_dir, metadata, final)
-    fresh = source_fresh and triage_fresh
+    fresh = source_fresh and triage_fresh and final_contract_trusted
     status = final.get("status")
     print(
         json.dumps(
@@ -5747,6 +5912,8 @@ def verify_command(args: argparse.Namespace) -> int:
                 "fresh": fresh,
                 "source_fresh": source_fresh,
                 "triage_fresh": triage_fresh,
+                "final_contract_trusted": final_contract_trusted,
+                "final_contract_issues": final_contract_issues,
                 "freshness_mode": freshness["mode"],
                 "commit": freshness.get("commit"),
                 "reviewed_fingerprint": final.get("source_fingerprint"),
@@ -5821,6 +5988,11 @@ def attest_commit_command(args: argparse.Namespace) -> int:
         )
     with exclusive_file_lock(final_path):
         final = read_json(final_path)
+        trusted, issues = final_contract_trust(final)
+        if not trusted:
+            raise ReviewError(
+                "Cannot attest an untrusted legacy final: " + "; ".join(issues)
+            )
         freshness = freshness_status(
             run_dir, metadata, final.get("source_fingerprint")
         )
@@ -5864,13 +6036,6 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
     repository = repository_metadata(repo)
     source_fingerprint = fingerprint(repo, scope, paths, path_filters)
     overlay_paths = snapshot_overlay_paths(repo, scope, paths, path_filters)
-    blocked_paths = sorted(
-        {
-            path
-            for path in overlay_paths
-            if is_sensitive_path(path) or (repo / path).is_symlink()
-        }
-    )
     with tempfile.TemporaryDirectory(prefix="mm-review-scan-") as temporary:
         scan_dir = Path(temporary)
         snapshot_dir = create_snapshot(
@@ -5896,7 +6061,14 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
                 "against a stable tree."
             )
         external_symlinks = external_snapshot_symlinks(snapshot_dir)
-        findings = sensitive_content_findings(snapshot_dir, overlay_paths, patch)
+        review_paths = snapshot_review_paths(snapshot_dir)
+        blocked_paths = sorted(
+            path for path in review_paths if is_sensitive_path(path)
+        )
+        review_snapshot_fingerprint = content_fingerprint(
+            snapshot_dir, review_paths
+        )
+        findings = sensitive_content_findings(snapshot_dir, review_paths, patch)
     token = None
     if args.approve_findings and findings and not blocked_paths and not external_symlinks:
         token = create_sensitive_scan_token(
@@ -5905,6 +6077,7 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
             path_filters=path_filters,
             paths=paths,
             source_fingerprint=source_fingerprint,
+            review_snapshot_fingerprint=review_snapshot_fingerprint,
             findings=findings,
         )
     result = {
@@ -5914,6 +6087,8 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
         "path_filters": list(path_filters),
         "paths": paths,
         "snapshot_overlay_paths": overlay_paths,
+        "review_snapshot_file_count": len(review_paths),
+        "review_snapshot_fingerprint": review_snapshot_fingerprint,
         "source_fingerprint": source_fingerprint,
         "blocked_paths": blocked_paths,
         "external_symlinks": external_symlinks,
@@ -6168,7 +6343,40 @@ def persist_review_results(
     ]
     status = "completed"
     failure: dict[str, Any] | None = None
-    if failed_reviewers:
+    workflow_budget = metadata.get("workflow_budget")
+    reserved_for_run = (
+        workflow_budget.get("reserved_for_run_usd")
+        if isinstance(workflow_budget, dict)
+        else None
+    )
+    claude_result = result_by_name.get("claude")
+    claude_cost = (
+        claude_result.usage.get("total_cost_usd")
+        if claude_result and isinstance(claude_result.usage, dict)
+        else None
+    )
+    budget_exceeded = bool(
+        isinstance(reserved_for_run, (int, float))
+        and not isinstance(reserved_for_run, bool)
+        and isinstance(claude_cost, (int, float))
+        and not isinstance(claude_cost, bool)
+        and float(claude_cost) > float(reserved_for_run) + 0.000001
+    )
+    if budget_exceeded:
+        status = "failed"
+        failure = {
+            "type": "lineage_budget_exceeded",
+            "provider": "claude",
+            "reported_cost_usd": round(float(claude_cost), 6),
+            "protected_reservation_usd": round(float(reserved_for_run), 6),
+            "message": (
+                "Provider-reported cost exceeded the protected lineage "
+                "reservation; this run cannot produce a passing gate."
+            ),
+        }
+        if "claude" not in failed_reviewers:
+            failed_reviewers.append("claude")
+    elif failed_reviewers:
         status = "partial" if usable_successes else "failed"
         failure = {
             "type": "reviewer_failure",
@@ -6207,6 +6415,23 @@ def persist_review_results(
     return sorted(failed_reviewers), sorted(invalid_reports)
 
 
+def reviewer_failure_guidance(run_dir: Path, metadata: dict[str, Any]) -> str:
+    failure = metadata.get("failure")
+    if isinstance(failure, dict) and failure.get("type") == "lineage_budget_exceeded":
+        return (
+            "Claude's reported cost exceeded the protected lineage budget "
+            "reservation, so this run failed closed and cannot be resumed. "
+            "Other successful reports remain audit evidence. Start a fresh "
+            "review round only if the unchanged workflow's remaining budget "
+            f"guard permits it; inspect {run_dir}."
+        )
+    return (
+        "One or more reviewers failed. Successful reports were preserved; "
+        f"retry only the failed providers with `mm-review resume --run "
+        f"{run_dir}` after readiness is restored."
+    )
+
+
 def resume_review_command(args: argparse.Namespace) -> int:
     os.umask(0o077)
     run_dir = resolve_run_dir(args.run)
@@ -6226,6 +6451,12 @@ def resume_review_locked(
     claude_max_budget_usd: float | None = None,
 ) -> int:
     metadata = read_json(run_dir / "metadata.json")
+    if int(metadata.get("schema_version") or 0) < 9:
+        raise ReviewError(
+            "Runs created before schema 9 cannot be resumed because their full "
+            "outgoing snapshot was not fingerprint-bound. Start a fresh review "
+            "workflow."
+        )
     resume_terminal_status = (
         "partial" if metadata.get("status") == "partial" else "failed"
     )
@@ -6345,10 +6576,23 @@ def resume_review_locked(
         command.extend(["--kimi-model", str(kimi.get("model") or "k3-256k")])
     review_args = build_parser().parse_args(command)
     reviewers = reviewer_definitions(review_args, load_config())
+    patch = (run_dir / "change.patch").read_text(encoding="utf-8")
+    budget_estimates = reviewer_budget_estimates(
+        reviewers,
+        review_mode=(
+            str(metadata.get("review_mode"))
+            if metadata.get("review_mode")
+            else None
+        ),
+        patch_bytes=len(patch.encode()),
+    )
     reviewers, budget = apply_workflow_budget(
         reviewers,
         str(metadata["workflow_id"]),
         reservation_id=str(metadata["run_id"]),
+        minimum_provider_budget_usd=minimum_viable_reviewer_budget(
+            budget_estimates, "claude"
+        ),
     )
 
     snapshot_dir = run_dir / "snapshot"
@@ -6364,13 +6608,31 @@ def resume_review_locked(
             raise ReviewError(
                 "Cannot resume because the recreated snapshot has an external symlink."
             )
-        patch = (run_dir / "change.patch").read_text(encoding="utf-8")
+        review_paths = snapshot_review_paths(snapshot_dir)
+        blocked_paths = sorted(
+            path for path in review_paths if is_sensitive_path(path)
+        )
+        if blocked_paths:
+            raise ReviewError(
+                "Cannot resume because the complete recreated snapshot contains "
+                "a sensitive path. Start a fresh review after removing it."
+            )
+        review_snapshot_fingerprint = content_fingerprint(
+            snapshot_dir, review_paths
+        )
+        if review_snapshot_fingerprint != metadata.get(
+            "review_snapshot_fingerprint"
+        ):
+            raise ReviewError(
+                "Cannot resume because the complete outgoing snapshot no longer "
+                "matches the partial run. Start a fresh review workflow."
+            )
         content_findings = sensitive_content_findings(
-            snapshot_dir, overlay_paths, patch
+            snapshot_dir, review_paths, patch
         )
         known_ids = {item.identifier for item in content_findings}
         allowed_ids = set(metadata.get("allowed_sensitive_findings", []))
-        if known_ids - allowed_ids and not metadata.get("sensitive_override"):
+        if known_ids - allowed_ids:
             raise ReviewError(
                 "Cannot resume because the recreated snapshot has unapproved "
                 "sensitive findings. Run a fresh sensitive preflight."
@@ -6385,9 +6647,12 @@ def resume_review_locked(
                 "heartbeat_at": utc_now(),
                 "runner_pid": os.getpid(),
                 "workflow_budget": budget,
+                "budget_estimates": budget_estimates,
                 "review_policy": resume_policy,
                 "resumed_reviewers": failed_names,
                 "snapshot_overlay_paths": overlay_paths,
+                "review_snapshot_file_count": len(review_paths),
+                "review_snapshot_fingerprint": review_snapshot_fingerprint,
             }
         )
         metadata.pop("terminal_error", None)
@@ -6466,6 +6731,14 @@ def resume_review_locked(
 
 def run_review_command(args: argparse.Namespace) -> int:
     os.umask(0o077)
+    if args.allow_sensitive_paths or args.allow_sensitive_finding:
+        raise ReviewError(
+            "Direct sensitive-content overrides are no longer accepted. Run "
+            "`mm-review scan ... --approve-findings`, inspect its redacted "
+            "findings, then consume the one-shot exact-snapshot token with "
+            "--sensitive-scan-token. Sensitive paths and external symlinks "
+            "must be removed from the outgoing snapshot."
+        )
     config = load_config()
     supplemental_parent: tuple[Path, dict[str, Any], dict[str, Any]] | None = None
     if args.supplemental_of:
@@ -6482,6 +6755,12 @@ def run_review_command(args: argparse.Namespace) -> int:
         if not parent_final_path.exists():
             raise ReviewError("Supplemental review requires a finalized parent run.")
         parent_final = read_json(parent_final_path)
+        parent_trusted, parent_issues = final_contract_trust(parent_final)
+        if not parent_trusted:
+            raise ReviewError(
+                "Supplemental review requires a structured trusted parent "
+                "final: " + "; ".join(parent_issues)
+            )
         if not str(parent_final.get("status") or "").startswith("PASS"):
             raise ReviewError("Supplemental review requires a passing parent gate.")
         parent_freshness = freshness_status(
@@ -6670,8 +6949,8 @@ def run_review_command(args: argparse.Namespace) -> int:
         "isolated_snapshot": True,
         "coverage_contract_required": True,
         "patch_sha256": sha256_text(patch),
-        "sensitive_override": bool(args.allow_sensitive_paths),
-        "allowed_sensitive_findings": sorted(set(args.allow_sensitive_finding)),
+        "sensitive_override": False,
+        "allowed_sensitive_findings": [],
         "sensitive_scan_token": args.sensitive_scan_token,
     }
     safe_write_json(run_dir / "metadata.json", metadata)
@@ -6691,15 +6970,6 @@ def run_review_command(args: argparse.Namespace) -> int:
                     "Supplemental review source is not content-equivalent to the "
                     "finalized parent snapshot. Create a normal successor workflow."
                 )
-        if args.sensitive_scan_token:
-            scan_token_path, scan_token_value = validate_sensitive_scan_token(
-                args.sensitive_scan_token,
-                repository=repository,
-                scope=scope,
-                path_filters=path_filters,
-                paths=paths,
-                source_fingerprint=before,
-            )
         validate_workflow_phase(
             selected_workflow,
             str(repository["id"]),
@@ -6722,21 +6992,19 @@ def run_review_command(args: argparse.Namespace) -> int:
             round_number,
             before,
         )
-        sensitive = [path for path in overlay_paths if is_sensitive_path(path)]
-        symlinks = [path for path in overlay_paths if (repo / path).is_symlink()]
-        blocked_paths = sorted(set(sensitive + symlinks))
-        if blocked_paths and not args.allow_sensitive_paths:
-            details = [f"- path: {path}" for path in blocked_paths]
-            raise ReviewError(
-                "Review blocked because likely sensitive material is in scope:\n"
-                + "\n".join(details)
-                + "\nRemove it from scope or use --allow-sensitive-paths only "
-                "after confirming it is safe for external review."
-            )
-
         reviewers = reviewer_definitions(args, config)
+        budget_estimates = reviewer_budget_estimates(
+            reviewers,
+            review_mode=(str(review_mode) if review_mode else None),
+            patch_bytes=len(patch.encode()),
+        )
         reviewers, workflow_budget = apply_workflow_budget(
-            reviewers, selected_workflow, reservation_id=run_id
+            reviewers,
+            selected_workflow,
+            reservation_id=run_id,
+            minimum_provider_budget_usd=minimum_viable_reviewer_budget(
+                budget_estimates, "claude"
+            ),
         )
         snapshot_dir = create_snapshot(
             repo,
@@ -6761,22 +7029,39 @@ def run_review_command(args: argparse.Namespace) -> int:
                 "created. No reviewer was started; rerun against a stable tree."
             )
 
+        review_paths = snapshot_review_paths(snapshot_dir)
+        blocked_paths = sorted(
+            path for path in review_paths if is_sensitive_path(path)
+        )
+        review_snapshot_fingerprint = content_fingerprint(
+            snapshot_dir, review_paths
+        )
+        if args.sensitive_scan_token:
+            scan_token_path, scan_token_value = validate_sensitive_scan_token(
+                args.sensitive_scan_token,
+                repository=repository,
+                scope=scope,
+                path_filters=path_filters,
+                paths=paths,
+                source_fingerprint=before,
+                review_snapshot_fingerprint=review_snapshot_fingerprint,
+            )
         external_symlinks = external_snapshot_symlinks(snapshot_dir)
         content_findings = sensitive_content_findings(
-            snapshot_dir, overlay_paths, patch
+            snapshot_dir, review_paths, patch
         )
         token_allowed_ids = set(
             scan_token_value.get("allowed_sensitive_findings", [])
             if scan_token_value
             else []
         )
-        allowed_ids = set(args.allow_sensitive_finding) | token_allowed_ids
+        allowed_ids = token_allowed_ids
         known_ids = {item.identifier for item in content_findings}
         unknown_ids = sorted(allowed_ids - known_ids)
         if unknown_ids:
             raise ReviewError(
-                "These --allow-sensitive-finding IDs do not match the current "
-                "snapshot: " + ", ".join(unknown_ids)
+                "The sensitive scan token contains finding IDs that do not "
+                "match the current snapshot: " + ", ".join(unknown_ids)
             )
         unwaived_findings = [
             item for item in content_findings if item.identifier not in allowed_ids
@@ -6785,6 +7070,17 @@ def run_review_command(args: argparse.Namespace) -> int:
             dataclasses.asdict(item) for item in content_findings
         ]
         metadata["allowed_sensitive_findings"] = sorted(allowed_ids)
+        metadata["review_snapshot_file_count"] = len(review_paths)
+        metadata["review_snapshot_fingerprint"] = review_snapshot_fingerprint
+        if blocked_paths:
+            details = [f"- path: {path}" for path in blocked_paths]
+            raise ReviewError(
+                "Review blocked because a likely sensitive path would be sent "
+                "in the complete external-review snapshot:\n"
+                + "\n".join(details)
+                + "\nSensitive paths cannot be overridden; remove them from "
+                "the outgoing repository snapshot."
+            )
         if external_symlinks:
             details = [
                 f"- external symlink: {path}" for path in external_symlinks
@@ -6797,7 +7093,7 @@ def run_review_command(args: argparse.Namespace) -> int:
                 "symlink from scope or replace it with safe in-repository "
                 "content."
             )
-        if unwaived_findings and not args.allow_sensitive_paths:
+        if unwaived_findings:
             details = [
                 f"- content: {finding.display()}"
                 for finding in unwaived_findings
@@ -6806,9 +7102,9 @@ def run_review_command(args: argparse.Namespace) -> int:
                 "Review blocked because likely sensitive material is in the "
                 "private snapshot:\n"
                 + "\n".join(details)
-                + "\nUse --allow-sensitive-finding <id> for a reviewed exact "
-                "match, or the broader --allow-sensitive-paths override only "
-                "after confirming the entire scope is safe."
+                + "\nRun `mm-review scan ... --approve-findings`, inspect the "
+                "redacted findings, then consume its one-shot exact-snapshot "
+                "token with --sensitive-scan-token."
             )
 
         safe_write(
@@ -6832,21 +7128,6 @@ def run_review_command(args: argparse.Namespace) -> int:
             phase=args.phase,
         )
         safe_write(prompt_path, prompt)
-        budget_estimates: dict[str, dict[str, Any]] = {}
-        for reviewer in reviewers:
-            if reviewer.name != "claude":
-                continue
-            configured_budget = float(
-                reviewer_command_value(reviewer, "--max-budget-usd") or 0
-            )
-            budget_estimates[reviewer.name] = historical_budget_estimate(
-                provider=reviewer.name,
-                model=reviewer.model,
-                effort=reviewer_command_value(reviewer, "--effort"),
-                review_mode=(str(review_mode) if review_mode else None),
-                patch_bytes=len(patch.encode()),
-                configured_budget_usd=configured_budget,
-            )
         metadata.update(
             {
                 "status": "running",
@@ -6999,11 +7280,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             if result.returncode != 0:
                 print(f"  private stderr={result.error_path}")
         if failures:
-            raise ReviewError(
-                "One or more reviewers failed. Successful reports were preserved; "
-                f"retry only the failed providers with `mm-review resume --run "
-                f"{run_dir}` after readiness is restored."
-            )
+            raise ReviewError(reviewer_failure_guidance(run_dir, metadata))
         if invalid_reports:
             raise ReviewError(
                 "Reviewer output failed the report contract: "
@@ -7268,7 +7545,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     scan_parser = subparsers.add_parser(
-        "scan", help="Run secret/symlink preflight without creating a review run"
+        "scan",
+        help=(
+            "Scan the complete outgoing snapshot for secrets/symlink escapes "
+            "without creating a review run"
+        ),
     )
     scan_parser.add_argument(
         "--repo", default=".", help="Path inside the target Git repository"
@@ -7326,7 +7607,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "Repository-relative task path to include; repeat for multiple paths. "
-            "Unrelated dirty files stay outside the snapshot and fingerprint."
+            "Unrelated dirty overlays stay outside the snapshot, but unchanged "
+            "tracked files remain visible to reviewers."
         ),
     )
     run_parser.add_argument(
@@ -7402,15 +7684,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-sensitive-paths",
         action="store_true",
         help=(
-            "Broadly confirm flagged paths/content are safe to review; "
-            "external symlink escapes remain blocked"
+            "Deprecated and rejected; sensitive paths cannot be overridden"
         ),
     )
     run_parser.add_argument(
         "--allow-sensitive-finding",
         action="append",
         default=[],
-        help="Allow one exact redacted secret-scan finding ID; repeat as needed",
+        help=(
+            "Deprecated and rejected; use a one-shot token from "
+            "`mm-review scan --approve-findings`"
+        ),
     )
     run_parser.add_argument(
         "--sensitive-scan-token",

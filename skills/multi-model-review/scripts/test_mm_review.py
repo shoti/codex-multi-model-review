@@ -1914,7 +1914,7 @@ None.
             self.assertIn("must not be a symlink", readiness.detail)
             self.assertEqual(target.read_text(encoding="utf-8"), "unchanged\n")
 
-    def test_external_snapshot_symlink_cannot_be_broadly_overridden(self) -> None:
+    def test_external_snapshot_symlink_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             repo = root / "repo"
@@ -1931,7 +1931,6 @@ None.
                     str(repo),
                     "--path",
                     "src",
-                    "--allow-sensitive-paths",
                 ]
             )
 
@@ -2318,7 +2317,14 @@ None.
             )
             MM.safe_write_json(
                 run_dir / "final.json",
-                {"source_fingerprint": fingerprint, "status": "PASS_CLEAN"},
+                {
+                    "schema_version": 8,
+                    "source_fingerprint": fingerprint,
+                    "status": "PASS_CLEAN",
+                    "codex_verdict": "PASS_CLEAN",
+                    "triage_status": "PASS_CLEAN",
+                    "triage_sha256s": {"run-attest": "a" * 64},
+                },
             )
 
             freshness = MM.freshness_status(
@@ -2744,13 +2750,15 @@ None.
             mock.patch.object(MM, "workflow_spend", return_value=0.7),
         ):
             adjusted, status = MM.apply_workflow_budget([reviewer], "wf-test")
-        self.assertEqual(adjusted[0].command[-1], "0.3")
+        self.assertEqual(adjusted[0].command[-1], "0.272727")
         self.assertEqual(status["remaining_before_run_usd"], 0.3)
+        self.assertEqual(status["reserved_for_run_usd"], 0.3)
+        self.assertEqual(status["provider_overrun_safety_reserve_usd"], 0.027273)
         with (
             mock.patch.object(MM, "workflow_budget_limit", return_value=1.0),
             mock.patch.object(MM, "workflow_spend", return_value=0.8),
             self.assertRaisesRegex(
-                MM.ReviewError, r"below the \$0.25 minimum"
+                MM.ReviewError, r"below the \$0.25 minimum viable provider budget"
             ),
         ):
             MM.apply_workflow_budget([reviewer], "wf-test")
@@ -2779,14 +2787,37 @@ None.
                 document = MM.read_json(workflows / "wf-budget.json")
                 first_budget = float(first[0].command[-1])
                 second_budget = float(second[0].command[-1])
-                self.assertEqual(first_budget + second_budget, 2.0)
+                self.assertAlmostEqual(first_budget + second_budget, 1.818182)
                 self.assertEqual(first_status["reserved_before_run_usd"], 0.0)
-                self.assertEqual(second_status["reserved_before_run_usd"], 1.25)
+                self.assertEqual(second_status["reserved_before_run_usd"], 1.375)
+                self.assertEqual(first_status["reserved_for_run_usd"], 1.375)
+                self.assertEqual(second_status["reserved_for_run_usd"], 0.625)
                 self.assertEqual(len(document["budget_reservations"]), 2)
                 MM.release_workflow_budget_reservation("wf-budget", "run-1")
                 MM.release_workflow_budget_reservation("wf-budget", "run-2")
                 released = MM.read_json(workflows / "wf-budget.json")
         self.assertEqual(released["budget_reservations"], {})
+
+    def test_workflow_budget_blocks_historically_underfunded_attempt(self) -> None:
+        reviewer = MM.Reviewer(
+            "claude",
+            ("claude", "--max-budget-usd", "1.25"),
+            {},
+            "sonnet",
+            "fake",
+        )
+        with self.assertRaisesRegex(
+            MM.ReviewError,
+            r"at most \$0.91.*below the \$1.10 minimum viable provider budget",
+        ):
+            MM._adjust_workflow_budget(
+                [reviewer],
+                identifier="wf-underfunded",
+                limit=5.0,
+                spent=4.0,
+                reserved=0.0,
+                minimum_provider_budget_usd=1.10,
+            )
 
     def test_supplemental_siblings_share_parent_lineage_reservations(self) -> None:
         reviewer = MM.Reviewer(
@@ -2823,9 +2854,9 @@ None.
                 )
                 lineage = MM.workflow_lineage_ids("wf-supplemental-two")
         self.assertEqual(float(first[0].command[-1]), 1.25)
-        self.assertEqual(float(second[0].command[-1]), 0.75)
+        self.assertEqual(float(second[0].command[-1]), 0.568182)
         self.assertEqual(first_status["reserved_before_run_usd"], 0.0)
-        self.assertEqual(second_status["reserved_before_run_usd"], 1.25)
+        self.assertEqual(second_status["reserved_before_run_usd"], 1.375)
         self.assertEqual(
             lineage,
             ["wf-parent", "wf-supplemental-one", "wf-supplemental-two"],
@@ -2897,6 +2928,84 @@ None.
         self.assertEqual(invalid, ["claude"])
         self.assertEqual(persisted["failure"]["type"], "reviewer_failure")
         self.assertEqual(persisted["failure"]["invalid_reports"], ["claude"])
+
+    def test_provider_cost_beyond_safety_reservation_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            report = run_dir / "claude.md"
+            error = run_dir / "claude.stderr.log"
+            kimi_report = run_dir / "kimi.md"
+            kimi_error = run_dir / "kimi.stderr.log"
+            report.write_text(
+                "# Verdict\nPASS_CLEAN\n\n# Findings\nNone.\n\n"
+                "# Test gaps\nNone.\n\n# Coverage\n- Complete: yes\n"
+                "- Unreviewed changed paths: []\n- Limitations: []\n\n"
+                "# Notes\nNone.\n",
+                encoding="utf-8",
+            )
+            error.write_text("", encoding="utf-8")
+            kimi_report.write_text(
+                report.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            kimi_error.write_text("", encoding="utf-8")
+            now = MM.utc_now()
+            metadata = {
+                "run_id": "run-budget-overrun",
+                "workflow_id": "wf-budget-overrun",
+                "repository": {"id": "repo-1"},
+                "created_at": now,
+                "started_at": now,
+                "risks": [],
+                "workflow_budget": {"reserved_for_run_usd": 1.375},
+            }
+            reviewer = MM.Reviewer(
+                "claude", ("claude",), {}, "sonnet", "fake"
+            )
+            kimi = MM.Reviewer("kimi", ("kimi",), {}, "k3", "fake")
+            results = [
+                MM.ReviewResult(
+                    "claude",
+                    0,
+                    report,
+                    error,
+                    now,
+                    now,
+                    0.1,
+                    False,
+                    {"total_cost_usd": 1.40},
+                    None,
+                ),
+                MM.ReviewResult(
+                    "kimi",
+                    0,
+                    kimi_report,
+                    kimi_error,
+                    now,
+                    now,
+                    0.1,
+                    False,
+                    None,
+                    None,
+                ),
+            ]
+            with mock.patch.object(MM, "workflow_lineage_runs", return_value=[]):
+                failures, invalid = MM.persist_review_results(
+                    run_dir=run_dir,
+                    metadata=metadata,
+                    reviewers=[reviewer, kimi],
+                    results=results,
+                )
+            persisted = MM.read_json(run_dir / "metadata.json")
+            summary = MM.read_json(run_dir / "review-summary.json")
+            guidance = MM.reviewer_failure_guidance(run_dir, persisted)
+        self.assertEqual(failures, ["claude"])
+        self.assertEqual(invalid, [])
+        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(persisted["failure"]["type"], "lineage_budget_exceeded")
+        self.assertEqual(summary["reviews"]["kimi"]["verdict"], "PASS_CLEAN")
+        self.assertNotIn("mm-review resume", guidance)
+        self.assertIn("cannot be resumed", guidance)
+        self.assertIn("fresh review round", guidance)
 
     def test_workflow_supersede_links_both_documents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3109,6 +3218,7 @@ None.
             MM.safe_write_json(
                 run_dir / "metadata.json",
                 {
+                    "schema_version": 9,
                     "run_id": "run-resume",
                     "status": "partial",
                     "failure": {
@@ -3129,6 +3239,7 @@ None.
                     "path_filters": [],
                     "paths": ["src/a.py"],
                     "source_fingerprint": "fingerprint",
+                    "review_snapshot_fingerprint": "snapshot-fingerprint",
                     "workflow_id": "wf-active",
                     "review_policy": {"timeout_minutes": 1},
                     "created_at": now,
@@ -3167,6 +3278,10 @@ None.
                 mock.patch.object(
                     MM, "sensitive_content_findings", return_value=[]
                 ),
+                mock.patch.object(MM, "snapshot_review_paths", return_value=[]),
+                mock.patch.object(
+                    MM, "content_fingerprint", return_value="snapshot-fingerprint"
+                ),
                 mock.patch.object(
                     MM,
                     "invoke_reviewer",
@@ -3190,6 +3305,7 @@ None.
             MM.safe_write_json(
                 run_dir / "metadata.json",
                 {
+                    "schema_version": 9,
                     "run_id": "run-budget",
                     "status": "failed",
                     "failure": {
@@ -3315,6 +3431,7 @@ None.
                     path_filters=(),
                     paths=["fixture.py"],
                     source_fingerprint="abc",
+                    review_snapshot_fingerprint="snapshot-abc",
                     findings=findings,
                 )
                 path, value = MM.validate_sensitive_scan_token(
@@ -3324,6 +3441,7 @@ None.
                     path_filters=(),
                     paths=["fixture.py"],
                     source_fingerprint="abc",
+                    review_snapshot_fingerprint="snapshot-abc",
                 )
                 MM.consume_sensitive_scan_token(path, value)
                 with self.assertRaisesRegex(MM.ReviewError, "already consumed"):
@@ -3334,7 +3452,109 @@ None.
                         path_filters=(),
                         paths=["fixture.py"],
                         source_fingerprint="abc",
+                        review_snapshot_fingerprint="snapshot-abc",
                     )
+
+    def test_sensitive_scan_covers_unchanged_files_outside_task_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            scans = root / "scans"
+            repo.mkdir()
+            initialize_repo(repo)
+            (repo / "credentials.py").write_text(
+                'apiKey = "credential-value-123456"\n', encoding="utf-8"
+            )
+            run(["git", "add", "credentials.py"], cwd=repo)
+            run(["git", "commit", "-qm", "add review fixture"], cwd=repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            args = MM.build_parser().parse_args(
+                [
+                    "scan",
+                    "--repo",
+                    str(repo),
+                    "--path",
+                    "src",
+                    "--approve-findings",
+                ]
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(MM, "SENSITIVE_SCANS_DIR", scans),
+                redirect_stdout(output),
+            ):
+                result = MM.sensitive_scan_command(args)
+                report = json.loads(output.getvalue())
+                token_path = MM.sensitive_scan_path(report["approved_token"])
+                token = MM.read_json(token_path)
+        self.assertEqual(result, 0)
+        self.assertEqual(report["paths"], ["src/feature.py"])
+        self.assertIn(
+            "credentials.py",
+            [item["path"] for item in report["sensitive_findings"]],
+        )
+        self.assertGreater(report["review_snapshot_file_count"], 1)
+        self.assertEqual(
+            token["review_snapshot_fingerprint"],
+            report["review_snapshot_fingerprint"],
+        )
+
+    def test_run_blocks_unchanged_secret_outside_task_scope_before_provider(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            runs = root / "runs"
+            repo.mkdir()
+            initialize_repo(repo)
+            (repo / "credentials.py").write_text(
+                'apiKey = "credential-value-123456"\n', encoding="utf-8"
+            )
+            run(["git", "add", "credentials.py"], cwd=repo)
+            run(["git", "commit", "-qm", "add review fixture"], cwd=repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            args = MM.build_parser().parse_args(
+                [
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--path",
+                    "src",
+                    "--task",
+                    "Review the scoped feature change.",
+                ]
+            )
+            with (
+                mock.patch.object(MM, "RUNS_DIR", runs),
+                mock.patch.object(MM, "WORKFLOWS_DIR", runs / "workflows"),
+                mock.patch.object(
+                    MM,
+                    "load_config",
+                    return_value=json.loads(json.dumps(MM.DEFAULT_CONFIG)),
+                ),
+                mock.patch.object(MM, "reviewer_definitions", return_value=[]),
+                mock.patch.object(MM, "invoke_reviewer") as invoke,
+                self.assertRaisesRegex(
+                    MM.ReviewError,
+                    "likely sensitive material is in the private snapshot",
+                ),
+            ):
+                MM.run_review_command(args)
+        invoke.assert_not_called()
+
+    def test_direct_sensitive_finding_override_is_rejected(self) -> None:
+        args = MM.build_parser().parse_args(
+            ["run", "--allow-sensitive-finding", "deadbeef1234"]
+        )
+        with self.assertRaisesRegex(
+            MM.ReviewError, "Direct sensitive-content overrides"
+        ):
+            MM.run_review_command(args)
 
     def test_analytics_separates_partial_runs_and_typed_failures(self) -> None:
         now = MM.utc_now()
@@ -3761,12 +3981,12 @@ None.
                 mock.patch.object(MM, "run_artifact_bytes") as artifact_bytes,
             ):
                 self.assertEqual(MM.workflow_spend("wf-new"), 1.0)
-                adjusted, budget = MM.apply_workflow_budget(
-                    [reviewer], "wf-new", reservation_id="run-new"
-                )
-            self.assertEqual(adjusted[0].command[-1], "0.25")
-            self.assertEqual(budget["spent_before_run_usd"], 1.0)
-            self.assertEqual(budget["reserved_before_run_usd"], 0.25)
+                with self.assertRaisesRegex(
+                    MM.ReviewError, "provider-overrun safety reserve"
+                ):
+                    MM.apply_workflow_budget(
+                        [reviewer], "wf-new", reservation_id="run-new"
+                    )
             artifact_bytes.assert_not_called()
 
     def test_evidence_memory_rebuilds_and_searches_across_workflows(self) -> None:
@@ -4025,6 +4245,10 @@ None.
         self.assertEqual(estimate["sample_count"], 6)
         self.assertEqual(estimate["confidence"], "medium")
         self.assertEqual(estimate["budget_exhausted_attempts"], 2)
+        self.assertEqual(estimate["minimum_viable_budget_usd"], 0.6)
+        self.assertEqual(
+            estimate["successful_cost_distribution_usd"]["count"], 5
+        )
         self.assertTrue(estimate["configured_below_recommendation"])
         self.assertFalse(estimate["automatic_policy_change"])
         args = MM.build_parser().parse_args(["budget-estimate", "--uncommitted"])
@@ -4037,13 +4261,16 @@ None.
             workflows.mkdir()
             pending_dir = root / "repo" / "pending"
             final_dir = root / "repo" / "final"
+            legacy_dir = root / "repo" / "legacy"
             stale_dir = root / "repo" / "stale"
             pending_dir.mkdir(parents=True)
             final_dir.mkdir()
+            legacy_dir.mkdir()
             stale_dir.mkdir()
             documents = {
                 "wf-20260806T000000Z-pending": {},
                 "wf-20260806T000001Z-final": {},
+                "wf-20260806T000003Z-legacy": {"status": "completed"},
                 "wf-20200101T000000Z-stale": {},
                 "wf-20260806T000002Z-old": {"status": "superseded"},
             }
@@ -4087,10 +4314,29 @@ None.
                     "test_gaps": [],
                 },
             )
-            MM.safe_write_json(final_dir / "final.json", {"status": "PASS_CLEAN"})
+            legacy_metadata = {
+                "run_id": "run-legacy",
+                "workflow_id": "wf-20260806T000003Z-legacy",
+                "status": "completed",
+                "created_at": MM.utc_now(),
+            }
+            MM.safe_write_json(
+                final_dir / "final.json",
+                {
+                    "schema_version": 8,
+                    "status": "PASS_CLEAN",
+                    "codex_verdict": "PASS_CLEAN",
+                    "triage_status": "PASS_CLEAN",
+                    "triage_sha256s": {"run-final": "a" * 64},
+                },
+            )
+            MM.safe_write_json(
+                legacy_dir / "final.json", {"schema_version": 7, "status": "PASS_CLEAN"}
+            )
             records = [
                 (pending_dir, pending_metadata),
                 (final_dir, final_metadata),
+                (legacy_dir, legacy_metadata),
                 (stale_dir, stale_metadata),
             ]
             with (
@@ -4103,12 +4349,15 @@ None.
         }
         self.assertEqual(states["wf-20260806T000000Z-pending"], "needs_triage")
         self.assertEqual(states["wf-20260806T000001Z-final"], "unclosed_run_final")
+        self.assertEqual(
+            states["wf-20260806T000003Z-legacy"], "legacy_untrusted_final"
+        )
         self.assertEqual(states["wf-20200101T000000Z-stale"], "stale_incomplete")
         self.assertEqual(states["wf-20260806T000002Z-old"], "superseded")
         self.assertEqual(report["unclassified_run_records"], 1)
         self.assertFalse(report["mutated"])
         compact = MM.render_workflow_audit_compact(report)
-        self.assertIn("Workflow audit: 4 workflows; stale threshold=7d", compact)
+        self.assertIn("Workflow audit: 5 workflows; stale threshold=7d", compact)
         self.assertIn(
             "wf-20260806T000000Z-pending: needs_triage; "
             "decide pending or unresolved items",
@@ -4117,6 +4366,11 @@ None.
         self.assertIn(
             "wf-20260806T000001Z-final: unclosed_run_final; "
             "verify freshness and run workflow finalize",
+            compact,
+        )
+        self.assertIn(
+            "wf-20260806T000003Z-legacy: legacy_untrusted_final; "
+            "start a fresh structured review; legacy finals cannot gate",
             compact,
         )
         args = MM.build_parser().parse_args(["workflow", "audit", "--format", "compact"])
@@ -4386,14 +4640,23 @@ None.
                     "supersedes": [],
                     "policy": MM.workflow_policy(),
                 }
-                final_document = {"status": "PASS_CLEAN", "source_fingerprint": "x"}
+                final_document = {
+                    "schema_version": 8,
+                    "status": "PASS_CLEAN",
+                    "source_fingerprint": "x",
+                    "codex_verdict": "PASS_CLEAN",
+                    "triage_status": "PASS_CLEAN",
+                    "triage_sha256s": {"run-done": "a" * 64},
+                }
                 read_json.side_effect = lambda path: (
                     final_document if path.name == "final.json" else workflow_document
                 )
-                status, ready = MM.workflow_status("wf-done")
+                with mock.patch.object(MM, "final_triage_is_fresh", return_value=True):
+                    status, ready = MM.workflow_status("wf-done")
             self.assertTrue(ready)
             self.assertEqual(status["state"], "ready_to_finalize")
             self.assertFalse(status["repositories"][0]["accepts_reviews"])
+            self.assertTrue(status["repositories"][0]["final_contract_trusted"])
             self.assertEqual(artifact_bytes.call_count, 1)
 
     def test_codex_block_overrides_clean_reviewer_triage(self) -> None:
@@ -4682,6 +4945,21 @@ None.
         self.assertEqual(
             set(final["triage_sha256s"]), {"run-repair", "run-confirmation"}
         )
+
+    def test_legacy_final_contract_is_untrusted(self) -> None:
+        trusted, issues = MM.final_contract_trust(
+            {
+                "schema_version": 7,
+                "status": "PASS_CLEAN",
+                "codex_review": "Codex says this should block.",
+                "triage_sha256": "a" * 64,
+            }
+        )
+        self.assertFalse(trusted)
+        self.assertIn("schema_version must be 8 or newer", issues)
+        self.assertIn("codex_verdict is missing or invalid", issues)
+        self.assertIn("triage_status is missing or invalid", issues)
+        self.assertIn("triage_sha256s is missing or invalid", issues)
 
     def test_supplemental_final_is_explicitly_non_authoritative(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
