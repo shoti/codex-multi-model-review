@@ -104,7 +104,7 @@ PROVIDER_BINARIES = {
 }
 LEGACY_PROVIDER_ALIASES = {"gemini": "antigravity"}
 PROVIDER_CHOICES = (*PROVIDERS, *LEGACY_PROVIDER_ALIASES)
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MAX_REPAIR_ROUNDS = 3
 RUN_PHASES = ("repair", "confirmation", "supplemental")
 DEFAULT_REVIEW_MODE = "balanced"
@@ -215,6 +215,8 @@ VALID_DECISIONS = {"accepted", "deferred", "fixed", "rejected", "uncertain"}
 VALID_TEST_GAP_DECISIONS = {"accepted", "covered", "deferred", "rejected"}
 MEMORY_ASSESSMENTS = {"useful", "irrelevant", "mixed"}
 SEVERITY_ORDER = {"blocker": 4, "high": 3, "medium": 2, "low": 1}
+GATE_STATUSES = ("PASS_CLEAN", "PASS_WITH_FINDINGS", "BLOCK")
+GATE_STATUS_ORDER = {status: index for index, status in enumerate(GATE_STATUSES)}
 DOTENV_ASSIGNMENT_PATTERN = re.compile(
     r"""(?im)^[+\- ]?(?![+\-]{3})(?:export\s+)?
     (?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password)
@@ -4407,6 +4409,7 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
         freshness_mode = "not-finalized"
         commit = None
         final_status = None
+        triage_fresh = False
         if final_path.exists():
             final = read_json(final_path)
             final_status = final.get("status")
@@ -4417,6 +4420,10 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                 fresh = bool(freshness["fresh"])
                 freshness_mode = str(freshness["mode"])
                 commit = freshness.get("commit")
+                triage_fresh = final_triage_is_fresh(
+                    run_dir, metadata, final
+                )
+                fresh = fresh and triage_fresh
             except ReviewError:
                 fresh = False
             passing_status = str(final_status).startswith("PASS") or (
@@ -4440,6 +4447,7 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                 "confirmation_complete": confirmation_complete,
                 "fresh": fresh,
                 "freshness_mode": freshness_mode,
+                "triage_fresh": triage_fresh,
                 "commit": commit,
                 "final_status": final_status,
                 "accepts_reviews": not confirmation_complete,
@@ -5289,6 +5297,169 @@ def final_gate_status(
     return "PASS_CLEAN"
 
 
+def conservative_gate_status(*statuses: str) -> str:
+    invalid = [status for status in statuses if status not in GATE_STATUS_ORDER]
+    if invalid:
+        raise ReviewError(
+            "Invalid final-gate status: " + ", ".join(sorted(set(invalid)))
+        )
+    return max(statuses, key=GATE_STATUS_ORDER.__getitem__)
+
+
+def repository_key(metadata: dict[str, Any]) -> str | None:
+    repository = metadata.get("repository")
+    if not isinstance(repository, dict):
+        return None
+    value = repository.get("id") or repository.get("root")
+    return str(value) if value else None
+
+
+def finalization_triage_runs(
+    run_dir: Path,
+    metadata: dict[str, Any],
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Return current and earlier same-repository runs that inform this gate."""
+    current_dir = run_dir.resolve()
+    records: dict[Path, dict[str, Any]] = {current_dir: metadata}
+    workflow_identifier = str(metadata.get("workflow_id") or "")
+    if not workflow_identifier or metadata.get("phase") == "supplemental":
+        return list(records.items())
+    current_repository = repository_key(metadata)
+    current_round = int(metadata.get("round", 0))
+    workflow_ancestry = workflow_ancestry_ids(workflow_identifier)
+    workflow_order = {
+        identifier: index for index, identifier in enumerate(workflow_ancestry)
+    }
+    for candidate_workflow in workflow_ancestry:
+        for candidate_dir, candidate_metadata in workflow_runs(candidate_workflow):
+            candidate_dir = candidate_dir.resolve()
+            if (
+                candidate_dir == current_dir
+                or candidate_metadata.get("status") != "completed"
+            ):
+                continue
+            if candidate_metadata.get("phase") == "supplemental":
+                continue
+            if (
+                current_repository is None
+                or repository_key(candidate_metadata) != current_repository
+            ):
+                continue
+            if (
+                candidate_workflow == workflow_identifier
+                and int(candidate_metadata.get("round", 0)) > current_round
+            ):
+                continue
+            records[candidate_dir] = candidate_metadata
+    return sorted(
+        records.items(),
+        key=lambda item: (
+            workflow_order.get(str(item[1].get("workflow_id") or ""), 0),
+            int(item[1].get("round", 0)),
+            str(item[1].get("created_at", "")),
+            str(item[0]),
+        ),
+    )
+
+
+def final_item_reference(
+    item: dict[str, Any],
+    run_dir: Path,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    run_identifier = str(metadata.get("run_id") or run_dir.name)
+    item_identifier = str(item.get("id") or "unknown")
+    return {
+        "id": f"{run_identifier}:{item_identifier}",
+        "item_id": item_identifier,
+        "run_id": run_identifier,
+        "run_dir": str(run_dir),
+        "round": metadata.get("round"),
+        "phase": metadata.get("phase", "repair"),
+        "kind": item.get("kind", "finding"),
+        "reviewer": item.get("reviewer"),
+        "title": item.get("title"),
+        "location": item.get("location"),
+        "severity": item.get("severity"),
+        "decision": item.get("decision"),
+        "evidence": item.get("evidence"),
+        "action": item.get("action"),
+        "verification": item.get("verification"),
+    }
+
+
+def final_triage_is_fresh(
+    run_dir: Path,
+    metadata: dict[str, Any],
+    final: dict[str, Any],
+) -> bool:
+    expected_many = final.get("triage_sha256s")
+    if isinstance(expected_many, dict):
+        actual: dict[str, str] = {}
+        for candidate_dir, candidate_metadata in finalization_triage_runs(
+            run_dir, metadata
+        ):
+            triage_path = candidate_dir / "triage.json"
+            if not triage_path.is_file():
+                return False
+            run_identifier = str(
+                candidate_metadata.get("run_id") or candidate_dir.name
+            )
+            actual[run_identifier] = sha256_text(
+                triage_path.read_text(encoding="utf-8")
+            )
+        return actual == expected_many
+    expected_one = final.get("triage_sha256")
+    triage_path = run_dir / "triage.json"
+    if isinstance(expected_one, str) and triage_path.is_file():
+        return sha256_text(triage_path.read_text(encoding="utf-8")) == expected_one
+    return True
+
+
+def effective_finalization_items(
+    items: Sequence[tuple[dict[str, Any], Path, dict[str, Any]]],
+    workflow_identifier: str,
+) -> list[tuple[dict[str, Any], Path, dict[str, Any]]]:
+    """Carry ancestor deferrals while allowing later matching decisions to resolve them."""
+    effective: list[
+        tuple[
+            tuple[str, str],
+            str,
+            tuple[dict[str, Any], Path, dict[str, Any]],
+        ]
+    ] = []
+    for item, item_run_dir, item_metadata in items:
+        item_workflow = str(item_metadata.get("workflow_id") or "")
+        title = normalized_item_title(item.get("title"))
+        identity = (
+            str(item.get("kind") or "finding"),
+            title
+            or f"{item_metadata.get('run_id') or item_run_dir.name}:{item.get('id')}",
+        )
+        run_identifier = str(item_metadata.get("run_id") or item_run_dir.resolve())
+        matching_deferrals = [
+            index
+            for index, (prior_identity, prior_run, prior) in enumerate(effective)
+            if prior_identity == identity
+            and prior_run != run_identifier
+            and prior[0].get("decision") == "deferred"
+        ]
+        if item.get("decision") != "deferred" and len(matching_deferrals) == 1:
+            effective.pop(matching_deferrals[0])
+        is_current_workflow = (
+            not item_workflow or item_workflow == workflow_identifier
+        )
+        if is_current_workflow or item.get("decision") == "deferred":
+            effective.append(
+                (
+                    identity,
+                    run_identifier,
+                    (item, item_run_dir, item_metadata),
+                )
+            )
+    return [entry for _, _, entry in effective]
+
+
 def incomplete_review_coverage(run_dir: Path) -> list[dict[str, Any]]:
     summary_path = run_dir / "review-summary.json"
     if not summary_path.exists():
@@ -5345,22 +5516,81 @@ def finalize_command(args: argparse.Namespace) -> int:
             "needed source changes, then run and finalize the mandatory "
             "confirmation round."
         )
-    triage_path = run_dir / "triage.json"
-    with exclusive_file_lock(triage_path):
-        triage = read_json(triage_path)
-        triage_text = triage_path.read_text(encoding="utf-8")
-    findings = triage.get("findings")
-    if not isinstance(findings, list):
-        raise ReviewError("Triage has no valid findings list.")
-    test_gaps = triage.get("test_gaps", [])
-    if not isinstance(test_gaps, list):
-        raise ReviewError("Triage has no valid test-gaps list.")
-    pending = pending_triage_ids(triage)
-    if pending:
-        raise ReviewError(
-            "Every finding and test gap must be decided before finalization: "
-            + ", ".join(pending)
+    triage_runs = finalization_triage_runs(run_dir, metadata)
+    triage_paths = [
+        candidate_dir / "triage.json" for candidate_dir, _ in triage_runs
+    ]
+    triage_snapshots: list[
+        tuple[Path, dict[str, Any], dict[str, Any], str]
+    ] = []
+    with exclusive_file_locks(triage_paths):
+        for candidate_dir, candidate_metadata in triage_runs:
+            candidate_path = candidate_dir / "triage.json"
+            if not candidate_path.exists():
+                raise ReviewError(
+                    f"Completed workflow run has no triage.json: {candidate_dir}"
+                )
+            candidate_triage = read_json(candidate_path)
+            candidate_text = candidate_path.read_text(encoding="utf-8")
+            findings = candidate_triage.get("findings")
+            if not isinstance(findings, list):
+                raise ReviewError(
+                    f"Triage has no valid findings list: {candidate_path}"
+                )
+            test_gaps = candidate_triage.get("test_gaps", [])
+            if not isinstance(test_gaps, list):
+                raise ReviewError(
+                    f"Triage has no valid test-gaps list: {candidate_path}"
+                )
+            pending = pending_triage_ids(candidate_triage)
+            if pending:
+                run_identifier = str(
+                    candidate_metadata.get("run_id") or candidate_dir.name
+                )
+                raise ReviewError(
+                    "Every finding and test gap must be decided before "
+                    f"finalization: {run_identifier}:"
+                    + f", {run_identifier}:".join(pending)
+                )
+            triage_snapshots.append(
+                (candidate_dir, candidate_metadata, candidate_triage, candidate_text)
+            )
+
+    current_snapshot = next(
+        snapshot
+        for snapshot in triage_snapshots
+        if snapshot[0] == run_dir.resolve()
+    )
+    triage_text = current_snapshot[3]
+    history_findings: list[tuple[dict[str, Any], Path, dict[str, Any]]] = []
+    history_test_gaps: list[tuple[dict[str, Any], Path, dict[str, Any]]] = []
+    triage_sha256s: dict[str, str] = {}
+    for (
+        candidate_dir,
+        candidate_metadata,
+        candidate_triage,
+        candidate_text,
+    ) in triage_snapshots:
+        run_identifier = str(
+            candidate_metadata.get("run_id") or candidate_dir.name
         )
+        triage_sha256s[run_identifier] = sha256_text(candidate_text)
+        history_findings.extend(
+            (item, candidate_dir, candidate_metadata)
+            for item in candidate_triage.get("findings", [])
+            if isinstance(item, dict)
+        )
+        history_test_gaps.extend(
+            (item, candidate_dir, candidate_metadata)
+            for item in candidate_triage.get("test_gaps", [])
+            if isinstance(item, dict)
+        )
+    history_findings = effective_finalization_items(
+        history_findings, workflow_identifier
+    )
+    history_test_gaps = effective_finalization_items(
+        history_test_gaps, workflow_identifier
+    )
 
     reviewed = metadata.get("source_fingerprint")
     freshness = freshness_status(run_dir, metadata, reviewed)
@@ -5371,6 +5601,7 @@ def finalize_command(args: argparse.Namespace) -> int:
         )
 
     codex_review = args.codex_review.strip()
+    codex_verdict = str(args.codex_verdict)
     verification = [item.strip() for item in args.verification if item.strip()]
     coverage_verification = [
         item.strip()
@@ -5405,25 +5636,25 @@ def finalize_command(args: argparse.Namespace) -> int:
             + "\n- ".join(details)
         )
     remaining = [
-        item
-        for item in findings
-        if isinstance(item, dict)
-        and item.get("decision") in {"accepted", "deferred", "uncertain"}
+        final_item_reference(item, candidate_dir, candidate_metadata)
+        for item, candidate_dir, candidate_metadata in history_findings
+        if item.get("decision") in {"accepted", "deferred", "uncertain"}
     ]
     accepted_test_gaps = [
-        item
-        for item in test_gaps
-        if isinstance(item, dict) and item.get("decision") == "accepted"
+        final_item_reference(item, candidate_dir, candidate_metadata)
+        for item, candidate_dir, candidate_metadata in history_test_gaps
+        if item.get("decision") == "accepted"
     ]
     deferred_test_gaps = [
-        item
-        for item in test_gaps
-        if isinstance(item, dict) and item.get("decision") == "deferred"
+        final_item_reference(item, candidate_dir, candidate_metadata)
+        for item, candidate_dir, candidate_metadata in history_test_gaps
+        if item.get("decision") == "deferred"
     ]
-    gate_status = final_gate_status(
-        [item for item in findings if isinstance(item, dict)],
-        [item for item in test_gaps if isinstance(item, dict)],
+    triage_status = final_gate_status(
+        [item for item, _, _ in history_findings],
+        [item for item, _, _ in history_test_gaps],
     )
+    gate_status = conservative_gate_status(triage_status, codex_verdict)
     status = gate_status
     if phase == "supplemental":
         status = {
@@ -5460,6 +5691,9 @@ def finalize_command(args: argparse.Namespace) -> int:
         "source_fingerprint": reviewed,
         "freshness_mode": freshness["mode"],
         "triage_sha256": sha256_text(triage_text),
+        "triage_sha256s": triage_sha256s,
+        "triage_status": triage_status,
+        "codex_verdict": codex_verdict,
         "codex_review": codex_review,
         "verification": verification,
         "review_coverage": {
@@ -5470,9 +5704,9 @@ def finalize_command(args: argparse.Namespace) -> int:
                 incomplete_coverage and coverage_verification
             ),
         },
-        "remaining_finding_ids": [
-            str(item.get("id")) for item in remaining
-        ],
+        "remaining_findings": remaining,
+        "remaining_finding_ids": [str(item.get("id")) for item in remaining],
+        "remaining_test_gaps": accepted_test_gaps + deferred_test_gaps,
         "remaining_test_gap_ids": [
             str(item.get("id"))
             for item in accepted_test_gaps + deferred_test_gaps
@@ -5501,7 +5735,9 @@ def verify_command(args: argparse.Namespace) -> int:
     freshness = freshness_status(
         run_dir, metadata, final.get("source_fingerprint")
     )
-    fresh = bool(freshness["fresh"])
+    source_fresh = bool(freshness["fresh"])
+    triage_fresh = final_triage_is_fresh(run_dir, metadata, final)
+    fresh = source_fresh and triage_fresh
     status = final.get("status")
     print(
         json.dumps(
@@ -5509,6 +5745,8 @@ def verify_command(args: argparse.Namespace) -> int:
                 "run_dir": str(run_dir),
                 "status": status,
                 "fresh": fresh,
+                "source_fresh": source_fresh,
+                "triage_fresh": triage_fresh,
                 "freshness_mode": freshness["mode"],
                 "commit": freshness.get("commit"),
                 "reviewed_fingerprint": final.get("source_fingerprint"),
@@ -7235,6 +7473,15 @@ def build_parser() -> argparse.ArgumentParser:
         "finalize", help="Finalize a fresh run after Codex review and verification"
     )
     finalize.add_argument("--run", required=True, help="Review run directory")
+    finalize.add_argument(
+        "--codex-verdict",
+        required=True,
+        choices=GATE_STATUSES,
+        help=(
+            "Codex's explicit final verdict; the machine gate uses the more "
+            "conservative result of this verdict and workflow triage"
+        ),
+    )
     finalize.add_argument("--codex-review", required=True)
     finalize.add_argument(
         "--verification",

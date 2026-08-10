@@ -176,6 +176,7 @@ selector is accepted only when it resolves to the pinned scope.
 
 ```bash
 mm-review finalize --run <run-dir> \
+  --codex-verdict <PASS_CLEAN|PASS_WITH_FINDINGS|BLOCK> \
   --codex-review "<final review result>" \
   --verification "<command/check: result>"
 mm-review verify --run <run-dir>
@@ -187,6 +188,7 @@ named path and limitation yourself and persist concrete compensation:
 
 ```bash
 mm-review finalize --run <run-dir> \
+  --codex-verdict <PASS_CLEAN|PASS_WITH_FINDINGS|BLOCK> \
   --codex-review "<final review result>" \
   --verification "<command/check: result>" \
   --coverage-verification "Read <paths> fully and traced <call paths>: <result>"
@@ -198,8 +200,14 @@ unreviewed paths, and limitations remain visible in `review-summary.json` and
 `triage.json`; the final gate additionally records Codex's compensation.
 Aggregate coverage remains visible in workflow metrics and analytics.
 
-`finalize` accepts only the confirmation round for new workflows and produces
-`PASS_CLEAN`, `PASS_WITH_FINDINGS`, or `BLOCK`. It refuses stale source,
+`finalize` accepts only the confirmation round for new workflows and requires
+Codex's explicit structured verdict. It produces the more conservative result
+of that verdict and the complete triage history for the repository workflow:
+`PASS_CLEAN`, `PASS_WITH_FINDINGS`, or `BLOCK`. Earlier deferred or otherwise
+unresolved items remain visible with run-qualified IDs, and deferrals from
+superseded task-lineage ancestors carry forward until a later matching decision
+resolves them. Verification hashes the complete triage set and fails closed if
+any recorded decision changes after finalization. It refuses stale source,
 pending findings/test gaps, accepted unresolved test gaps, risk-profiled runs
 without verification, and accepted/uncertain blocker or high confirmation
 findings.
@@ -230,6 +238,7 @@ pair:
 mm-review run --supplemental-of <finalized-run-dir> \
   --task "<focused additional concern>"
 mm-review finalize --run <supplemental-run-dir> \
+  --codex-verdict <PASS_CLEAN|PASS_WITH_FINDINGS|BLOCK> \
   --codex-review "<focused Codex verification>"
 mm-review verify --run <supplemental-run-dir>
 ```

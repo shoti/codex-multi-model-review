@@ -113,6 +113,16 @@ The final machine-readable gate is:
   remain;
 - `BLOCK`: an accepted/uncertain blocker or high finding remains.
 
+Codex must record its own explicit structured verdict at finalization. The
+machine status is the more conservative result of that verdict and reviewer
+triage across every completed round for the repository workflow. A Codex block
+can never be represented as a passing artifact. Deferred and otherwise
+unresolved earlier-round items remain in the final gate under run-qualified
+IDs even when the confirmation reviewer does not repeat them. Deferred items
+also carry across superseded task-lineage ancestors until a later matching
+decision resolves the same kind and title. The final gate hashes this complete
+triage set; changing any contributing decision makes the gate stale.
+
 `mm-review verify` must confirm the final gate is fresh. Every task must also
 run `mm-review workflow finalize` to close the workflow after confirming the
 latest round in each repository and the complete triage history.
