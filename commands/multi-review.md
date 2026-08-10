@@ -27,7 +27,7 @@ repository. Do not stop after collecting reviewer reports.
      for unusually high-risk work.
    - State explicitly which reviewers actually ran.
 5. Run `mm-review doctor` and stop if the plugin/cache or an enabled reviewer is
-   not ready. Use `mm-review doctor --live` before the first paid-provider run
+   not ready. Use `mm-review doctor --live` before the first allowance-consuming run
    in a session or after a provider failure.
    Antigravity readiness must prove authenticated model access, not only that
    `agy` exists on PATH.
@@ -50,15 +50,16 @@ repository. Do not stop after collecting reviewer reports.
 ## Plan
 
 State repositories, path filters, scope, risk profiles, and enabled reviewers.
-Create one workflow ID for the task with a deliberate cumulative Claude budget.
-That cap follows every linked successor; supersession never resets task spend.
+Create one workflow ID for the task with a deliberate per-provider attempt
+ceiling. Successful and failed attempts follow every linked successor;
+supersession never resets task usage.
 Claude, Antigravity, and Kimi receive fresh independent read-only sessions when
 enabled. Codex remains implementer, finding verifier, and final gate.
 
 ## Commands
 
 1. Run `mm-review workflow start --review-mode <fast|balanced|deep>
-   --max-budget-usd <cap>`, then run
+   --max-provider-attempts <count>`, then run
    `--phase repair` in each affected
    repository with the same workflow ID, explicit `--path` filters, task
    intent, risks, review profile, and any provider override. Round numbering is
@@ -70,13 +71,13 @@ enabled. Codex remains implementer, finding verifier, and final gate.
    accepted.
 2. Read every reviewer report completely.
    If a run is `partial`, keep the source unchanged and use `mm-review resume`
-   so only failed reviewers are retried. If Claude exhausted its budget, pass
+   so only failed reviewers are retried. If Claude reached its native
+   API-equivalent stop, pass
    a larger one-resume `--claude-max-budget-usd` and/or lower
-   `--claude-effort` without reducing the existing budget; do not repeat a
+   `--claude-effort` without reducing the existing stop; do not repeat a
    weaker cap blindly.
-   The runner protects a 10% provider-overrun reserve and refuses a call when
-   the safe provider allowance is below comparable successful history. Do not
-   bypass that stop with a smaller review.
+   The USD denomination is Claude CLI's native stop and an API-price equivalent,
+   not proof of subscription billing.
 3. Independently trace every finding and test gap against the actual code path.
    Record every result with `mm-review decide` or one atomic
    `mm-review decide-batch`; model agreement alone is not evidence.
@@ -92,6 +93,10 @@ enabled. Codex remains implementer, finding verifier, and final gate.
    be finalized. If scoped source changes after confirmation, explicitly use
    `workflow supersede` and review under its successor. Keep scope, path
    filters, risks, review profile, and task text identical within one workflow.
+8. Use `mm-review continue <workflow-id>` for a read-only next-action plan.
+   Add `--execute-review` only when provider allowance may be consumed. Use
+   `mm-review gate <workflow-id>` to consolidate Codex finalization,
+   verification, optional commit attestation, and workflow closure.
 
 Never allow an external reviewer to edit the working tree. Do not commit, push,
 open a PR, deploy, or change production state without separate authorization.
@@ -104,9 +109,9 @@ Before finishing:
 - verify the relevant checks pass, or state exact failures and test gaps;
 - inspect the final diff for correctness, scope, secrets, and unintended files;
 - perform the final Codex review;
-- run `mm-review finalize` and `mm-review verify` for every repository;
-- run `mm-review workflow finalize` after every repository is ready, including
-  a single-repository task, so the workflow becomes explicitly completed;
+- run `mm-review gate <workflow-id>` after confirmation triage and Codex's
+  evidence-backed final review; the equivalent manual sequence remains
+  `finalize`, `verify`, then `workflow finalize`;
 - if a reviewed working tree is later committed with user authorization, run
   `mm-review attest-commit --run <run-dir> --commit HEAD` and verify again.
 
@@ -115,7 +120,8 @@ Before finishing:
 Report:
 
 - workflow ID, final round, reviewer models, scope, paths, and risk profiles;
-- aggregate reviewer runtime, reported cost, and turns from workflow status;
+- aggregate reviewer runtime, attempts, tokens, API-price equivalent, and turns
+  from workflow status;
 - accepted and fixed findings;
 - rejected, uncertain, covered, or deferred items with evidence;
 - verification commands and results;

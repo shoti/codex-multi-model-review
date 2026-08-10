@@ -23,7 +23,7 @@ names remain accepted as compatibility aliases.
 
 ```bash
 mm-review workflow start --name "<task>" \
-  --review-mode <fast|balanced|deep> --max-budget-usd 5
+  --review-mode <fast|balanced|deep> --max-provider-attempts 6
 ```
 
 Choose `fast` only for small, localized, low-risk changes; it permits one
@@ -34,18 +34,22 @@ broad cross-component changes; it retains the three-repair ceiling. Every mode
 still requires a fresh confirmation round. The default is `balanced`.
 Use `mm-review recommend` when the changed-path risk is unclear; its result is
 advisory and any explicit risk label still recommends `deep`.
-When historical budget exhaustion or an unfamiliar patch size makes the cap
-uncertain, inspect local evidence before starting:
+New workflows treat subscription allowance, provider attempts, quota cooldowns,
+and token telemetry as the scarce resources. They do not enforce a cumulative
+dollar cap. Claude still requires its native USD-denominated emergency stop in
+print mode; artifacts label that number as an API-price equivalent, not a bill.
+When historical exhaustion or an unfamiliar patch size makes Claude's native
+per-call stop uncertain, inspect local evidence before starting:
 
 ```bash
 mm-review budget-estimate --uncommitted \
   --review-mode <fast|balanced|deep> --claude-effort <effort>
 ```
 
-Treat the recommendation as advisory. Never lower review quality or change
-provider, effort, or budget automatically from historical cost evidence. The
-runner will still stop before launch if the safe remaining provider allowance
-is below the median cost of a sufficiently large comparable successful cohort.
+Treat the recommendation as advisory. Never lower review quality from historical
+usage evidence. The runner records provider authentication mode, readiness,
+attempts, quota cooldowns, and tokens; remaining subscription allowance stays
+`unknown` when a provider does not expose it.
 
 3. Run repair round 1 in each affected repository. Round numbering is automatic
    when `--round` is omitted. Prefer repeatable `--path` filters over temporary
@@ -143,11 +147,11 @@ mm-review resume --run <partial-run-dir>
 Resume fails closed if the source fingerprint changed or a later completed
 round already exists. Typed provider failures and the successful reports remain
 in the same run artifact. Every failed and resumed attempt retains its own
-metadata and archived provider artifacts, and every reported attempt cost counts
-toward the cumulative task-lineage cap.
+metadata and archived provider artifacts, and every attempt counts toward the
+cumulative provider-attempt ceiling.
 
-If Claude exhausted its per-review budget, do not blindly repeat the same cap or
-lower both effort and budget.
+If Claude reached its native per-review API-equivalent stop, do not blindly
+repeat the same cap or lower both effort and the stop.
 Resume the unchanged snapshot with an explicit one-attempt override:
 
 ```bash
@@ -155,12 +159,11 @@ mm-review resume --run <partial-run-dir> \
   --claude-max-budget-usd 2 --claude-effort medium
 ```
 
-The lineage cap still applies. A linked successor inherits every ancestor's
-reported spend and active reservations, so supersession cannot reset the task
-budget. If source, paths, or acceptance criteria must change, create a linked
-successor instead of resuming.
-An existing workflow supplied through `workflow supersede --by` must have the
-exact same cumulative cap; the command rejects a mismatched replacement.
+The provider-attempt ceiling still applies. A linked successor inherits every
+ancestor's successful and failed provider attempts, so supersession cannot reset
+task usage. If source, paths, or acceptance criteria must change, create a
+linked successor instead of resuming. An existing usage-aware workflow supplied
+through `workflow supersede --by` must have the exact same provider-usage policy.
 
 7. When no further source change is planned, run one mandatory confirmation
    round:
@@ -176,6 +179,27 @@ confirmation drift. Omit the scope selector for a command that works with
 `--uncommitted`, `--base`, and `--commit` repair contracts. An explicit scope
 selector is accepted only when it resolves to the pinned scope.
 
+Use the usage-aware continuation helper whenever the next lifecycle step is
+unclear:
+
+```bash
+mm-review continue <workflow-id>
+```
+
+It is read-only by default and returns the next exact action: initial review,
+triage, repair, confirmation, provider wait, Codex finalization, or gate closure.
+It includes provider authentication/resource mode, local attempt consumption,
+known cooldown/reset evidence, and `unknown` where remaining provider allowance
+is not observable. To authorize one available provider-review step:
+
+```bash
+mm-review continue <workflow-id> --execute-review
+```
+
+Persistent `provider_use_policy=auto` makes the plain command execute one safe
+review step automatically. It never fabricates triage decisions or Codex's
+final verdict.
+
 8. Triage the confirmation, perform Codex's final diff review, and finalize it:
 
 ```bash
@@ -185,6 +209,21 @@ mm-review finalize --run <run-dir> \
   --verification "<command/check: result>"
 mm-review verify --run <run-dir>
 ```
+
+The consolidated gate can perform the same finalization, verification, optional
+checked-out-HEAD attestation, and workflow closure:
+
+```bash
+mm-review gate <workflow-id> \
+  --codex-verdict <PASS_CLEAN|PASS_WITH_FINDINGS|BLOCK> \
+  --codex-review "<evidence-backed final review>" \
+  --verification "<command/check: result>" \
+  --attest-commit
+```
+
+Without a Codex verdict it reports `NEEDS_CODEX_FINAL`; without a mandatory
+confirmation it reports the exact `continue` action. `gate` does not invoke a
+provider unless `--execute-review` is explicitly supplied.
 
 If a successful confirmation reviewer explicitly reports incomplete coverage,
 finalization fails closed. Run another independent review, or inspect every
@@ -250,7 +289,7 @@ mm-review verify --run <supplemental-run-dir>
 The runner verifies exact content equivalence and writes `supplemental.json`.
 Supplemental evidence never replaces the parent final gate. Any accepted issue
 that changes source requires a normal successor workflow. Repeated supplemental
-siblings share the parent's lineage spend, reservations, and cumulative cap.
+siblings share the parent's provider-attempt lineage and reservations.
 
 Never claim a final PASS from an external report alone. The authoritative gate
 is a fresh `final.json` plus the completed workflow final. A supplemental file
@@ -276,7 +315,8 @@ user separately authorizes it.
 ## Control reviewers
 
 Claude is enabled by default. Antigravity and Kimi remain disabled until
-explicitly enabled, which avoids accidental spend or quota retries. Use the
+explicitly enabled, which avoids accidental allowance consumption or quota
+retries. Use the
 bundled runner so the plugin remains self-contained:
 
 ```bash
@@ -285,8 +325,11 @@ python3 <skill-dir>/scripts/mm_review.py doctor
 python3 <skill-dir>/scripts/mm_review.py doctor --live
 python3 <skill-dir>/scripts/mm_review.py recover --run <orphaned-run-dir>
 python3 <skill-dir>/scripts/mm_review.py set-effort medium
-python3 <skill-dir>/scripts/mm_review.py set-budget 1.25
-python3 <skill-dir>/scripts/mm_review.py set-workflow-budget 5
+python3 <skill-dir>/scripts/mm_review.py set-claude-usage-limit 1.25
+python3 <skill-dir>/scripts/mm_review.py set-provider-attempt-limit 6
+python3 <skill-dir>/scripts/mm_review.py set-provider-use-policy explicit
+python3 <skill-dir>/scripts/mm_review.py continue <workflow-id>
+python3 <skill-dir>/scripts/mm_review.py gate <workflow-id>
 python3 <skill-dir>/scripts/mm_review.py analytics --since-days 30 --format compact
 python3 <skill-dir>/scripts/mm_review.py budget-estimate --uncommitted --review-mode balanced
 python3 <skill-dir>/scripts/mm_review.py workflow audit --stale-days 7 --format compact
@@ -305,9 +348,11 @@ python3 <skill-dir>/scripts/mm_review.py set-model kimi k3-256k
 python3 <skill-dir>/scripts/mm_review.py set-model kimi k3
 ```
 
-`set-effort` and `set-budget` change persistent defaults. Prefer
+`set-effort` and `set-claude-usage-limit` change persistent defaults. Prefer
 `run --claude-effort ... --claude-max-budget-usd ...` or the matching `resume`
-flags for one review so temporary cost tuning does not leak into later tasks.
+flags for one review so temporary provider-native tuning does not leak into
+later tasks. `set-budget` and `set-workflow-budget` remain compatibility aliases
+for legacy configurations; new workflows do not use a cumulative dollar gate.
 
 Use `--with-antigravity`, `--without-antigravity`, `--with-kimi`, or
 `--without-kimi` for one-run overrides. Antigravity model `auto` delegates
@@ -339,7 +384,7 @@ reachable, has at least one available model, and the hard read-only custom
 agent matches the bundled definition. Run `agy` to authenticate or
 `mm-review install-antigravity-agent` to repair the agent when readiness fails.
 Kimi readiness calls `kimi provider list --json` and verifies that the selected
-model alias is actually configured before any paid review starts.
+model alias is actually configured before any provider allowance is consumed.
 
 ## Apply review policy
 
@@ -377,20 +422,21 @@ The runner:
 - requires structured reviewer coverage, persists notes and uncovered changed
   paths, and blocks finalization until incomplete confirmation coverage is
   independently rerun or explicitly compensated by Codex evidence;
-- caps Claude spend per review and cumulatively across the successor lineage
-  with atomic per-run reservations, including concurrent repositories;
-- protects a 10% provider-overrun reserve, refuses to launch when the safely
-  available Claude cap is below $0.25 or the comparable successful median, and
-  fails the run if reported cost exceeds the protected reservation;
+- caps provider attempts cumulatively across the successor lineage with atomic
+  per-run reservations, including concurrent repositories, and skips an
+  exhausted provider when another enabled reviewer is ready;
+- retains Claude's native per-review API-equivalent emergency stop without
+  treating it as subscription billing; legacy workflows retain their original
+  dollar-denominated lineage semantics for artifact compatibility;
 - preserves valid reports when another provider fails and resumes only the
   failed reviewers against the same immutable source under a full-transaction
   run lock;
 - records typed provider failures without replacing them with generic terminal
   exceptions;
-- classifies Claude budget exhaustion separately, rejects an unchanged blind
-  retry, and supports explicit one-resume effort/budget overrides;
+- classifies Claude native-stop exhaustion separately, rejects an unchanged
+  blind retry, and supports explicit one-resume effort/stop overrides;
 - preserves every resume attempt and its artifacts so analytics and cumulative
-  budget enforcement include failed paid attempts;
+  provider-attempt enforcement include failed attempts;
 - supports explicit successor workflow lineage after a closed confirmation or
   intentional contract change;
 - issues exact-fingerprint, one-shot approvals for inspected secret-scan
@@ -403,15 +449,16 @@ The runner:
 - preserves exact repeated-finding links across successor ancestors and adds a
   private rebuildable SQLite evidence index that ranks verified history across
   titles, paths, evidence, actions, and verification;
-- links review rounds across repositories and aggregates models, time, reported
-  cost, findings, gaps, and decisions under a stable workflow ID.
+- links review rounds across repositories and aggregates models, time,
+  provider-reported tokens and API-price equivalents, findings, gaps, and
+  decisions under a stable workflow ID.
 - exposes local analytics for adaptive modes, provider success/failure
-  categories, partial resumes, spend, decisions, lineage-level outcomes, closed
+  categories, partial resumes, allowance usage, decisions, lineage-level outcomes, closed
   workflows, provider-reported tokens, artifact bytes, review phases/models,
   structured coverage, preflight blocks, and the distinct count of workflows
   with repository run finals.
 - separates explicit adaptive-mode cohorts from inferred legacy depth, reports
-  lifecycle debt and unclassified runs, and records advisory budget evidence;
+  lifecycle debt and unclassified runs, and records advisory usage evidence;
 - records optional Codex feedback about memory candidates so retrieval quality
   can be tuned from real usage instead of assumed relevance.
 

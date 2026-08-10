@@ -35,7 +35,8 @@ Codex Multi-Model Review turns that conversation into a durable workflow:
 - reviewers disclose incomplete coverage and unreviewed changed paths in a
   structured contract that cannot disappear into free-form notes;
 - Claude output is schema-constrained and partial provider failures are resumable;
-- cumulative Claude spend is capped across the whole successor lineage, not only per call;
+- provider attempts, quota cooldowns, authentication mode, and token telemetry
+  are tracked across the whole successor lineage;
 - a private rebuildable evidence index helps Codex compare prior verified outcomes
   after fresh reviewers finish, without biasing reviewer prompts;
 - a final PASS is valid only while its source fingerprint remains fresh.
@@ -155,8 +156,8 @@ always works.
 The normal Codex-driven flow is:
 
 1. Finish the implementation and focused local checks.
-2. Start one workflow for the user task with a deliberate review mode and an
-   explicit cumulative budget when the default `$5.00` cap is not appropriate.
+2. Start one workflow for the user task with a deliberate review mode and a
+   per-provider attempt ceiling.
 3. Run a repair review against explicit scope, paths, risks, and intent.
 4. Verify and disposition every finding and test gap.
 5. Fix accepted items and rerun focused tests.
@@ -187,33 +188,29 @@ rounds, not weakening a high-impact review.
 
 If one provider fails after another provider has produced a valid report, the
 run is preserved as `partial`. Resume that exact immutable snapshot instead of
-paying the successful provider again. If the task contract must change after a
+consuming the successful provider's allowance again. If the task contract must change after a
 confirmation, explicitly supersede the closed workflow so the lineage remains
-auditable. The original budget and all prior spend follow that lineage; a
-successor is not a fresh credit allowance.
+auditable. All prior successful and failed attempts follow that lineage; a
+successor is not a fresh allowance.
 
 Secret and symlink checks that stop before any provider invocation are reported
 as `preflight_blocked`, separately from failed reviews and provider failures.
 Exact secret approvals remain one-shot and fingerprint-bound.
-When attaching an existing successor with `workflow supersede --by`, its budget
-must exactly match the current lineage cap; mismatched workflows are rejected.
+When attaching an existing successor with `workflow supersede --by`, its
+provider-usage policy must exactly match the current lineage policy.
 
 Before starting, `mm-review recommend` can conservatively suggest `fast`,
 `balanced`, or `deep` from the actual changed paths and explicit risks. The
 recommendation is advisory and any selected risk keeps the result at `deep`.
-`mm-review budget-estimate` separately compares the current patch with local
-provider history and reports a non-binding p90-based budget recommendation.
-It reports cost-bearing samples separately from all comparable attempts, so
-failures without usage data still count toward exhaustion evidence. It never
-changes effort, budgets, providers, or workflow policy automatically. The
-runner does enforce the comparable successful cohort's median as a minimum
-viable provider allowance; if the lineage cannot safely fund that amount, it
-stops before invoking Claude.
+`mm-review budget-estimate` remains a compatibility diagnostic for Claude's
+native USD-denominated print-mode stop. Its output is an API-price equivalent,
+not proof of subscription billing. Lifecycle decisions use provider readiness,
+known quota cooldowns, attempts, and reported tokens instead.
 
 Resume history is append-only: earlier attempt metadata and provider artifacts
-remain available, and every reported attempt cost counts toward the workflow
-cap. Claude budget exhaustion requires an explicit one-resume effort or budget
-override instead of silently repeating the same capped attempt.
+remain available, and every attempt counts toward the workflow's per-provider
+ceiling. Claude native-stop exhaustion requires an explicit one-resume effort
+or stop override instead of silently repeating the same capped attempt.
 
 Resume holds a run-specific lock for the complete transaction. Overlapping
 attempts against one artifact serialize; after the first succeeds, the next
@@ -270,7 +267,7 @@ RUNNER="<plugin-root>/skills/multi-model-review/scripts/mm_review.py"
 python3 "$RUNNER" doctor
 python3 "$RUNNER" workflow start \
   --name "harden session validation" \
-  --max-budget-usd 5
+  --max-provider-attempts 6
 
 python3 "$RUNNER" run \
   --repo /path/to/repository \
@@ -311,6 +308,24 @@ python3 "$RUNNER" resume --run <partial-run-directory> \
   --claude-max-budget-usd 2 --claude-effort medium
 ```
 
+Ask the runner for the next lifecycle action without invoking a provider:
+
+```bash
+python3 "$RUNNER" continue <workflow-id>
+```
+
+Authorize exactly one available provider-review step with
+`continue <workflow-id> --execute-review`. After confirmation triage and Codex's
+final diff review, consolidate the final gate:
+
+```bash
+python3 "$RUNNER" gate <workflow-id> \
+  --codex-verdict PASS_CLEAN \
+  --codex-review "Final diff review found no remaining defect." \
+  --verification "Focused tests: passed" \
+  --attest-commit
+```
+
 When repair triage is complete, load the pinned contract for confirmation, then:
 
 ```bash
@@ -341,7 +356,7 @@ meaning.
 ### Supplemental rechecks
 
 When a finalized snapshot is still fresh and the user asks one additional
-question, avoid paying for another repair-plus-confirmation pair:
+question, avoid consuming allowance for another repair-plus-confirmation pair:
 
 ```bash
 python3 "$RUNNER" run \
@@ -356,8 +371,8 @@ python3 "$RUNNER" verify --run <supplemental-run-directory>
 
 This performs exactly one fresh review and writes `supplemental.json` with an
 explicitly non-authoritative status. It never replaces the parent `final.json`.
-Every supplemental sibling shares the parent's task-lineage cap and active
-reservations, so repeated rechecks cannot create new budget allowances.
+Every supplemental sibling shares the parent's provider-attempt lineage and
+active reservations, so repeated rechecks cannot create new allowances.
 If it identifies a real issue requiring source changes, create a normal linked
 successor and run the full repair/confirmation workflow.
 
@@ -379,7 +394,7 @@ opt-in, points back to full artifacts/evidence, and automatically falls back to
 JSON if it would emit more UTF-8 bytes.
 Analytics keeps explicit adaptive-mode lineages separate from modes inferred
 for legacy workflows, reports unclassified legacy run records, and exposes
-cost/duration/patch distributions. `workflow audit` is read-only: it identifies
+API-equivalent/duration/patch distributions. `workflow audit` is read-only: it identifies
 pending triage, unclosed run finals, failures, and stale incomplete work without
 rewriting or deleting evidence.
 
@@ -416,8 +431,12 @@ evidence for future retrieval tuning without influencing reviewers.
 | `enable` / `disable [--lock]` | Persist reviewer availability; a lock also rejects one-run overrides |
 | `set-model` | Set a reviewer model |
 | `set-effort` | Set Claude reasoning effort |
-| `set-budget` | Set Claude's per-review USD cap |
-| `set-workflow-budget` | Set the default cumulative Claude USD cap for new workflows |
+| `set-claude-usage-limit` | Set Claude's USD-denominated API-equivalent emergency stop; this is not subscription billing |
+| `set-provider-attempt-limit` | Set the default per-provider attempt ceiling for new workflows |
+| `set-provider-use-policy` | Require explicit provider execution or permit one-step automatic continuation |
+| `set-budget` / `set-workflow-budget` | Compatibility commands for Claude's native stop and legacy workflows |
+| `continue` | Report the next lifecycle action and optionally execute one available provider-review step |
+| `gate` | Finalize, verify, optionally attest, and close a ready workflow |
 | `workflow start/status/audit/supersede/finalize` | Manage adaptive review mode and task lineage; audit is read-only and status/audit support compact output |
 | `scan` | Issue a one-shot fingerprint-bound approval after inspecting secret findings |
 | `run` | Execute a repair, confirmation, or exact-content supplemental round |
@@ -427,9 +446,9 @@ evidence for future retrieval tuning without influencing reviewers.
 | `verify` | Confirm that the gate still matches current source |
 | `attest-commit` | Bind unchanged reviewed content or a clean reviewed `--base` branch to the checked-out commit |
 | `recover` | Mark an orphaned run failed after its process exits |
-| `analytics` | Summarize explicit versus inferred mode cohorts, workflow outcomes, tokens, artifact bytes, memory telemetry, failures, spend, and closure |
+| `analytics` | Summarize explicit versus inferred mode cohorts, workflow outcomes, tokens, API-price equivalents, artifact bytes, memory telemetry, failures, and closure |
 | `recommend` | Suggest a conservative review mode from current paths and explicit risks |
-| `budget-estimate` | Report an advisory historical Claude budget estimate for the current scope without changing policy |
+| `budget-estimate` | Report an advisory historical Claude API-equivalent estimate without changing policy |
 | `memory status/rebuild/search/compact` | Maintain and query ranked Codex-only verified evidence; search supports opt-in compact output |
 
 Use `python3 .../mm_review.py <command> --help` for all flags.
@@ -490,44 +509,46 @@ official distribution channels and verify which executable your shell selects.
 The built-in secret scan is defense in depth. It is not a substitute for a
 repository secret scanner or deliberate source review.
 
-## Cost controls
+## Provider usage controls
 
-Claude is enabled by default with a `$1.25` maximum per review invocation and a
-`$5.00` cumulative maximum per task lineage. Successor workflows inherit all
-ancestor spend. Before every call, the runner reduces the next Claude cap to
-fit the remaining lineage budget while protecting an additional 10% provider
-overrun reserve. Each run atomically reserves both amounts while locking the
-lineage workflow documents, so concurrent repositories cannot reserve the same
-dollars. It also refuses to launch when the safely available provider cap is
-below `$0.25` or below the median cost of a sufficiently large comparable
-successful cohort. Most workflows should converge well before the limit.
+New workflows are controlled by provider allowance rather than a fictional
+cross-provider dollar budget. The runner records, per provider:
 
-Every resume attempt is retained and charged to that cumulative calculation;
-a failed paid attempt cannot be hidden by a later successful retry. Use
-`--claude-effort` and `--claude-max-budget-usd` on `run` or `resume` for
-one-attempt tuning. The `set-effort` and `set-budget` commands change persistent
-defaults.
+- subscription, API-billed, or unknown authentication mode when observable;
+- successful and failed attempts across the complete successor lineage;
+- an atomic per-provider attempt reservation for concurrent repositories;
+- provider-reported token telemetry and turns;
+- quota cooldowns and reset evidence returned by the CLI;
+- `unknown` when remaining plan allowance is not exposed.
 
-After budget exhaustion, lowering effort counts as a meaningful retry only if
-the per-review budget is not also reduced. This avoids paying for a predictably
-weaker retry that is even more likely to exhaust its cap.
+The default ceiling is six attempts per provider per lineage. Exhausting one
+provider does not manufacture more quota or convert another provider's usage
+into dollars: a ready enabled reviewer may continue independently, while a
+workflow with no available reviewer reports `WAIT_FOR_PROVIDER`.
 
-The reservation is released after provider results and reported usage are
-persisted. If the runner process is forcibly killed, its reservation remains
-conservatively unavailable rather than silently permitting overspend; inspect
-and recover the interrupted run before deciding whether to supersede the
-lineage with a new explicit budget.
+Claude's non-interactive CLI still requires a USD-denominated `--max-budget-usd`
+stop. The plugin retains it as a per-call emergency brake and stores
+`total_cost_usd` as an API-price equivalent. For subscription authentication,
+that figure is not treated as a bill. If an `ANTHROPIC_API_KEY` overrides the
+subscription, status reports API-billed mode and the same figure may represent
+real token billing. Independently of Claude's own enforcement, the runner fails
+the review closed if the reported API-price equivalent exceeds that per-call
+stop plus the existing 10% provider-overrun safety reserve. This check is a
+per-call safety invariant, not workflow dollar accounting.
 
-If provider-reported cost exceeds even the protected reservation, the run is
-recorded as `lineage_budget_exceeded` and cannot produce a passing gate.
+Legacy workflows keep their original cumulative-dollar behavior so historical
+artifacts and gates remain verifiable. New workflows set
+`enforce_lineage_api_equivalent_cap=false`; their authoritative lifecycle guard
+is provider attempts plus observed quota/readiness state.
 
-`doctor --live` performs provider calls and gives its Claude probe a `$0.10`
-cap. Plain `status` and `doctor` do not probe disabled providers. Antigravity
-and Kimi usage is governed by their accounts; the runner does not enforce an
-equivalent USD cap for them.
+`continue` is read-only under the default `explicit` policy. Use
+`--execute-review` to consume one available review step, or deliberately set
+`provider_use_policy=auto`. Neither mode invents an unavailable remaining-quota
+percentage, triage decision, or Codex verdict.
 
-Provider-reported cost and usage are recorded when available. A configured cap
-is a safety limit, not a prediction of the final bill.
+`doctor --live` performs provider calls and gives its Claude probe a small
+native emergency stop. Plain status and doctor calls do not probe disabled
+providers.
 
 ## Troubleshooting
 
@@ -542,9 +563,11 @@ is a safety limit, not a prediction of the final bill.
   `mm-review recover --run <run-directory>`.
 - **Partial run:** keep the source unchanged and use
   `mm-review resume --run <run-directory>`; only failed reviewers run again.
-- **Claude budget exhausted:** resume only with an explicit
-  `--claude-max-budget-usd` and/or lower `--claude-effort`; the cumulative
-  workflow cap still applies.
+- **Claude native stop exhausted:** resume only with an explicit
+  `--claude-max-budget-usd` and/or lower `--claude-effort`; the provider-attempt
+  ceiling still applies.
+- **Provider attempt allowance exhausted:** wait for quota reset, enable another
+  provider, or intentionally supersede with a matching revised usage policy.
 - **Stale final gate or changed confirmation contract:** use
   `mm-review workflow supersede <workflow-id> --reason "<why>"`, then review
   under the reported successor workflow.
