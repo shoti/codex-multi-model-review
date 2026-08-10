@@ -5453,26 +5453,43 @@ None.
         self.assertTrue(result["advisory_only"])
 
     def test_workflow_status_distinguishes_ready_to_finalize_and_completed(self) -> None:
-        run_dir = Path("/private/tmp/finalized-review")
         metadata = {
             "workflow_id": "wf-done",
+            "run_id": "run-done",
             "repository": {"id": "repo-one"},
             "status": "completed",
             "round": 2,
             "phase": "confirmation",
         }
         with tempfile.TemporaryDirectory() as temporary:
-            workflows = Path(temporary)
+            root = Path(temporary)
+            workflows = root / "workflows"
+            run_dir = root / "finalized-review"
+            run_dir.mkdir()
+            workflow_document = {
+                "workflow_id": "wf-done",
+                "supersedes": [],
+                "policy": MM.workflow_policy(),
+            }
+            final_document = {
+                "schema_version": 8,
+                "status": "PASS_CLEAN",
+                "source_fingerprint": "x",
+                "codex_verdict": "PASS_CLEAN",
+                "triage_status": "PASS_CLEAN",
+                "triage_sha256s": {"run-done": "a" * 64},
+            }
             MM.safe_write_json(
                 workflows / "wf-done.json",
-                {
-                    "workflow_id": "wf-done",
-                    "supersedes": [],
-                    "policy": MM.workflow_policy(),
-                },
+                workflow_document,
+            )
+            MM.safe_write_json(run_dir / "final.json", final_document)
+            MM.safe_write_json(
+                run_dir / "triage.json", {"findings": [], "test_gaps": []}
             )
             with (
                 mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "CONFIG_PATH", root / "missing-config.json"),
                 mock.patch.object(MM, "workflow_runs", return_value=[(run_dir, metadata)]),
                 mock.patch.object(
                     MM, "workflow_lineage_runs", return_value=[(run_dir, metadata)]
@@ -5481,8 +5498,6 @@ None.
                     MM, "workflow_lineage_ids", return_value=["wf-done"]
                 ),
                 mock.patch.object(MM, "latest_workflow_runs", return_value=[(run_dir, metadata)]),
-                mock.patch.object(Path, "exists", return_value=True),
-                mock.patch.object(MM, "read_json") as read_json,
                 mock.patch.object(
                     MM,
                     "freshness_status",
@@ -5494,22 +5509,6 @@ None.
                     return_value=MM.empty_artifact_bytes(),
                 ) as artifact_bytes,
             ):
-                workflow_document = {
-                    "workflow_id": "wf-done",
-                    "supersedes": [],
-                    "policy": MM.workflow_policy(),
-                }
-                final_document = {
-                    "schema_version": 8,
-                    "status": "PASS_CLEAN",
-                    "source_fingerprint": "x",
-                    "codex_verdict": "PASS_CLEAN",
-                    "triage_status": "PASS_CLEAN",
-                    "triage_sha256s": {"run-done": "a" * 64},
-                }
-                read_json.side_effect = lambda path: (
-                    final_document if path.name == "final.json" else workflow_document
-                )
                 with mock.patch.object(MM, "final_triage_is_fresh", return_value=True):
                     status, ready = MM.workflow_status("wf-done")
             self.assertTrue(ready)
