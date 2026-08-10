@@ -139,7 +139,7 @@ DEFAULT_TIMEOUT_MINUTES = 15
 DOCTOR_TIMEOUT_SECONDS = 90
 DOCTOR_CLAUDE_BUDGET_USD = 0.10
 DEFAULT_QUOTA_COOLDOWN_MINUTES = 60
-MIN_CLAUDE_REVIEW_BUDGET_USD = 0.05
+MIN_CLAUDE_REVIEW_BUDGET_USD = 0.25
 DEFAULT_ANALYTICS_DAYS = 7
 DEFAULT_BUDGET_EVIDENCE_DAYS = 30
 MIN_BUDGET_ESTIMATE_SAMPLES = 5
@@ -1271,8 +1271,29 @@ def snapshot_target(snapshot_dir: Path, relative_path: str) -> Path:
     return target
 
 
+def snapshot_overlay_paths(
+    repo: Path,
+    scope: Scope,
+    paths: Sequence[str],
+    path_filters: Sequence[str] = (),
+) -> list[str]:
+    overlay_paths = set(paths)
+    if scope.kind == "base":
+        overlay_paths.update(
+            changed_paths(
+                repo,
+                Scope("uncommitted", None, "current working tree"),
+                path_filters,
+            )
+        )
+    return sorted(overlay_paths)
+
+
 def create_snapshot(
-    repo: Path, scope: Scope, paths: Sequence[str], run_dir: Path
+    repo: Path,
+    scope: Scope,
+    overlay_paths: Sequence[str],
+    run_dir: Path,
 ) -> Path:
     snapshot_dir = run_dir / "snapshot"
     snapshot_dir.mkdir(mode=0o700)
@@ -1300,7 +1321,7 @@ def create_snapshot(
     if scope.kind == "commit":
         return snapshot_dir
 
-    for relative_path in paths:
+    for relative_path in overlay_paths:
         source = repo / relative_path
         target = snapshot_target(snapshot_dir, relative_path)
         if not source.exists() and not source.is_symlink():
@@ -2575,10 +2596,14 @@ def _adjust_workflow_budget(
             continue
         if remaining < MIN_CLAUDE_REVIEW_BUDGET_USD:
             raise ReviewError(
-                f"Workflow {identifier} exhausted its ${limit:.2f} budget "
-                f"(${spent:.2f} reported, ${reserved:.2f} reserved). Start or "
-                "supersede into a workflow with a larger explicit budget before "
-                "another paid review."
+                f"Workflow {identifier} has only ${remaining:.2f} left of its "
+                f"${limit:.2f} lineage budget (${spent:.2f} reported, "
+                f"${reserved:.2f} reserved), below the "
+                f"${MIN_CLAUDE_REVIEW_BUDGET_USD:.2f} minimum for a paid "
+                "Claude review. No provider was started. A successor inherits "
+                "the same cap; start a separate workflow with a larger "
+                "explicitly approved budget only when intentionally beginning "
+                "a new review lineage."
             )
         command = list(reviewer.command)
         budget_index = command.index("--max-budget-usd") + 1
@@ -5600,27 +5625,40 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
         raise ReviewError(f"No changes found for {scope.label}.")
     repository = repository_metadata(repo)
     source_fingerprint = fingerprint(repo, scope, paths, path_filters)
+    overlay_paths = snapshot_overlay_paths(repo, scope, paths, path_filters)
     blocked_paths = sorted(
         {
             path
-            for path in paths
+            for path in overlay_paths
             if is_sensitive_path(path) or (repo / path).is_symlink()
         }
     )
     with tempfile.TemporaryDirectory(prefix="mm-review-scan-") as temporary:
         scan_dir = Path(temporary)
-        snapshot_dir = create_snapshot(repo, scope, paths, scan_dir)
+        snapshot_dir = create_snapshot(
+            repo,
+            scope,
+            overlay_paths,
+            scan_dir,
+        )
         current_paths = changed_paths(repo, scope, path_filters)
+        current_overlay_paths = snapshot_overlay_paths(
+            repo, scope, current_paths, path_filters
+        )
         current_fingerprint = fingerprint(
             repo, scope, current_paths, path_filters
         )
-        if paths != current_paths or source_fingerprint != current_fingerprint:
+        if (
+            paths != current_paths
+            or overlay_paths != current_overlay_paths
+            or source_fingerprint != current_fingerprint
+        ):
             raise ReviewError(
                 "The review scope changed during sensitive preflight; rerun "
                 "against a stable tree."
             )
         external_symlinks = external_snapshot_symlinks(snapshot_dir)
-        findings = sensitive_content_findings(snapshot_dir, paths, patch)
+        findings = sensitive_content_findings(snapshot_dir, overlay_paths, patch)
     token = None
     if args.approve_findings and findings and not blocked_paths and not external_symlinks:
         token = create_sensitive_scan_token(
@@ -5637,6 +5675,7 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
         "scope": dataclasses.asdict(scope),
         "path_filters": list(path_filters),
         "paths": paths,
+        "snapshot_overlay_paths": overlay_paths,
         "source_fingerprint": source_fingerprint,
         "blocked_paths": blocked_paths,
         "external_symlinks": external_symlinks,
@@ -5981,6 +6020,15 @@ def resume_review_locked(
     path_filters = tuple(str(item) for item in metadata.get("path_filters", []))
     paths = [str(item) for item in metadata.get("paths", [])]
     current_paths = changed_paths(repo, scope, path_filters)
+    overlay_paths = snapshot_overlay_paths(repo, scope, paths, path_filters)
+    expected_overlay_paths = metadata.get("snapshot_overlay_paths")
+    if isinstance(expected_overlay_paths, list) and overlay_paths != sorted(
+        str(item) for item in expected_overlay_paths
+    ):
+        raise ReviewError(
+            "Cannot resume because the task-scoped snapshot overlay no longer "
+            "matches the partial run. Start a new workflow round."
+        )
     current_fingerprint = fingerprint(repo, scope, current_paths, path_filters)
     if current_paths != paths or current_fingerprint != metadata.get("source_fingerprint"):
         raise ReviewError(
@@ -6068,13 +6116,20 @@ def resume_review_locked(
     snapshot_dir = run_dir / "snapshot"
     try:
         clear_ephemeral_snapshot(run_dir)
-        snapshot_dir = create_snapshot(repo, scope, paths, run_dir)
+        snapshot_dir = create_snapshot(
+            repo,
+            scope,
+            overlay_paths,
+            run_dir,
+        )
         if external_snapshot_symlinks(snapshot_dir):
             raise ReviewError(
                 "Cannot resume because the recreated snapshot has an external symlink."
             )
         patch = (run_dir / "change.patch").read_text(encoding="utf-8")
-        content_findings = sensitive_content_findings(snapshot_dir, paths, patch)
+        content_findings = sensitive_content_findings(
+            snapshot_dir, overlay_paths, patch
+        )
         known_ids = {item.identifier for item in content_findings}
         allowed_ids = set(metadata.get("allowed_sensitive_findings", []))
         if known_ids - allowed_ids and not metadata.get("sensitive_override"):
@@ -6094,6 +6149,7 @@ def resume_review_locked(
                 "workflow_budget": budget,
                 "review_policy": resume_policy,
                 "resumed_reviewers": failed_names,
+                "snapshot_overlay_paths": overlay_paths,
             }
         )
         metadata.pop("terminal_error", None)
@@ -6315,6 +6371,7 @@ def run_review_command(args: argparse.Namespace) -> int:
     path_filters = normalize_path_filters(repo, args.path)
     scope = reused_scope or resolve_scope(args, repo, path_filters)
     paths = changed_paths(repo, scope, path_filters)
+    overlay_paths = snapshot_overlay_paths(repo, scope, paths, path_filters)
     patch = render_patch(repo, scope, path_filters)
     if not paths and not patch.strip():
         raise ReviewError(f"No changes found for {scope.label}.")
@@ -6356,6 +6413,7 @@ def run_review_command(args: argparse.Namespace) -> int:
         "scope": dataclasses.asdict(scope),
         "path_filters": list(path_filters),
         "paths": paths,
+        "snapshot_overlay_paths": overlay_paths,
         "excluded_changed_paths": excluded_paths,
         "risks": sorted(set(args.risk)),
         "review_profile": args.review_profile,
@@ -6426,8 +6484,8 @@ def run_review_command(args: argparse.Namespace) -> int:
             round_number,
             before,
         )
-        sensitive = [path for path in paths if is_sensitive_path(path)]
-        symlinks = [path for path in paths if (repo / path).is_symlink()]
+        sensitive = [path for path in overlay_paths if is_sensitive_path(path)]
+        symlinks = [path for path in overlay_paths if (repo / path).is_symlink()]
         blocked_paths = sorted(set(sensitive + symlinks))
         if blocked_paths and not args.allow_sensitive_paths:
             details = [f"- path: {path}" for path in blocked_paths]
@@ -6442,19 +6500,33 @@ def run_review_command(args: argparse.Namespace) -> int:
         reviewers, workflow_budget = apply_workflow_budget(
             reviewers, selected_workflow, reservation_id=run_id
         )
-        snapshot_dir = create_snapshot(repo, scope, paths, run_dir)
+        snapshot_dir = create_snapshot(
+            repo,
+            scope,
+            overlay_paths,
+            run_dir,
+        )
         snapshot_paths = changed_paths(repo, scope, path_filters)
+        current_overlay_paths = snapshot_overlay_paths(
+            repo, scope, snapshot_paths, path_filters
+        )
         snapshot_source_fingerprint = fingerprint(
             repo, scope, snapshot_paths, path_filters
         )
-        if before != snapshot_source_fingerprint or paths != snapshot_paths:
+        if (
+            before != snapshot_source_fingerprint
+            or paths != snapshot_paths
+            or overlay_paths != current_overlay_paths
+        ):
             raise ReviewError(
                 "The review scope changed while the private snapshot was being "
                 "created. No reviewer was started; rerun against a stable tree."
             )
 
         external_symlinks = external_snapshot_symlinks(snapshot_dir)
-        content_findings = sensitive_content_findings(snapshot_dir, paths, patch)
+        content_findings = sensitive_content_findings(
+            snapshot_dir, overlay_paths, patch
+        )
         token_allowed_ids = set(
             scan_token_value.get("allowed_sensitive_findings", [])
             if scan_token_value
@@ -6506,7 +6578,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             render_manifest(
                 repo,
                 scope,
-                paths,
+                overlay_paths,
                 display_repo=snapshot_dir,
                 path_filters=path_filters,
             ),

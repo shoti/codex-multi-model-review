@@ -73,6 +73,12 @@ All notable user-visible changes are documented here. This project follows
 
 ### Security
 
+- Overlay task-scoped working-tree changes onto `--base` snapshots even when a
+  branch file is reverted exactly to its base content, preventing reviewers
+  from inspecting the stale `HEAD` version, and apply the same sensitive-path,
+  symlink, content, and manifest coverage to those overlay-only files.
+- Refuse to start Claude when less than `$0.25` remains in the lineage budget,
+  avoiding paid overhead-only attempts that cannot produce a valid report.
 - Prevent resumed attempts from replacing earlier reported usage and thereby
   weakening the cumulative workflow budget.
 - Refuse a blind Claude resume after budget exhaustion until the operator
@@ -94,6 +100,9 @@ All notable user-visible changes are documented here. This project follows
 
 ### Changed
 
+- Make the documented `--reuse-contract` confirmation command scope-neutral so
+  it works for pinned `--base` and `--commit` workflows as well as
+  `--uncommitted` workflows.
 - Allow a clean reviewed `--base` branch to resolve as committed-equivalent and
   be attested to its checked-out HEAD, with actionable failure diagnostics.
 
