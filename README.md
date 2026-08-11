@@ -31,7 +31,8 @@ Codex Multi-Model Review turns that conversation into a durable workflow:
 - Codex verifies every finding against repository evidence;
 - repair rounds are bounded and followed by mandatory confirmation;
 - scope, paths, risks, profile, and task intent stay pinned across rounds;
-- provider failures, usage, decisions, and test gaps are persisted;
+- provider failures, usage, decisions, test gaps, and acknowledged structured
+  observations are persisted;
 - reviewers disclose incomplete coverage and unreviewed changed paths in a
   structured contract that cannot disappear into free-form notes;
 - Claude output is schema-constrained and partial provider failures are resumable;
@@ -160,13 +161,16 @@ The normal Codex-driven flow is:
    per-provider attempt ceiling.
 3. Run a repair review against explicit scope, paths, risks, and intent.
 4. Verify and disposition every finding and test gap.
-5. Fix accepted items and rerun focused tests.
+5. Fix accepted items, then run formatter, lint/static checks, and the complete
+   relevant local suite before another provider call; record the results with
+   `--local-verification`.
 6. Repeat only when necessary, within the selected repair-round limit.
 7. Run one mandatory confirmation with no further source changes planned,
    reusing the pinned repair contract.
 8. Finalize and verify the freshness-checked repository gate, then finalize the
    workflow so its state becomes explicitly `completed`.
 9. If authorized later, attest the unchanged reviewed snapshot to its commit.
+   A local source gate and a deployment-bound gate are reported separately.
 
 If the confirmation reviewer reports incomplete coverage, finalization stops.
 Run another independent review or inspect every disclosed path and limitation,
@@ -191,11 +195,22 @@ run is preserved as `partial`. Resume that exact immutable snapshot instead of
 consuming the successful provider's allowance again. If the task contract must change after a
 confirmation, explicitly supersede the closed workflow so the lineage remains
 auditable. All prior successful and failed attempts follow that lineage; a
-successor is not a fresh allowance.
+successor is not a fresh allowance. Post-fix local-verification requirements
+also follow the lineage. A successor may use `--reuse-contract` to keep the
+original pinned contract, or specify a new contract intentionally. Recorded
+evidence satisfies the requirement for that exact fingerprint; later source
+changes require fresh local evidence.
 
 Secret and symlink checks that stop before any provider invocation are reported
 as `preflight_blocked`, separately from failed reviews and provider failures.
-Exact secret approvals remain one-shot and fingerprint-bound.
+Exact initial secret approvals remain one-shot and fingerprint-bound. A later
+round may explicitly reuse an approval only within the same lineage and only
+when its path, line, rule, key, and line-content hash are identical.
+An unchanged tracked recognized sensitive file may instead be omitted from the
+private provider snapshot with `--exclude-snapshot-path`; the runner records
+Git/SHA-256 provenance, pins the exclusion, and requires explicit Codex coverage
+verification. Changed, task-scoped, untracked, directory, symlink, or ordinary
+code paths cannot be excluded.
 When attaching an existing successor with `workflow supersede --by`, its
 provider-usage policy must exactly match the current lineage policy.
 
@@ -206,11 +221,17 @@ recommendation is advisory and any selected risk keeps the result at `deep`.
 native USD-denominated print-mode stop. Its output is an API-price equivalent,
 not proof of subscription billing. Lifecycle decisions use provider readiness,
 known quota cooldowns, attempts, and reported tokens instead.
+Disabled and unprobed providers are never labeled ready, and coverage summaries
+name only providers that actually returned successful evidence.
 
 Resume history is append-only: earlier attempt metadata and provider artifacts
 remain available, and every attempt counts toward the workflow's per-provider
 ceiling. Claude native-stop exhaustion requires an explicit one-resume effort
 or stop override instead of silently repeating the same capped attempt.
+Before confirmation, `continue` warns when fewer than three attempts remain for
+an enabled provider. Use `workflow raise-provider-attempt-limit --to <count>
+--reason <reason>` for an explicit increase; the audit record is append-only and
+the command cannot lower the ceiling.
 
 Resume holds a run-specific lock for the complete transaction. Overlapping
 attempts against one artifact serialize; after the first succeeds, the next
@@ -342,6 +363,13 @@ python3 "$RUNNER" verify --run <confirmation-run-directory>
 python3 "$RUNNER" workflow finalize <workflow-id>
 ```
 
+`workflow status` reports both `ready` and `deployment_ready`. A clean working
+tree review proves the local source gate only. After committing the exact bytes,
+run the `attest-commit` command printed by `workflow finalize` or `continue`,
+then verify again. A commit-bound review still does not prove a deployed runtime,
+live data, broker submission, email delivery, or external side effect; collect
+that application-specific evidence separately when required.
+
 The explicit scope selector may be omitted. When present, it must resolve to
 the pinned scope; paths, risks, profile, and task cannot be re-specified.
 `--codex-verdict` is required and accepts `PASS_CLEAN`, `PASS_WITH_FINDINGS`,
@@ -352,6 +380,11 @@ in the final artifact under run-qualified IDs until a later matching decision
 resolves them. Verification also hashes that complete triage set, so a later
 decision change makes the final gate stale instead of silently changing its
 meaning.
+
+Reviewer Notes are neutral context only. Demonstrably non-actionable facts use
+the structured Observations section and require an evidence-backed
+`acknowledged` decision. Any plausible risk or recommended code/test change
+must remain a finding or test gap.
 
 ### Supplemental rechecks
 

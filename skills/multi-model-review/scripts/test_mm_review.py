@@ -1656,6 +1656,51 @@ class RunnerUnitTests(unittest.TestCase):
         self.assertEqual(status["active_runs"][0]["reviewers"], ["claude"])
         self.assertEqual(status["metrics"]["running_runs"], 1)
 
+    def test_workflow_coverage_excludes_contract_invalid_exit_zero_report(
+        self,
+    ) -> None:
+        invalid = (
+            Path("/private/tmp/invalid-review"),
+            {
+                "run_id": "run-invalid",
+                "workflow_id": "wf-invalid",
+                "repository": {"id": "repo-1", "name": "repo"},
+                "status": "failed",
+                "round": 1,
+                "phase": "repair",
+                "reviewers": {
+                    "claude": {
+                        "exit_code": 0,
+                        "report_contract_valid": False,
+                        "verdict": "PASS_CLEAN",
+                    }
+                },
+            },
+        )
+        with (
+            mock.patch.object(MM, "workflow_runs", return_value=[invalid]),
+            mock.patch.object(MM, "latest_workflow_runs", return_value=[invalid]),
+            mock.patch.object(MM, "workflow_lineage_runs", return_value=[invalid]),
+            mock.patch.object(
+                MM, "workflow_lineage_ids", return_value=["wf-invalid"]
+            ),
+            mock.patch.object(MM, "workflow_requires_confirmation", return_value=True),
+        ):
+            status, ready = MM.workflow_status("wf-invalid")
+
+        self.assertFalse(ready)
+        self.assertEqual(
+            status["external_review_coverage"]["attempted_providers"],
+            ["claude"],
+        )
+        self.assertEqual(
+            status["external_review_coverage"]["successful_providers"], []
+        )
+        self.assertEqual(
+            status["external_review_coverage"]["headline"],
+            "no successful external provider",
+        )
+
     def test_workflow_status_reports_persisted_workflow_before_first_run(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workflows_dir = Path(temporary)
@@ -2872,6 +2917,7 @@ None.
             root = Path(temporary)
             repo = root / "repo"
             run_dir = root / "run"
+            workflows_dir = root / "workflows"
             repo.mkdir()
             run_dir.mkdir()
             initialize_repo(repo)
@@ -2894,6 +2940,7 @@ None.
                 run_dir / "metadata.json",
                 {
                     "status": "completed",
+                    "workflow_id": "wf-attest",
                     "repository": {"root": str(repo), "head": head},
                     "scope": MM.dataclasses.asdict(scope),
                     "path_filters": list(filters),
@@ -2903,6 +2950,10 @@ None.
                         repo, paths
                     ),
                 },
+            )
+            MM.safe_write_json(
+                workflows_dir / "wf-attest.final.json",
+                {"state": "completed", "finalized_at": "original-time"},
             )
             MM.safe_write_json(
                 run_dir / "final.json",
@@ -2934,9 +2985,28 @@ None.
                     "HEAD",
                 ]
             )
-            self.assertEqual(MM.attest_commit_command(args), 0)
+            recomputed_status = {
+                "state": "completed_stale",
+                "ready": False,
+                "deployment_ready": False,
+            }
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows_dir),
+                mock.patch.object(
+                    MM,
+                    "workflow_status",
+                    return_value=(recomputed_status, False),
+                ),
+            ):
+                self.assertEqual(MM.attest_commit_command(args), 0)
             final = MM.read_json(run_dir / "final.json")
             self.assertEqual(final["commit_attestations"][0]["commit"], head)
+            workflow_final = MM.read_json(
+                workflows_dir / "wf-attest.final.json"
+            )
+            self.assertEqual(workflow_final["state"], "completed_stale")
+            self.assertFalse(workflow_final["deployment_ready"])
+            self.assertEqual(workflow_final["finalized_at"], "original-time")
 
     def test_batch_triage_is_atomic_for_findings_and_test_gaps(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3075,6 +3145,7 @@ None.
                                 "confidence": "high"
                             }],
                             "test_gaps": [],
+                            "observations": [],
                             "coverage": {
                                 "complete": True,
                                 "unreviewed_changed_paths": [],
@@ -5303,6 +5374,7 @@ None.
         self.assertEqual(parsed["verdict"], "PASS_CLEAN")
         self.assertEqual(parsed["findings"], [])
         self.assertEqual(len(parsed["observations"]), 1)
+        self.assertEqual(parsed["observations"][0]["kind"], "observation")
         self.assertIn("non-actionable", parsed["normalizations"][0])
 
     def test_observation_only_pass_with_findings_normalizes_to_clean(self) -> None:
@@ -5430,6 +5502,7 @@ None.
             triage = MM.read_json(run_dir / "triage.json")
         self.assertEqual(triage["findings"], [])
         self.assertEqual(len(triage["observations"]), 1)
+        self.assertEqual(triage["observations"][0]["decision"], "pending")
 
     def test_mode_recommendation_fails_closed_for_explicit_risk(self) -> None:
         args = MM.build_parser().parse_args(
@@ -5903,6 +5976,484 @@ None.
             self.assertEqual(workflow["status"], "completed")
             self.assertEqual(final["state"], "completed")
 
+    def test_structured_observations_are_explicit_and_require_acknowledgment(
+        self,
+    ) -> None:
+        report = MM.render_structured_review(
+            {
+                "verdict": "PASS_CLEAN",
+                "findings": [],
+                "test_gaps": [],
+                "observations": [
+                    {
+                        "actionable": False,
+                        "severity": "low",
+                        "title": "Deterministic fixture behavior",
+                        "location": "tests/test_fixture.py:10",
+                        "evidence": "The fake clock is isolated to this test.",
+                        "why_non_actionable": "Production state is unreachable.",
+                    }
+                ],
+                "coverage": {
+                    "complete": True,
+                    "unreviewed_changed_paths": [],
+                    "limitations": [],
+                },
+                "notes": [],
+            }
+        )
+        parsed = MM.parse_review_report("claude", report)
+        observation = parsed["observations"][0]
+        self.assertEqual(observation["id"], "claude-observation-001")
+        triage = {
+            "findings": [],
+            "test_gaps": [],
+            "observations": [{**observation, "decision": "pending"}],
+        }
+        self.assertEqual(
+            MM.pending_triage_ids(triage), ["claude-observation-001"]
+        )
+        with self.assertRaisesRegex(MM.ReviewError, "invalid for observation"):
+            MM.apply_triage_decision(
+                triage,
+                identifier="claude-observation-001",
+                decision="rejected",
+                evidence="Incorrect disposition.",
+                action=None,
+                verification=None,
+            )
+        MM.apply_triage_decision(
+            triage,
+            identifier="claude-observation-001",
+            decision="acknowledged",
+            evidence="Codex verified the stated non-production boundary.",
+            action=None,
+            verification=None,
+        )
+        self.assertEqual(MM.pending_triage_ids(triage), [])
+
+    def test_provider_usage_does_not_claim_disabled_or_unprobed_readiness(
+        self,
+    ) -> None:
+        config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
+        config["claude"]["enabled"] = True
+        config["antigravity"]["enabled"] = False
+        with (
+            mock.patch.object(MM, "load_config", return_value=config),
+            mock.patch.object(
+                MM, "workflow_provider_attempts", return_value={name: 0 for name in MM.PROVIDERS}
+            ),
+            mock.patch.object(
+                MM,
+                "workflow_usage_policy",
+                return_value={"mode": "provider_allowance", "max_attempts_per_provider": 6},
+            ),
+            mock.patch.object(MM, "active_provider_cooldown", return_value=None),
+            mock.patch.object(
+                MM,
+                "latest_provider_resource_metadata",
+                return_value=("subscription", "included_plan_allowance"),
+            ),
+        ):
+            usage = MM.provider_usage_snapshot("wf-provider")
+        self.assertIsNone(usage["providers"]["claude"]["ready"])
+        self.assertEqual(
+            usage["providers"]["claude"]["readiness_status"], "not_probed"
+        )
+        self.assertIsNone(usage["providers"]["antigravity"]["ready"])
+        self.assertEqual(
+            usage["providers"]["antigravity"]["readiness_status"], "disabled"
+        )
+        self.assertEqual(
+            usage["providers"]["claude"]["authentication_mode"], "subscription"
+        )
+
+    def test_claude_resource_metadata_records_subscription_allowance(self) -> None:
+        reviewer = MM.Reviewer("claude", ("claude",), {}, "sonnet", "test")
+        with mock.patch.object(
+            MM,
+            "claude_authentication_mode",
+            return_value=("subscription", "Claude subscription authentication"),
+        ):
+            resource = MM.reviewer_resource_metadata(reviewer)
+        self.assertEqual(resource["authentication_mode"], "subscription")
+        self.assertEqual(resource["usage_resource"], "included_plan_allowance")
+
+    def test_snapshot_exclusion_is_exact_unchanged_sensitive_file_with_provenance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            initialize_repo(repo)
+            npmrc = repo / ".npmrc"
+            npmrc.write_text("registry=https://registry.npmjs.org/\n", encoding="utf-8")
+            run(["git", "add", ".npmrc"], cwd=repo)
+            run(["git", "commit", "-qm", "add npm config"], cwd=repo)
+            (repo / "src" / "feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+            paths = MM.changed_paths(
+                repo, MM.Scope("uncommitted", None, "changes"), ("src",)
+            )
+            exclusions = MM.resolve_snapshot_exclusions(
+                repo,
+                [".npmrc"],
+                task_paths=paths,
+                path_filters=("src",),
+            )
+            self.assertEqual(exclusions[0]["path"], ".npmrc")
+            self.assertEqual(len(exclusions[0]["sha256"]), 64)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            snapshot = MM.create_snapshot(
+                repo,
+                MM.Scope("uncommitted", None, "changes"),
+                paths,
+                run_dir,
+            )
+            MM.apply_snapshot_exclusions(snapshot, exclusions)
+            self.assertFalse((snapshot / ".npmrc").exists())
+            self.assertTrue((snapshot / "src" / "feature.py").exists())
+            npmrc.write_text("registry=https://example.invalid/\n", encoding="utf-8")
+            with self.assertRaisesRegex(MM.ReviewError, "unchanged from HEAD"):
+                MM.validate_snapshot_exclusion_provenance(
+                    repo,
+                    exclusions,
+                    task_paths=paths,
+                    path_filters=("src",),
+                )
+
+    def test_snapshot_exclusion_rejects_non_sensitive_or_task_scoped_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            initialize_repo(repo)
+            with self.assertRaisesRegex(MM.ReviewError, "recognized sensitive"):
+                MM.resolve_snapshot_exclusions(
+                    repo,
+                    ["unrelated.txt"],
+                    task_paths=["src/feature.py"],
+                    path_filters=("src",),
+                )
+            npmrc = repo / ".npmrc"
+            npmrc.write_text("registry=https://registry.npmjs.org/\n", encoding="utf-8")
+            run(["git", "add", ".npmrc"], cwd=repo)
+            run(["git", "commit", "-qm", "add npm config"], cwd=repo)
+            with self.assertRaisesRegex(MM.ReviewError, "task-scoped"):
+                MM.resolve_snapshot_exclusions(
+                    repo,
+                    [".npmrc"],
+                    task_paths=[".npmrc"],
+                    path_filters=(),
+                )
+
+    def test_snapshot_exclusion_fails_closed_for_historical_commit_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            initialize_repo(repo)
+            npmrc = repo / ".npmrc"
+            npmrc.write_text(
+                "registry=https://old.example.invalid/\n", encoding="utf-8"
+            )
+            run(["git", "add", ".npmrc"], cwd=repo)
+            run(["git", "commit", "-qm", "add old npm config"], cwd=repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            run(["git", "add", "src/feature.py"], cwd=repo)
+            run(["git", "commit", "-qm", "add historical feature"], cwd=repo)
+            historical_commit = run(
+                ["git", "rev-parse", "HEAD"], cwd=repo
+            ).stdout.strip()
+            npmrc.write_text(
+                "registry=https://current.example.invalid/\n", encoding="utf-8"
+            )
+            run(["git", "add", ".npmrc"], cwd=repo)
+            run(["git", "commit", "-qm", "update npm config"], cwd=repo)
+
+            scope = MM.Scope("commit", historical_commit, "historical commit")
+            paths = MM.changed_paths(repo, scope)
+            self.assertEqual(paths, ["src/feature.py"])
+            exclusions = MM.resolve_snapshot_exclusions(
+                repo,
+                [".npmrc"],
+                task_paths=paths,
+                path_filters=(),
+            )
+            run_dir = root / "run"
+            run_dir.mkdir()
+            snapshot = MM.create_snapshot(
+                repo,
+                scope,
+                MM.snapshot_overlay_paths(repo, scope, paths, ()),
+                run_dir,
+            )
+
+            with self.assertRaisesRegex(
+                MM.ReviewError,
+                "does not match its pinned provenance.*historical --commit",
+            ):
+                MM.apply_snapshot_exclusions(snapshot, exclusions)
+
+    def test_lineage_sensitive_approval_reuse_requires_identical_content_hash(
+        self,
+    ) -> None:
+        finding = MM.SensitiveFinding(
+            identifier="abc123def456",
+            path="tests/fixture.txt",
+            line=2,
+            rule="literal secret-like assignment",
+            key="password",
+            content_sha256="f" * 64,
+        )
+        metadata = {
+            "schema_version": 11,
+            "run_id": "run-approved",
+            "repository": {"id": "repo-one"},
+            "allowed_sensitive_findings": [finding.identifier],
+            "sensitive_findings": [MM.dataclasses.asdict(finding)],
+        }
+        with mock.patch.object(
+            MM, "workflow_lineage_runs", return_value=[(Path("/run"), metadata)]
+        ):
+            approved, sources = MM.reusable_lineage_sensitive_approvals(
+                "wf-one", "repo-one", [finding]
+            )
+            changed = MM.dataclasses.replace(finding, content_sha256="e" * 64)
+            changed_approved, _ = MM.reusable_lineage_sensitive_approvals(
+                "wf-one", "repo-one", [changed]
+            )
+        self.assertEqual(approved, {finding.identifier})
+        self.assertEqual(sources, ["run-approved"])
+        self.assertEqual(changed_approved, set())
+
+    def test_provider_attempt_limit_raise_is_increase_only_and_audited(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            with mock.patch.object(MM, "WORKFLOWS_DIR", workflows):
+                MM.create_workflow(
+                    "wf-raise", usage_based=True, max_provider_attempts=2
+                )
+                args = MM.build_parser().parse_args(
+                    [
+                        "workflow",
+                        "raise-provider-attempt-limit",
+                        "wf-raise",
+                        "--to",
+                        "5",
+                        "--reason",
+                        "reserve confirmation recovery headroom",
+                    ]
+                )
+                MM.workflow_raise_provider_attempt_limit_command(args)
+                document = MM.read_json(workflows / "wf-raise.json")
+                self.assertEqual(
+                    document["policy"]["usage_policy"]["max_attempts_per_provider"],
+                    5,
+                )
+                self.assertEqual(
+                    document["provider_attempt_limit_history"][0]["previous"], 2
+                )
+                lower = MM.build_parser().parse_args(
+                    [
+                        "workflow",
+                        "raise-provider-attempt-limit",
+                        "wf-raise",
+                        "--to",
+                        "4",
+                        "--reason",
+                        "would weaken audit semantics",
+                    ]
+                )
+                with self.assertRaisesRegex(MM.ReviewError, "must increase"):
+                    MM.workflow_raise_provider_attempt_limit_command(lower)
+
+    def test_confirmation_plan_warns_when_recovery_headroom_is_low(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            MM.safe_write_json(
+                run_dir / "triage.json", {"findings": [], "test_gaps": []}
+            )
+            metadata = {
+                "status": "completed",
+                "phase": "repair",
+                "round": 1,
+                "repository": {"id": "repo-one", "root": "/repo"},
+            }
+            usage = {
+                "providers": {
+                    "claude": {
+                        "enabled": True,
+                        "ready": True,
+                        "attempts": 5,
+                        "attempts_remaining": 1,
+                    }
+                }
+            }
+            with (
+                mock.patch.object(
+                    MM,
+                    "workflow_status",
+                    return_value=({"state": "active", "active_runs": []}, False),
+                ),
+                mock.patch.object(MM, "provider_usage_snapshot", return_value=usage),
+                mock.patch.object(
+                    MM, "latest_workflow_attempts", return_value=[(run_dir, metadata)]
+                ),
+                mock.patch.object(MM, "workflow_runs", return_value=[(run_dir, metadata)]),
+                mock.patch.object(MM, "workflow_max_repair_rounds", return_value=2),
+                mock.patch.object(MM, "_current_run_source_changed", return_value=False),
+            ):
+                plan = MM.workflow_continue_plan("wf-headroom", probe_usage=True)
+        warning = plan["actions"][0]["attempt_headroom_warning"]
+        self.assertEqual(warning["providers"], ["claude"])
+        self.assertIn("raise-provider-attempt-limit", warning["raise_command"])
+
+    def test_review_binding_distinguishes_working_tree_commit_and_attestation(
+        self,
+    ) -> None:
+        commit = "a" * 40
+        working_metadata = {
+            "scope": {"kind": "uncommitted", "value": None, "label": "changes"}
+        }
+        self.assertEqual(
+            MM.review_binding(working_metadata, {}, commit),
+            ("working_tree_only", False),
+        )
+        self.assertEqual(
+            MM.review_binding(
+                working_metadata,
+                {"commit_attestations": [{"commit": commit}]},
+                commit,
+            ),
+            ("attested_commit", True),
+        )
+        commit_metadata = {
+            "scope": {"kind": "commit", "value": commit, "label": "commit"}
+        }
+        self.assertEqual(
+            MM.review_binding(commit_metadata, {}, commit),
+            ("immutable_commit", True),
+        )
+
+    def test_fixed_lineage_requires_local_verification_before_another_provider(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "fixed"
+            verified_run_dir = root / "verified"
+            run_dir.mkdir()
+            verified_run_dir.mkdir()
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {
+                    "findings": [
+                        {"id": "claude-001", "kind": "finding", "decision": "fixed"}
+                    ],
+                    "test_gaps": [],
+                },
+            )
+            metadata = {
+                "status": "completed",
+                "completed_at": "2026-08-11T10:00:00+00:00",
+                "run_id": "run-fixed",
+                "source_fingerprint": "before",
+                "repository": {"id": "repo-one"},
+            }
+            MM.safe_write_json(
+                verified_run_dir / "triage.json",
+                {"findings": [], "test_gaps": [], "observations": []},
+            )
+            verified_metadata = {
+                "status": "completed",
+                "completed_at": "2026-08-11T10:01:00+00:00",
+                "run_id": "run-verified",
+                "source_fingerprint": "after",
+                "local_verification_before_provider": ["full suite passed"],
+                "repository": {"id": "repo-one"},
+            }
+            with mock.patch.object(
+                MM, "workflow_lineage_runs", return_value=[(run_dir, metadata)]
+            ):
+                self.assertTrue(
+                    MM.local_verification_required("wf-one", "repo-one", "after")
+                )
+                self.assertFalse(
+                    MM.local_verification_required("wf-one", "repo-one", "before")
+                )
+            with mock.patch.object(
+                MM,
+                "workflow_lineage_runs",
+                return_value=[
+                    (verified_run_dir, verified_metadata),
+                    (run_dir, metadata),
+                ],
+            ):
+                self.assertFalse(
+                    MM.local_verification_required("wf-one", "repo-one", "after")
+                )
+                self.assertTrue(
+                    MM.local_verification_required("wf-one", "repo-one", "later")
+                )
+
+    def test_snapshot_exclusion_requires_codex_coverage_compensation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "run_id": "run-excluded",
+                    "status": "completed",
+                    "phase": "confirmation",
+                    "source_fingerprint": "same",
+                    "risks": [],
+                    "snapshot_exclusions": [{"path": ".npmrc", "sha256": "a" * 64}],
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {"findings": [], "test_gaps": [], "observations": []},
+            )
+            MM.safe_write_json(
+                run_dir / "review-summary.json",
+                {
+                    "reviews": {
+                        "claude": {
+                            "coverage": {
+                                "complete": True,
+                                "unreviewed_changed_paths": [],
+                                "limitations": [],
+                            }
+                        }
+                    }
+                },
+            )
+            args = MM.build_parser().parse_args(
+                [
+                    "finalize",
+                    "--run",
+                    str(run_dir),
+                    "--codex-verdict",
+                    "PASS_CLEAN",
+                    "--codex-review",
+                    "Provider-reviewed source is clean.",
+                ]
+            )
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM,
+                    "freshness_status",
+                    return_value={"fresh": True, "mode": "working-tree"},
+                ),
+            ):
+                with self.assertRaisesRegex(MM.ReviewError, "snapshot exclusions"):
+                    MM.finalize_command(args)
+
 
 class RunnerEndToEndTests(unittest.TestCase):
     def test_supplemental_recheck_preserves_legacy_parent_policy(self) -> None:
@@ -5927,6 +6478,9 @@ class RunnerEndToEndTests(unittest.TestCase):
                     import sys
                     if "--version" in sys.argv:
                         print("fake-claude 1.0")
+                        raise SystemExit(0)
+                    if sys.argv[1:] == ["auth", "status"]:
+                        print(json.dumps({{"loggedIn": True, "authMethod": "oauth"}}))
                         raise SystemExit(0)
                     path = pathlib.Path({str(count_path)!r})
                     path.write_text(str(int(path.read_text()) + 1 if path.exists() else 1))
@@ -6277,6 +6831,9 @@ class RunnerEndToEndTests(unittest.TestCase):
                     import sys
                     if "--version" in sys.argv:
                         print("fake-claude 1.0")
+                        raise SystemExit(0)
+                    if sys.argv[1:] == ["auth", "status"]:
+                        print(json.dumps({{"loggedIn": True, "authMethod": "oauth"}}))
                         raise SystemExit(0)
                     count_path = pathlib.Path({str(invocation_count)!r})
                     count = int(count_path.read_text()) if count_path.exists() else 0
@@ -6879,6 +7436,9 @@ class RunnerEndToEndTests(unittest.TestCase):
                     if "--version" in sys.argv:
                         print("fake-claude 1.0")
                         raise SystemExit(0)
+                    if sys.argv[1:] == ["auth", "status"]:
+                        print(json.dumps({{"loggedIn": True, "authMethod": "oauth"}}))
+                        raise SystemExit(0)
                     path = pathlib.Path({str(claude_count)!r})
                     count = int(path.read_text() or "0") if path.exists() else 0
                     path.write_text(str(count + 1))
@@ -6978,6 +7538,452 @@ class RunnerEndToEndTests(unittest.TestCase):
             self.assertEqual(completed["status"], "completed")
             self.assertEqual(completed["reviewers"]["kimi"]["exit_code"], 0)
             self.assertEqual(claude_count.read_text(encoding="utf-8"), "1")
+
+    def test_run_enforces_post_fix_local_verification_across_supersede(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            repo = root / "repo"
+            bin_dir = root / "bin"
+            invocation_count = root / "claude-count"
+            home.mkdir()
+            repo.mkdir()
+            bin_dir.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            fake_claude = bin_dir / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/usr/bin/env python3
+                    import json
+                    import pathlib
+                    import sys
+                    if "--version" in sys.argv:
+                        print("fake-claude 1.0")
+                        raise SystemExit(0)
+                    if sys.argv[1:] == ["auth", "status"]:
+                        print(json.dumps({{"loggedIn": True, "authMethod": "oauth"}}))
+                        raise SystemExit(0)
+                    path = pathlib.Path({str(invocation_count)!r})
+                    count = int(path.read_text()) if path.exists() else 0
+                    path.write_text(str(count + 1))
+                    sys.stdin.read()
+                    if count == 0:
+                        report = "# Verdict\\nPASS_WITH_FINDINGS\\n\\n# Findings\\n## [medium] Exercise the post-fix gate\\n- Location: src/feature.py:1\\n- Trigger: A repaired source changes\\n- Evidence: The first review supplies a triage item\\n- Impact: Another provider call needs local evidence\\n- Smallest fix: Record local checks\\n- Confidence: high\\n\\n# Test gaps\\nNone.\\n\\n# Observations\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n"
+                    else:
+                        report = "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n\\n# Observations\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n"
+                    print(json.dumps({{"result": report, "total_cost_usd": 0.01}}))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            base = [sys.executable, str(SCRIPT_PATH)]
+            started = run(
+                [*base, "workflow", "start", "--review-mode", "deep"],
+                cwd=repo,
+                env=environment,
+            )
+            workflow_identifier = started.stdout.strip()
+            initial = run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    workflow_identifier,
+                    "--phase",
+                    "repair",
+                    "--task",
+                    "Verify the post-fix local gate.",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            self.assertIn("PASS_WITH_FINDINGS", initial.stdout)
+            metadata_paths = list(
+                (home / ".codex" / "review-runs").glob("*/*/metadata.json")
+            )
+            initial_metadata_path = next(
+                path
+                for path in metadata_paths
+                if json.loads(path.read_text(encoding="utf-8")).get("status")
+                == "completed"
+            )
+            initial_run_dir = initial_metadata_path.parent
+            run(
+                [
+                    *base,
+                    "decide",
+                    "--run",
+                    str(initial_run_dir),
+                    "--finding",
+                    "claude-001",
+                    "--decision",
+                    "fixed",
+                    "--evidence",
+                    "The implementation was updated after review.",
+                    "--verification",
+                    "Focused test passed.",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 3\n", encoding="utf-8"
+            )
+            successor_identifier = run(
+                [
+                    *base,
+                    "workflow",
+                    "supersede",
+                    workflow_identifier,
+                    "--reason",
+                    "The repaired source needs a fresh workflow lineage gate.",
+                ],
+                cwd=repo,
+                env=environment,
+            ).stdout.strip()
+            blocked = run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    successor_identifier,
+                    "--phase",
+                    "repair",
+                    "--reuse-contract",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+                check=False,
+            )
+            self.assertEqual(blocked.returncode, 2)
+            self.assertIn("--local-verification", blocked.stderr)
+            self.assertEqual(invocation_count.read_text(encoding="utf-8"), "1")
+            completed = run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    successor_identifier,
+                    "--phase",
+                    "repair",
+                    "--reuse-contract",
+                    "--local-verification",
+                    "formatter, static checks, and full tests passed",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            self.assertIn("PASS_CLEAN", completed.stdout)
+            completed_metadata = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in (home / ".codex" / "review-runs").glob(
+                    "*/*/metadata.json"
+                )
+                if json.loads(path.read_text(encoding="utf-8")).get("status")
+                == "completed"
+            ]
+            final_invocation_count = invocation_count.read_text(encoding="utf-8")
+        latest = next(
+            item
+            for item in completed_metadata
+            if item["workflow_id"] == successor_identifier
+        )
+        self.assertEqual(latest["round"], 1)
+        self.assertEqual(
+            latest["local_verification_before_provider"],
+            ["formatter, static checks, and full tests passed"],
+        )
+        self.assertEqual(final_invocation_count, "2")
+
+    def test_run_reuses_only_identical_lineage_sensitive_approvals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            repo = root / "repo"
+            bin_dir = root / "bin"
+            invocation_count = root / "claude-count"
+            home.mkdir()
+            repo.mkdir()
+            bin_dir.mkdir()
+            initialize_repo(repo)
+            fixture = repo / "credential-fixture.py"
+            approved_content = "api" + 'Key = "credential-value-123456"\n'
+            fixture.write_text(approved_content, encoding="utf-8")
+            run(["git", "add", "credential-fixture.py"], cwd=repo)
+            run(["git", "commit", "-qm", "add credential fixture"], cwd=repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            fake_claude = bin_dir / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/usr/bin/env python3
+                    import json
+                    import pathlib
+                    import sys
+                    if "--version" in sys.argv:
+                        print("fake-claude 1.0")
+                        raise SystemExit(0)
+                    if sys.argv[1:] == ["auth", "status"]:
+                        print(json.dumps({{"loggedIn": True, "authMethod": "oauth"}}))
+                        raise SystemExit(0)
+                    path = pathlib.Path({str(invocation_count)!r})
+                    count = int(path.read_text()) if path.exists() else 0
+                    path.write_text(str(count + 1))
+                    sys.stdin.read()
+                    report = "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n\\n# Observations\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n"
+                    print(json.dumps({{"result": report, "total_cost_usd": 0.01}}))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            base = [sys.executable, str(SCRIPT_PATH)]
+            workflow_identifier = run(
+                [*base, "workflow", "start", "--review-mode", "deep"],
+                cwd=repo,
+                env=environment,
+            ).stdout.strip()
+            scan = run(
+                [
+                    *base,
+                    "scan",
+                    "--repo",
+                    str(repo),
+                    "--uncommitted",
+                    "--path",
+                    "src/feature.py",
+                    "--approve-findings",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            token = json.loads(scan.stdout)["approved_token"]
+            initial = run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    workflow_identifier,
+                    "--phase",
+                    "repair",
+                    "--path",
+                    "src/feature.py",
+                    "--task",
+                    "Verify exact lineage approval reuse.",
+                    "--sensitive-scan-token",
+                    token,
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            self.assertIn("PASS_CLEAN", initial.stdout)
+            fixture.write_text(
+                "api" + 'Key = "different-credential-value-654321"\n',
+                encoding="utf-8",
+            )
+            run(["git", "add", "credential-fixture.py"], cwd=repo)
+            run(["git", "commit", "-qm", "change credential fixture"], cwd=repo)
+            changed = run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    workflow_identifier,
+                    "--phase",
+                    "confirmation",
+                    "--reuse-contract",
+                    "--reuse-lineage-sensitive-approvals",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+                check=False,
+            )
+            self.assertEqual(changed.returncode, 2)
+            self.assertIn("New or changed findings require", changed.stderr)
+            self.assertEqual(invocation_count.read_text(encoding="utf-8"), "1")
+            fixture.write_text(approved_content, encoding="utf-8")
+            run(["git", "add", "credential-fixture.py"], cwd=repo)
+            run(["git", "commit", "-qm", "restore credential fixture"], cwd=repo)
+            confirmation = run(
+                [
+                    *base,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    workflow_identifier,
+                    "--phase",
+                    "confirmation",
+                    "--reuse-contract",
+                    "--reuse-lineage-sensitive-approvals",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            self.assertIn("PASS_CLEAN", confirmation.stdout)
+            confirmation_metadata = max(
+                (
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in (home / ".codex" / "review-runs").glob(
+                        "*/*/metadata.json"
+                    )
+                    if json.loads(path.read_text(encoding="utf-8")).get("status")
+                    == "completed"
+                ),
+                key=lambda item: int(item["round"]),
+            )
+            final_invocation_count = invocation_count.read_text(encoding="utf-8")
+        self.assertEqual(final_invocation_count, "2")
+        self.assertEqual(
+            confirmation_metadata["sensitive_approval_mode"], "lineage_reuse"
+        )
+        self.assertTrue(
+            confirmation_metadata["lineage_sensitive_approval_sources"]
+        )
+
+    def test_run_snapshot_exclusion_controls_provider_manifest_and_freshness(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            repo = root / "repo"
+            bin_dir = root / "bin"
+            provider_observation = root / "provider-observation.json"
+            home.mkdir()
+            repo.mkdir()
+            bin_dir.mkdir()
+            initialize_repo(repo)
+            npmrc = repo / ".npmrc"
+            npmrc.write_text(
+                "registry=https://registry.npmjs.org/\n", encoding="utf-8"
+            )
+            run(["git", "add", ".npmrc"], cwd=repo)
+            run(["git", "commit", "-qm", "add npm config"], cwd=repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            fake_claude = bin_dir / "claude"
+            fake_claude.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/usr/bin/env python3
+                    import json
+                    import pathlib
+                    import sys
+                    if "--version" in sys.argv:
+                        print("fake-claude 1.0")
+                        raise SystemExit(0)
+                    if sys.argv[1:] == ["auth", "status"]:
+                        print(json.dumps({{"loggedIn": True, "authMethod": "oauth"}}))
+                        raise SystemExit(0)
+                    prompt = sys.stdin.read()
+                    manifest_path = next(
+                        line.split(": ", 1)[1]
+                        for line in prompt.splitlines()
+                        if line.startswith("Manifest artifact: ")
+                    )
+                    manifest = pathlib.Path(manifest_path).read_text()
+                    pathlib.Path({str(provider_observation)!r}).write_text(json.dumps({{
+                        "snapshot_has_npmrc": pathlib.Path(".npmrc").exists(),
+                        "manifest_lists_npmrc": ".npmrc" in manifest,
+                        "manifest_records_sha256": "sha256=" in manifest
+                    }}))
+                    report = "# Verdict\\nPASS_CLEAN\\n\\n# Findings\\nNone.\\n\\n# Test gaps\\nNone.\\n\\n# Observations\\nNone.\\n\\n# Coverage\\n- Complete: yes\\n- Unreviewed changed paths: []\\n- Limitations: []\\n\\n# Notes\\nNone.\\n"
+                    print(json.dumps({{"result": report, "total_cost_usd": 0.01}}))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            reviewed = run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--uncommitted",
+                    "--task",
+                    "Verify snapshot exclusion plumbing.",
+                    "--exclude-snapshot-path",
+                    ".npmrc",
+                    "--without-antigravity",
+                    "--without-kimi",
+                ],
+                cwd=repo,
+                env=environment,
+            )
+            self.assertIn("PASS_CLEAN", reviewed.stdout)
+            observation = json.loads(
+                provider_observation.read_text(encoding="utf-8")
+            )
+            metadata_path = next(
+                (home / ".codex" / "review-runs").glob("*/*/metadata.json")
+            )
+            run_dir = metadata_path.parent
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            manifest = (run_dir / "manifest.md").read_text(encoding="utf-8")
+            fresh = MM.freshness_status(
+                run_dir, metadata, metadata["source_fingerprint"]
+            )
+            npmrc.write_text(
+                "registry=https://example.invalid/\n", encoding="utf-8"
+            )
+            stale = MM.freshness_status(
+                run_dir, metadata, metadata["source_fingerprint"]
+            )
+        self.assertFalse(observation["snapshot_has_npmrc"])
+        self.assertTrue(observation["manifest_lists_npmrc"])
+        self.assertTrue(observation["manifest_records_sha256"])
+        self.assertEqual(metadata["snapshot_exclusions"][0]["path"], ".npmrc")
+        self.assertIn("Snapshot exclusions (not transmitted):", manifest)
+        self.assertTrue(fresh["fresh"])
+        self.assertFalse(stale["fresh"])
+        self.assertEqual(stale["mode"], "snapshot-exclusion-stale")
 
 
 if __name__ == "__main__":

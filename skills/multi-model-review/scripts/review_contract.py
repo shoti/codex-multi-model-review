@@ -10,7 +10,14 @@ from typing import Any
 CLAUDE_REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["verdict", "findings", "test_gaps", "coverage", "notes"],
+    "required": [
+        "verdict",
+        "findings",
+        "test_gaps",
+        "observations",
+        "coverage",
+        "notes",
+    ],
     "properties": {
         "verdict": {
             "type": "string",
@@ -68,6 +75,29 @@ CLAUDE_REVIEW_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+        "observations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "actionable",
+                    "severity",
+                    "title",
+                    "location",
+                    "evidence",
+                    "why_non_actionable",
+                ],
+                "properties": {
+                    "actionable": {"type": "boolean", "const": False},
+                    "severity": {"type": "string", "const": "low"},
+                    "title": {"type": "string"},
+                    "location": {"type": ["string", "null"]},
+                    "evidence": {"type": "string"},
+                    "why_non_actionable": {"type": "string"},
+                },
+            },
+        },
         "coverage": {
             "type": "object",
             "additionalProperties": False,
@@ -122,6 +152,20 @@ def render_structured_review(payload: dict[str, Any]) -> str:
                 f"## [{item['severity']}] {item['title']}",
                 f"- Needed test: {item['needed_test']}",
                 f"- Risk: {item['risk']}",
+                "",
+            ]
+        )
+    lines.extend(["# Observations"])
+    observations = payload.get("observations") or []
+    if not observations:
+        lines.append("None.")
+    for item in observations:
+        lines.extend(
+            [
+                f"## [low] {item['title']}",
+                f"- Location: {item.get('location') or 'Not specified'}",
+                f"- Evidence: {item['evidence']}",
+                f"- Why non-actionable: {item['why_non_actionable']}",
                 "",
             ]
         )
@@ -245,11 +289,12 @@ def parse_severity_items(
         body = section[match.end() : end].strip()
         location_match = re.search(r"(?im)^-\s*Location:\s*(.+?)\s*$", body)
         suffix = offset + 1
-        identifier = (
-            f"{reviewer}-{suffix:03d}"
-            if identifier_kind == "finding"
-            else f"{reviewer}-test-{suffix:03d}"
-        )
+        if identifier_kind == "finding":
+            identifier = f"{reviewer}-{suffix:03d}"
+        elif identifier_kind == "test_gap":
+            identifier = f"{reviewer}-test-{suffix:03d}"
+        else:
+            identifier = f"{reviewer}-observation-{suffix:03d}"
         items.append(
             {
                 "id": identifier,
@@ -313,7 +358,17 @@ def parse_review_report(
         markdown_section(report, "Findings"),
         identifier_kind="finding",
     )
-    observations = [
+    explicit_observations = parse_severity_items(
+        reviewer,
+        markdown_section(report, "Observations"),
+        identifier_kind="observation",
+    )
+    invalid_observation_severities = [
+        item["id"]
+        for item in explicit_observations
+        if item["severity"] != "low"
+    ]
+    legacy_observations = [
         item
         for item in findings
         if item.get("severity") == "low"
@@ -326,11 +381,25 @@ def parse_review_report(
             str(item.get("report_excerpt") or ""),
         )
     ]
-    if observations:
-        observation_ids = {str(item.get("id")) for item in observations}
+    if legacy_observations:
+        observation_ids = {str(item.get("id")) for item in legacy_observations}
         findings = [
             item for item in findings if str(item.get("id")) not in observation_ids
         ]
+    observations = [
+        *explicit_observations,
+        *[
+            {
+                **item,
+                "id": (
+                    f"{reviewer}-observation-"
+                    f"{len(explicit_observations) + index:03d}"
+                ),
+                "kind": "observation",
+            }
+            for index, item in enumerate(legacy_observations, start=1)
+        ],
+    ]
     test_gap_section = markdown_section(report, "Test gaps")
     test_gaps = parse_severity_items(
         reviewer, test_gap_section, identifier_kind="test_gap"
@@ -387,6 +456,7 @@ def parse_review_report(
         "test_gap_counts": test_gap_counts,
         "test_gaps": test_gaps,
         "invalid_test_gap_severities": invalid_test_gap_severities,
+        "invalid_observation_severities": invalid_observation_severities,
         "observations": observations,
         "coverage": parse_coverage(report),
         "notes": parse_notes(report),
@@ -401,7 +471,11 @@ def parsed_report_is_invalid(
         not isinstance(coverage, dict) or not coverage.get("contract_valid")
     ):
         return True
-    if parsed["verdict"] == "UNKNOWN" or parsed["invalid_test_gap_severities"]:
+    if (
+        parsed["verdict"] == "UNKNOWN"
+        or parsed["invalid_test_gap_severities"]
+        or parsed.get("invalid_observation_severities")
+    ):
         return True
     if parsed["verdict"] == "PASS_WITH_FINDINGS" and not (
         parsed["findings"] or parsed["test_gaps"]
