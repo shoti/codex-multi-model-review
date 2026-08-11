@@ -9,6 +9,10 @@ Keep reviewer output advisory. Codex owns the implementation, verifies every
 finding, and makes the final decision. External reviewers are always fresh,
 independent, and read-only.
 
+The runner requires Python 3.12 or newer. Resolve and verify the interpreter
+before the first command; on macOS, `/usr/bin/python3` may still be Python 3.9.
+An unsupported interpreter is rejected before workflow or provider activity.
+
 Invoke the workflow with `/multi-model-review:multi-review`, or mention
 `$multi-model-review` in a prompt. The slash command accepts `uncommitted`,
 `branch <base>`, or `commit <sha>`, plus `with-antigravity`,
@@ -121,12 +125,13 @@ mm-review decide --run <run-dir> --finding claude-001 \
 
 Use `accepted`, `fixed`, `rejected`, `deferred`, or `uncertain`. Model agreement
 is not evidence. `accepted` and `uncertain` block the next round; after a fix,
-record `fixed` on the original item with verification. A bounded medium/low
+record `fixed` on the original item with verification and changed scoped
+source. A bounded medium/low
 finding may be `deferred`; blocker/high findings cannot. For test gaps, use
 `covered`, `rejected`, `deferred`, or `accepted`. An accepted gap blocks the
 next round until changed to `covered`, `rejected`, or `deferred`; a deferred
-item remains visible in `PASS_WITH_FINDINGS`. Marking a previously accepted
-gap `covered` requires verification and a changed scoped fingerprint.
+item remains visible in `PASS_WITH_FINDINGS`. Marking a finding `fixed` or a
+test gap `covered` requires verification and a changed scoped fingerprint.
 Reviewer test gaps are contractually limited to medium/low. A blocker/high
 test-gap heading makes the provider report invalid, and the triage/final gate
 also refuses to defer such an item as defense in depth.
@@ -305,6 +310,11 @@ its workflow:
 mm-review workflow supersede <workflow-id> --reason "<contract or source change>"
 ```
 
+The successor inherits every repository represented in the superseded lineage.
+Each one must receive a fresh successor review and final; status reports an
+inherited repository with no successor run as `not-reviewed`, `continue` names
+the missing repository, and workflow finalization remains blocked.
+
 Close every workflow after all repositories pass, including single-repository
 tasks:
 
@@ -312,9 +322,11 @@ tasks:
 mm-review workflow finalize <workflow-id>
 ```
 
-`workflow status` distinguishes active work, `ready_to_finalize`, `completed`,
-`completed_stale`, blocked, and superseded states. A completed workflow rejects
-new reviews; create a linked successor for a source or contract change.
+`workflow status` and the read-only `workflow audit` distinguish active work,
+`ready_to_finalize`, `completed`, `completed_stale`, blocked, and superseded
+states using current source evidence. A persisted completed marker does not
+hide a stale final. A completed workflow rejects new reviews; create a linked
+successor for a source or contract change.
 It also distinguishes `ready` (fresh local source gate) from
 `deployment_ready` (an immutable commit review or explicit commit attestation).
 After committing exact reviewed bytes, run the exact `attest-commit` action

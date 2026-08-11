@@ -10,13 +10,14 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 
@@ -26,6 +27,7 @@ assert SPEC and SPEC.loader
 MM = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MM
 SPEC.loader.exec_module(MM)
+import evidence_memory as EM
 
 
 def run(
@@ -56,7 +58,280 @@ def initialize_repo(root: Path) -> None:
     run(["git", "commit", "-qm", "initial"], cwd=root)
 
 
+def structured_report(
+    *,
+    verdict: str = "PASS_CLEAN",
+    findings: str = "None.",
+    test_gaps: str = "None.",
+    observations: str = "None.",
+    coverage_complete: bool = True,
+    unreviewed_paths: list[str] | None = None,
+    limitations: list[str] | None = None,
+) -> str:
+    return (
+        f"# Verdict\n{verdict}\n\n"
+        f"# Findings\n{findings}\n\n"
+        f"# Test gaps\n{test_gaps}\n\n"
+        f"# Observations\n{observations}\n\n"
+        "# Coverage\n"
+        f"- Complete: {'yes' if coverage_complete else 'no'}\n"
+        "- Unreviewed changed paths: "
+        f"{json.dumps(unreviewed_paths or [])}\n"
+        f"- Limitations: {json.dumps(limitations or [])}\n\n"
+        "# Notes\nNone.\n"
+    )
+
+
+class FakeProviderHarness:
+    """Real subprocess harness whose only provider binaries are local shims."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.home = root / "home"
+        self.bin_dir = root / "bin"
+        self.state_path = root / "provider-state.json"
+        self.log_path = root / "provider-invocations.jsonl"
+        self.home.mkdir()
+        self.bin_dir.mkdir()
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "_sequence": 0,
+                    "claude": [],
+                    "agy": [],
+                    "kimi": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        shim = self.bin_dir / "provider-shim"
+        shim.write_text(
+            textwrap.dedent(
+                r"""
+                #!/usr/bin/env python3
+                import fcntl
+                import json
+                import os
+                import pathlib
+                import sys
+                import time
+
+                provider = pathlib.Path(sys.argv[0]).name
+                args = sys.argv[1:]
+                if args == ["--version"]:
+                    print(f"fake-{provider} campaign-1.0")
+                    raise SystemExit(0)
+                if provider == "claude" and args == ["--help"]:
+                    print("--effort --max-budget-usd --json-schema --permission-mode --tools --safe-mode --no-session-persistence")
+                    raise SystemExit(0)
+                if provider == "claude" and args == ["auth", "status"]:
+                    print(json.dumps({"loggedIn": True, "authMethod": "oauth", "subscription": "synthetic"}))
+                    raise SystemExit(0)
+                if provider == "agy" and args == ["models"]:
+                    print("fake-model")
+                    raise SystemExit(0)
+                if provider == "kimi" and args == ["provider", "list", "--json"]:
+                    print(json.dumps({"models": {"k3-256k": {}}}))
+                    raise SystemExit(0)
+
+                prompt = sys.stdin.read() if provider == "claude" else ""
+                state_path = pathlib.Path(os.environ["MM_FAKE_PROVIDER_STATE"])
+                with state_path.open("r+", encoding="utf-8") as state_file:
+                    fcntl.flock(state_file, fcntl.LOCK_EX)
+                    state = json.load(state_file)
+                    queue = state.get(provider, [])
+                    if not queue:
+                        print(f"no queued outcome for {provider}", file=sys.stderr)
+                        raise SystemExit(96)
+                    outcome = queue.pop(0)
+                    state[provider] = queue
+                    state["_sequence"] = int(state.get("_sequence", 0)) + 1
+                    sequence = state["_sequence"]
+                    state_file.seek(0)
+                    json.dump(state, state_file)
+                    state_file.truncate()
+
+                cwd = pathlib.Path.cwd()
+                snapshot_files = sorted(
+                    str(path.relative_to(cwd))
+                    for path in cwd.rglob("*")
+                    if path.is_file() or path.is_symlink()
+                )
+                mutation = outcome.get("mutate_relative")
+                if mutation:
+                    target = cwd / mutation
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text("provider mutation\n", encoding="utf-8")
+                record = {
+                    "sequence": sequence,
+                    "provider": provider,
+                    "cwd": str(cwd),
+                    "args": args,
+                    "stdin_bytes": len(prompt.encode()),
+                    "snapshot_files": snapshot_files,
+                    "mutate_relative": mutation,
+                }
+                log_path = pathlib.Path(os.environ["MM_FAKE_PROVIDER_LOG"])
+                with log_path.open("a", encoding="utf-8") as log_file:
+                    fcntl.flock(log_file, fcntl.LOCK_EX)
+                    log_file.write(json.dumps(record, sort_keys=True) + "\n")
+
+                kind = outcome.get("kind", "report")
+                if kind == "malformed_wrapper":
+                    print("{not-json")
+                    raise SystemExit(int(outcome.get("exit_code", 0)))
+                if kind == "failure":
+                    print(outcome.get("stdout", ""))
+                    print(outcome.get("stderr", "provider failed"), file=sys.stderr)
+                    raise SystemExit(int(outcome.get("exit_code", 1)))
+                if kind == "budget_exhausted":
+                    message = "budget_exhausted: synthetic provider stop"
+                    if provider == "claude":
+                        print(json.dumps({"is_error": True, "result": message}))
+                    else:
+                        print(message, file=sys.stderr)
+                    raise SystemExit(int(outcome.get("exit_code", 1)))
+                if kind == "timeout":
+                    time.sleep(float(outcome.get("seconds", 120)))
+                    raise SystemExit(0)
+
+                report = outcome.get("report", "")
+                if provider == "claude":
+                    print(json.dumps({
+                        "result": report,
+                        "total_cost_usd": float(outcome.get("cost", 0.01)),
+                        "num_turns": 1,
+                    }))
+                elif provider == "agy":
+                    print(json.dumps({
+                        "status": "SUCCESS",
+                        "response": report,
+                        "duration_seconds": 0.01,
+                        "num_turns": 1,
+                    }))
+                else:
+                    print(report)
+                raise SystemExit(int(outcome.get("exit_code", 0)))
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        for provider in ("claude", "agy", "kimi"):
+            shutil.copy2(shim, self.bin_dir / provider)
+            (self.bin_dir / provider).chmod(0o755)
+        agent_path = (
+            self.home
+            / ".gemini"
+            / "config"
+            / "agents"
+            / MM.ANTIGRAVITY_AGENT_NAME
+            / "agent.md"
+        )
+        agent_path.parent.mkdir(parents=True)
+        shutil.copy2(MM.ANTIGRAVITY_AGENT_PATH, agent_path)
+        self.environment = os.environ.copy()
+        self.environment.update(
+            {
+                "HOME": str(self.home),
+                "PATH": f"{self.bin_dir}:{self.environment['PATH']}",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "MM_FAKE_PROVIDER_STATE": str(self.state_path),
+                "MM_FAKE_PROVIDER_LOG": str(self.log_path),
+            }
+        )
+        self.base = [sys.executable, str(SCRIPT_PATH)]
+
+    def assert_fake_resolution(self) -> None:
+        for provider in ("claude", "agy", "kimi"):
+            resolved = shutil.which(provider, path=self.environment["PATH"])
+            if Path(resolved or "").resolve() != (self.bin_dir / provider).resolve():
+                raise AssertionError(
+                    f"unsafe provider resolution for {provider}: {resolved}"
+                )
+
+    def queue(self, provider: str, *outcomes: dict[str, object]) -> None:
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        state.setdefault(provider, []).extend(outcomes)
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    def cli(
+        self,
+        repo: Path,
+        *arguments: str,
+        check: bool = True,
+        provider_backed: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        if provider_backed:
+            self.assert_fake_resolution()
+        completed = run(
+            [*self.base, *arguments],
+            cwd=repo,
+            env=self.environment,
+            check=False,
+        )
+        if check and completed.returncode != 0:
+            raise AssertionError(
+                f"runner exited {completed.returncode}; stdout={completed.stdout!r}; "
+                f"stderr={completed.stderr!r}"
+            )
+        return completed
+
+    def invocations(self) -> list[dict[str, object]]:
+        if not self.log_path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.log_path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+
+    def run_directories(self) -> list[Path]:
+        return sorted(
+            path.parent
+            for path in (self.home / ".codex" / "review-runs").glob(
+                "*/*/metadata.json"
+            )
+        )
+
+
 class RunnerUnitTests(unittest.TestCase):
+    def test_main_rejects_unsupported_python_before_argument_parsing(self) -> None:
+        error = io.StringIO()
+        with (
+            mock.patch.object(MM.sys, "version_info", (3, 9, 6)),
+            mock.patch.object(MM, "build_parser") as parser,
+            redirect_stderr(error),
+        ):
+            self.assertEqual(MM.main(), 2)
+        parser.assert_not_called()
+        self.assertIn("Python 3.12 or newer is required", error.getvalue())
+        self.assertIn("running 3.9.6", error.getvalue())
+
+    def test_internal_error_diagnostic_omits_exception_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            try:
+                raise TypeError("synthetic-sensitive-value-must-not-persist")
+            except TypeError as exc:
+                path = MM.persist_internal_error(run_dir, exc)
+            diagnostic = MM.read_json(path)
+            raw = path.read_text(encoding="utf-8")
+        self.assertEqual(diagnostic["error_type"], "TypeError")
+        self.assertTrue(diagnostic["frames"])
+        self.assertNotIn("synthetic-sensitive-value-must-not-persist", raw)
+        self.assertEqual(
+            diagnostic["privacy"], "exception message and local values omitted"
+        )
+
+    def test_evidence_memory_context_closes_sqlite_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "evidence.sqlite3"
+            with EM._open_database(database) as connection:
+                connection.execute("SELECT 1").fetchone()
+            with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed"):
+                connection.execute("SELECT 1")
+
     def setUp(self) -> None:
         self.health_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.health_directory.cleanup)
@@ -790,6 +1065,61 @@ class RunnerUnitTests(unittest.TestCase):
                     )
                 document = MM.read_json(workflows / "wf-exhausted.json")
         self.assertNotIn("usage_reservations", document)
+
+    def test_concurrent_provider_attempt_reservations_cannot_exceed_limit(
+        self,
+    ) -> None:
+        reviewer = MM.Reviewer("claude", ("claude",), {}, "sonnet", "fake")
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            barrier = threading.Barrier(3)
+            results: list[str] = []
+            results_lock = threading.Lock()
+
+            def reserve(reservation_id: str) -> None:
+                barrier.wait()
+                try:
+                    MM.apply_workflow_budget(
+                        [reviewer],
+                        "wf-concurrent-usage",
+                        reservation_id=reservation_id,
+                    )
+                except MM.ReviewError:
+                    outcome = "blocked"
+                else:
+                    outcome = "reserved"
+                with results_lock:
+                    results.append(outcome)
+
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(
+                    MM,
+                    "workflow_provider_attempts",
+                    return_value={provider: 0 for provider in MM.PROVIDERS},
+                ),
+                mock.patch.object(MM, "active_provider_cooldown", return_value=None),
+            ):
+                MM.create_workflow(
+                    "wf-concurrent-usage",
+                    usage_based=True,
+                    max_provider_attempts=1,
+                )
+                threads = [
+                    threading.Thread(target=reserve, args=(f"run-{index}",))
+                    for index in range(2)
+                ]
+                for thread in threads:
+                    thread.start()
+                barrier.wait()
+                for thread in threads:
+                    thread.join(timeout=2)
+                document = MM.read_json(
+                    workflows / "wf-concurrent-usage.json"
+                )
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertCountEqual(results, ["reserved", "blocked"])
+        self.assertEqual(len(document["usage_reservations"]), 1)
 
     def test_continue_zero_run_is_read_only_and_actionable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3070,6 +3400,97 @@ None.
             self.assertEqual(updated["findings"][0]["decision"], "rejected")
             self.assertEqual(updated["test_gaps"][0]["decision"], "covered")
 
+    def test_fixed_and_covered_decisions_require_changed_scoped_source(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            run_dir = root / "run"
+            repo.mkdir()
+            run_dir.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            scope = MM.Scope(
+                "uncommitted",
+                None,
+                "staged, unstaged, and untracked changes",
+            )
+            paths = ["src/feature.py"]
+            reviewed_fingerprint = MM.fingerprint(
+                repo, scope, paths, ("src",)
+            )
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "repository": {"root": str(repo)},
+                    "scope": {
+                        "kind": scope.kind,
+                        "value": scope.value,
+                        "label": scope.label,
+                    },
+                    "path_filters": ["src"],
+                    "paths": paths,
+                    "source_fingerprint": reviewed_fingerprint,
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {
+                    "findings": [
+                        {
+                            "id": "claude-001",
+                            "kind": "finding",
+                            "decision": "accepted",
+                        }
+                    ],
+                    "test_gaps": [
+                        {
+                            "id": "claude-test-001",
+                            "kind": "test_gap",
+                            "decision": "accepted",
+                        }
+                    ],
+                    "observations": [],
+                },
+            )
+            decisions = [
+                {
+                    "finding": "claude-001",
+                    "decision": "fixed",
+                    "evidence": "The enqueue now follows persistence.",
+                    "verification": "Focused regression passed.",
+                },
+                {
+                    "finding": "claude-test-001",
+                    "decision": "covered",
+                    "evidence": "A regression test now asserts ordering.",
+                    "verification": "Focused regression passed.",
+                },
+            ]
+
+            with self.assertRaisesRegex(
+                MM.ReviewError, "task-scoped source is unchanged"
+            ):
+                MM.write_triage_decisions(run_dir, decisions)
+            unchanged = MM.read_json(run_dir / "triage.json")
+            self.assertEqual(unchanged["findings"][0]["decision"], "accepted")
+            self.assertEqual(
+                unchanged["test_gaps"][0]["decision"], "accepted"
+            )
+
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 3\n", encoding="utf-8"
+            )
+            MM.write_triage_decisions(run_dir, decisions)
+            resolved = MM.read_json(run_dir / "triage.json")
+            self.assertEqual(resolved["findings"][0]["decision"], "fixed")
+            self.assertEqual(
+                resolved["test_gaps"][0]["decision"], "covered"
+            )
+
 
     def test_kimi_readiness_requires_the_configured_model_alias(self) -> None:
         payload = json.dumps(
@@ -3735,7 +4156,36 @@ None.
     def test_workflow_supersede_links_both_documents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             workflows = Path(temporary)
-            with mock.patch.object(MM, "WORKFLOWS_DIR", workflows):
+            prior_runs = [
+                (
+                    Path(temporary) / "repo-one" / "run-one",
+                    {
+                        "phase": "confirmation",
+                        "repository": {
+                            "id": "repo-one",
+                            "name": "one",
+                            "root": "/private/tmp/one",
+                        },
+                    },
+                ),
+                (
+                    Path(temporary) / "repo-two" / "run-two",
+                    {
+                        "phase": "confirmation",
+                        "repository": {
+                            "id": "repo-two",
+                            "name": "two",
+                            "root": "/private/tmp/two",
+                        },
+                    },
+                ),
+            ]
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(
+                    MM, "workflow_lineage_runs", return_value=prior_runs
+                ),
+            ):
                 MM.create_workflow(
                     "wf-old",
                     name="Old",
@@ -3761,6 +4211,10 @@ None.
         self.assertEqual(old["status"], "superseded")
         self.assertEqual(new["supersedes"], ["wf-old"])
         self.assertEqual(
+            [item["id"] for item in new["required_repositories"]],
+            ["repo-one", "repo-two"],
+        )
+        self.assertEqual(
             new["policy"],
             {
                 "review_mode": "fast",
@@ -3771,6 +4225,102 @@ None.
                 "max_budget_usd": 7.0,
             },
         )
+
+    def test_successor_missing_inherited_repository_cannot_finalize(self) -> None:
+        metadata = {
+            "workflow_id": "wf-successor",
+            "run_id": "run-one",
+            "repository": {
+                "id": "repo-one",
+                "name": "one",
+                "root": "/private/tmp/one",
+            },
+            "status": "completed",
+            "round": 1,
+            "phase": "confirmation",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflows = root / "workflows"
+            workflows.mkdir()
+            run_dir = root / "run-one"
+            run_dir.mkdir()
+            MM.safe_write_json(
+                workflows / "wf-successor.json",
+                {
+                    "workflow_id": "wf-successor",
+                    "supersedes": ["wf-old"],
+                    "policy": MM.workflow_policy(),
+                    "required_repositories": [
+                        metadata["repository"],
+                        {
+                            "id": "repo-two",
+                            "name": "two",
+                            "root": "/private/tmp/two",
+                        },
+                    ],
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "final.json",
+                {
+                    "schema_version": MM.SCHEMA_VERSION,
+                    "status": "PASS_CLEAN",
+                    "source_fingerprint": "same",
+                    "codex_verdict": "PASS_CLEAN",
+                    "triage_status": "PASS_CLEAN",
+                    "triage_sha256s": {"run-one": "a" * 64},
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "triage.json", {"findings": [], "test_gaps": []}
+            )
+            records = [(run_dir, metadata)]
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "CONFIG_PATH", root / "missing.json"),
+                mock.patch.object(MM, "workflow_runs", return_value=records),
+                mock.patch.object(
+                    MM, "workflow_lineage_runs", return_value=records
+                ),
+                mock.patch.object(
+                    MM, "workflow_lineage_ids", return_value=["wf-successor"]
+                ),
+                mock.patch.object(
+                    MM, "latest_workflow_runs", return_value=records
+                ),
+                mock.patch.object(
+                    MM, "latest_workflow_attempts", return_value=records
+                ),
+                mock.patch.object(
+                    MM,
+                    "freshness_status",
+                    return_value={"fresh": True, "mode": "working-tree"},
+                ),
+                mock.patch.object(MM, "final_triage_is_fresh", return_value=True),
+                mock.patch.object(
+                    MM, "run_artifact_bytes", return_value=MM.empty_artifact_bytes()
+                ),
+            ):
+                status, ready = MM.workflow_status("wf-successor")
+                plan = MM.workflow_continue_plan("wf-successor")
+                args = MM.build_parser().parse_args(
+                    ["workflow", "finalize", "wf-successor"]
+                )
+                with self.assertRaisesRegex(
+                    MM.ReviewError, "Workflow is not ready"
+                ):
+                    MM.workflow_finalize_command(args)
+        self.assertFalse(ready)
+        missing = [
+            item
+            for item in status["repositories"]
+            if item["state"] == "not-reviewed"
+        ]
+        self.assertEqual([item["repository"]["id"] for item in missing], ["repo-two"])
+        self.assertEqual(plan["next"], "NEEDS_REVIEW")
+        self.assertEqual(plan["actions"][0]["repository"], "two")
+        self.assertIn("--reuse-contract", plan["actions"][0]["command"])
 
     def test_workflow_supersede_by_rejects_a_different_budget_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4046,15 +4596,30 @@ None.
                 mock.patch.object(
                     MM,
                     "invoke_reviewer",
-                    side_effect=RuntimeError("unexpected resume failure"),
+                    side_effect=RuntimeError(
+                        "synthetic-sensitive-value-must-not-persist"
+                    ),
                 ),
-                self.assertRaisesRegex(RuntimeError, "unexpected resume failure"),
+                self.assertRaisesRegex(
+                    MM.ReviewError, "redacted private diagnostics"
+                ),
             ):
                 MM.resume_review_command(args)
             metadata = MM.read_json(run_dir / "metadata.json")
+            diagnostic = MM.read_json(run_dir / "internal-error.json")
+            raw_artifacts = "".join(
+                path.read_text(encoding="utf-8")
+                for path in run_dir.glob("*.json")
+            )
         self.assertEqual(metadata["status"], "partial")
         self.assertEqual(metadata["failure"]["type"], "reviewer_failure")
         self.assertEqual(metadata["terminal_error"]["type"], "RuntimeError")
+        self.assertEqual(
+            metadata["terminal_error"]["message"],
+            "Unexpected internal runner failure.",
+        )
+        self.assertEqual(diagnostic["error_type"], "RuntimeError")
+        self.assertNotIn("synthetic-sensitive-value-must-not-persist", raw_artifacts)
 
     def test_budget_exhaustion_requires_an_explicit_resume_override(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -6198,7 +6763,7 @@ None.
             ):
                 MM.apply_snapshot_exclusions(snapshot, exclusions)
 
-    def test_lineage_sensitive_approval_reuse_requires_identical_content_hash(
+    def test_lineage_sensitive_approval_reuse_requires_every_identity_field(
         self,
     ) -> None:
         finding = MM.SensitiveFinding(
@@ -6222,13 +6787,22 @@ None.
             approved, sources = MM.reusable_lineage_sensitive_approvals(
                 "wf-one", "repo-one", [finding]
             )
-            changed = MM.dataclasses.replace(finding, content_sha256="e" * 64)
-            changed_approved, _ = MM.reusable_lineage_sensitive_approvals(
-                "wf-one", "repo-one", [changed]
-            )
+            mismatches = [
+                MM.dataclasses.replace(finding, path="tests/other.txt"),
+                MM.dataclasses.replace(finding, line=3),
+                MM.dataclasses.replace(finding, rule="OpenAI-style secret key"),
+                MM.dataclasses.replace(finding, key="api_key"),
+                MM.dataclasses.replace(finding, content_sha256="e" * 64),
+            ]
+            changed_approvals = [
+                MM.reusable_lineage_sensitive_approvals(
+                    "wf-one", "repo-one", [changed]
+                )[0]
+                for changed in mismatches
+            ]
         self.assertEqual(approved, {finding.identifier})
         self.assertEqual(sources, ["run-approved"])
-        self.assertEqual(changed_approved, set())
+        self.assertEqual(changed_approvals, [set()] * len(mismatches))
 
     def test_provider_attempt_limit_raise_is_increase_only_and_audited(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -6456,6 +7030,1694 @@ None.
 
 
 class RunnerEndToEndTests(unittest.TestCase):
+    def test_failure_resume_and_attempt_accounting_campaign(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "failure-repo"
+            repo.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            harness = FakeProviderHarness(root)
+            contradictory = structured_report(
+                verdict="PASS_CLEAN",
+                findings=textwrap.dedent(
+                    """\
+                    ## [low] Contradictory declared verdict is normalized
+                    - Location: src/feature.py:1
+                    - Trigger: A finding accompanies PASS_CLEAN
+                    - Evidence: The structured finding is present
+                    - Impact: The report must not be called clean
+                    - Smallest fix: Preserve the finding in triage
+                    - Confidence: high
+                    """
+                ).strip(),
+            )
+            clean = structured_report()
+            harness.queue(
+                "claude", {"kind": "report", "report": contradictory}
+            )
+            harness.queue(
+                "kimi",
+                {
+                    "kind": "failure",
+                    "stderr": "synthetic provider process failed",
+                    "exit_code": 7,
+                },
+                {"kind": "report", "report": clean},
+            )
+            partial_workflow = harness.cli(
+                repo,
+                "workflow",
+                "start",
+                "--review-mode",
+                "balanced",
+                "--max-provider-attempts",
+                "4",
+            ).stdout.strip()
+            partial = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--uncommitted",
+                "--workflow-id",
+                partial_workflow,
+                "--path",
+                "src/feature.py",
+                "--task",
+                "Exercise partial provider recovery.",
+                "--with-kimi",
+                "--without-antigravity",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(partial.returncode, 2)
+            partial_dir = next(
+                path
+                for path in harness.run_directories()
+                if MM.read_json(path / "metadata.json").get("workflow_id")
+                == partial_workflow
+            )
+            partial_metadata = MM.read_json(partial_dir / "metadata.json")
+            self.assertEqual(partial_metadata["status"], "partial")
+            self.assertEqual(
+                partial_metadata["failure"]["successful_reviewers"], ["claude"]
+            )
+            self.assertEqual(
+                partial_metadata["failure"]["categories"]["kimi"],
+                "provider_error",
+            )
+            harness.cli(
+                repo,
+                "resume",
+                "--run",
+                str(partial_dir),
+                provider_backed=True,
+            )
+            resumed = MM.read_json(partial_dir / "metadata.json")
+            self.assertEqual(resumed["status"], "completed")
+            self.assertEqual(resumed["resumed_reviewers"], ["kimi"])
+            self.assertEqual(len(MM.reviewer_attempts(resumed["reviewers"]["claude"])), 1)
+            self.assertEqual(len(MM.reviewer_attempts(resumed["reviewers"]["kimi"])), 2)
+            self.assertTrue((partial_dir / "kimi.attempt-1.md").exists())
+            self.assertTrue((partial_dir / "kimi.attempt-1.stderr.log").exists())
+            summary = MM.read_json(partial_dir / "review-summary.json")
+            self.assertEqual(
+                summary["reviews"]["claude"]["declared_verdict"], "PASS_CLEAN"
+            )
+            self.assertEqual(
+                summary["reviews"]["claude"]["verdict"], "PASS_WITH_FINDINGS"
+            )
+            provider_calls = harness.invocations()
+            self.assertEqual(
+                [item["provider"] for item in provider_calls].count("claude"), 1
+            )
+            self.assertEqual(
+                [item["provider"] for item in provider_calls].count("kimi"), 2
+            )
+            partial_status = json.loads(
+                harness.cli(
+                    repo, "workflow", "status", partial_workflow, check=False
+                ).stdout
+            )
+            self.assertEqual(
+                partial_status["external_review_coverage"]["headline"],
+                "claude + kimi",
+            )
+            partial_continue = json.loads(
+                harness.cli(
+                    repo, "continue", partial_workflow, check=False
+                ).stdout
+            )
+            self.assertEqual(partial_continue["next"], "NEEDS_TRIAGE")
+
+            malformed_workflow = harness.cli(
+                repo,
+                "workflow",
+                "start",
+                "--review-mode",
+                "balanced",
+                "--max-provider-attempts",
+                "2",
+            ).stdout.strip()
+            harness.queue("claude", {"kind": "malformed_wrapper", "exit_code": 0})
+            malformed = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                malformed_workflow,
+                "--path",
+                "src/feature.py",
+                "--task",
+                "Reject malformed provider output.",
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(malformed.returncode, 2)
+            malformed_dir = next(
+                path
+                for path in harness.run_directories()
+                if MM.read_json(path / "metadata.json").get("workflow_id")
+                == malformed_workflow
+            )
+            malformed_metadata = MM.read_json(malformed_dir / "metadata.json")
+            self.assertEqual(
+                malformed_metadata["reviewers"]["claude"]["failure_category"],
+                "malformed_response",
+            )
+
+            invalid_workflow = harness.cli(
+                repo,
+                "workflow",
+                "start",
+                "--review-mode",
+                "balanced",
+                "--max-provider-attempts",
+                "2",
+            ).stdout.strip()
+            harness.queue(
+                "claude",
+                {
+                    "kind": "report",
+                    "report": structured_report(verdict="PASS_WITH_FINDINGS"),
+                },
+            )
+            invalid = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                invalid_workflow,
+                "--path",
+                "src/feature.py",
+                "--task",
+                "Reject exit-zero contract-invalid output.",
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(invalid.returncode, 2)
+            invalid_dir = next(
+                path
+                for path in harness.run_directories()
+                if MM.read_json(path / "metadata.json").get("workflow_id")
+                == invalid_workflow
+            )
+            invalid_metadata = MM.read_json(invalid_dir / "metadata.json")
+            self.assertEqual(invalid_metadata["failure"]["type"], "invalid_report")
+            self.assertEqual(invalid_metadata["reviewers"]["claude"]["exit_code"], 0)
+            self.assertFalse(
+                invalid_metadata["reviewers"]["claude"]["report_contract_valid"]
+            )
+            invalid_status = json.loads(
+                harness.cli(
+                    repo, "workflow", "status", invalid_workflow, check=False
+                ).stdout
+            )
+            self.assertEqual(
+                invalid_status["external_review_coverage"]["headline"],
+                "no successful external provider",
+            )
+            self.assertEqual(
+                invalid_status["provider_usage"]["providers"]["claude"][
+                    "readiness_status"
+                ],
+                "not_probed",
+            )
+            self.assertEqual(
+                invalid_status["provider_usage"]["providers"]["kimi"][
+                    "readiness_status"
+                ],
+                "disabled",
+            )
+            invalid_continue = json.loads(
+                harness.cli(
+                    repo, "continue", invalid_workflow, check=False
+                ).stdout
+            )
+            self.assertEqual(invalid_continue["next"], "NEEDS_RECOVERY")
+
+            budget_workflow = harness.cli(
+                repo,
+                "workflow",
+                "start",
+                "--review-mode",
+                "balanced",
+                "--max-provider-attempts",
+                "2",
+            ).stdout.strip()
+            harness.queue("claude", {"kind": "budget_exhausted"})
+            exhausted = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                budget_workflow,
+                "--path",
+                "src/feature.py",
+                "--task",
+                "Recover explicitly from a synthetic provider stop.",
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(exhausted.returncode, 2)
+            budget_dir = next(
+                path
+                for path in harness.run_directories()
+                if MM.read_json(path / "metadata.json").get("workflow_id")
+                == budget_workflow
+            )
+            budget_metadata = MM.read_json(budget_dir / "metadata.json")
+            self.assertEqual(
+                budget_metadata["reviewers"]["claude"]["failure_category"],
+                "budget_exhausted",
+            )
+            calls_before_blind_retry = len(harness.invocations())
+            blind = harness.cli(
+                repo,
+                "resume",
+                "--run",
+                str(budget_dir),
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(blind.returncode, 2)
+            self.assertIn("blind resume", blind.stderr)
+            self.assertEqual(len(harness.invocations()), calls_before_blind_retry)
+            harness.queue("claude", {"kind": "report", "report": clean})
+            harness.cli(
+                repo,
+                "resume",
+                "--run",
+                str(budget_dir),
+                "--claude-max-budget-usd",
+                "2",
+                provider_backed=True,
+            )
+            recovered = MM.read_json(budget_dir / "metadata.json")
+            self.assertEqual(recovered["status"], "completed")
+            self.assertEqual(len(MM.reviewer_attempts(recovered["reviewers"]["claude"])), 2)
+            self.assertTrue((budget_dir / "claude.attempt-1.md").exists())
+            headroom = json.loads(
+                harness.cli(
+                    repo, "continue", budget_workflow, check=False
+                ).stdout
+            )
+            self.assertEqual(headroom["next"], "WAIT_FOR_PROVIDER")
+            warning = headroom["actions"][0]["attempt_headroom_warning"]
+            self.assertEqual(warning["providers"], ["claude"])
+            harness.cli(
+                repo,
+                "workflow",
+                "raise-provider-attempt-limit",
+                budget_workflow,
+                "--to",
+                "6",
+                "--reason",
+                "reserve successor repair and confirmation recovery headroom",
+            )
+            cannot_lower = harness.cli(
+                repo,
+                "workflow",
+                "raise-provider-attempt-limit",
+                budget_workflow,
+                "--to",
+                "5",
+                "--reason",
+                "invalid lowering attempt",
+                check=False,
+            )
+            self.assertEqual(cannot_lower.returncode, 2)
+            budget_document = MM.read_json(
+                harness.home
+                / ".codex"
+                / "review-runs"
+                / "workflows"
+                / f"{budget_workflow}.json"
+            )
+            self.assertEqual(
+                budget_document["provider_attempt_limit_history"][0]["new"], 6
+            )
+            successor = harness.cli(
+                repo,
+                "workflow",
+                "supersede",
+                budget_workflow,
+                "--reason",
+                "Exercise successor usage inheritance.",
+            ).stdout.strip()
+            successor_before = json.loads(
+                harness.cli(
+                    repo, "workflow", "status", successor, check=False
+                ).stdout
+            )
+            self.assertEqual(
+                successor_before["provider_usage"]["providers"]["claude"][
+                    "attempts"
+                ],
+                2,
+            )
+            harness.queue(
+                "claude",
+                {"kind": "report", "report": clean},
+                {"kind": "report", "report": clean},
+            )
+            harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                successor,
+                "--phase",
+                "repair",
+                "--reuse-contract",
+                "--without-antigravity",
+                "--without-kimi",
+                provider_backed=True,
+            )
+            successor_plan = json.loads(
+                harness.cli(repo, "continue", successor, check=False).stdout
+            )
+            self.assertEqual(successor_plan["actions"][0]["phase"], "confirmation")
+            self.assertNotIn(
+                "attempt_headroom_warning", successor_plan["actions"][0]
+            )
+            confirmation = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                successor,
+                "--phase",
+                "confirmation",
+                "--reuse-contract",
+                "--without-antigravity",
+                "--without-kimi",
+                provider_backed=True,
+            )
+            confirmation_dir = Path(
+                next(
+                    line.split(": ", 1)[1]
+                    for line in confirmation.stdout.splitlines()
+                    if line.startswith("Review artifacts: ")
+                )
+            )
+            harness.cli(
+                repo,
+                "finalize",
+                "--run",
+                str(confirmation_dir),
+                "--codex-verdict",
+                "PASS_CLEAN",
+                "--codex-review",
+                "Attempt lineage and recovery behavior are consistent.",
+            )
+            successor_status = json.loads(
+                harness.cli(
+                    repo, "workflow", "status", successor, check=False
+                ).stdout
+            )
+            self.assertEqual(
+                successor_status["provider_usage"]["providers"]["claude"][
+                    "attempts"
+                ],
+                4,
+            )
+            self.assertEqual(
+                successor_status["provider_usage"]["providers"]["claude"][
+                    "attempts_remaining"
+                ],
+                2,
+            )
+            original_status = json.loads(
+                harness.cli(
+                    repo, "workflow", "status", budget_workflow, check=False
+                ).stdout
+            )
+            self.assertEqual(original_status["state"], "superseded")
+
+            harness.queue(
+                "claude", {"kind": "timeout", "seconds": 10}
+            )
+            harness.assert_fake_resolution()
+            timeout_dir = root / "timeout-run"
+            timeout_dir.mkdir()
+            timeout_reviewer = MM.Reviewer(
+                "claude",
+                (str(harness.bin_dir / "claude"),),
+                {
+                    "MM_FAKE_PROVIDER_STATE": str(harness.state_path),
+                    "MM_FAKE_PROVIDER_LOG": str(harness.log_path),
+                },
+                "sonnet",
+                "fake",
+            )
+            with mock.patch.object(
+                MM, "PROVIDER_HEALTH_PATH", root / "provider-health.json"
+            ):
+                timeout_result = MM.invoke_reviewer(
+                    timeout_reviewer,
+                    repo=repo,
+                    prompt="synthetic timeout",
+                    run_dir=timeout_dir,
+                    timeout_seconds=1,
+                )
+            self.assertTrue(timeout_result.timed_out)
+            self.assertEqual(timeout_result.returncode, 124)
+            self.assertEqual(timeout_result.failure_category, "timeout")
+
+    def test_security_boundary_campaign_is_fail_closed_and_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "security-repo"
+            repo.mkdir()
+            initialize_repo(repo)
+            fixtures = repo / "fixtures"
+            fixtures.mkdir()
+            task_path = repo / "src" / "task.py"
+            task_path.write_text("VALUE = 1\n", encoding="utf-8")
+            npmrc = repo / ".npmrc"
+            npmrc.write_text(
+                "registry=https://registry.npmjs.org/\n", encoding="utf-8"
+            )
+            unchanged_secret = fixtures / "unchanged_secret.py"
+            synthetic_value = "credential-value-123456"
+            unchanged_secret.write_text(
+                f'apiKey = "{synthetic_value}"\n', encoding="utf-8"
+            )
+            deleted_secret = fixtures / "deleted_secret.py"
+            deleted_secret.write_text(
+                f'password = "{synthetic_value}"\n', encoding="utf-8"
+            )
+            run(
+                [
+                    "git",
+                    "add",
+                    ".npmrc",
+                    "src/task.py",
+                    "fixtures/unchanged_secret.py",
+                    "fixtures/deleted_secret.py",
+                ],
+                cwd=repo,
+            )
+            run(["git", "commit", "-qm", "add security fixtures"], cwd=repo)
+            task_path.write_text("VALUE = 2\n", encoding="utf-8")
+            deleted_secret.unlink()
+            (repo / "unrelated.txt").write_text("dirty unrelated\n", encoding="utf-8")
+            (repo / "src" / "internal-link").symlink_to("task.py")
+            outside = root / "outside.txt"
+            outside.write_text("outside\n", encoding="utf-8")
+            (repo / "src" / "external-link").symlink_to(outside)
+            harness = FakeProviderHarness(root)
+            task = "Review the scoped task while preserving snapshot security boundaries."
+            workflow_identifier = harness.cli(
+                repo,
+                "workflow",
+                "start",
+                "--name",
+                "snapshot security campaign",
+                "--review-mode",
+                "deep",
+                "--max-provider-attempts",
+                "6",
+            ).stdout.strip()
+            common = [
+                "--repo",
+                str(repo),
+                "--uncommitted",
+                "--path",
+                "src/task.py",
+                "--path",
+                "src/internal-link",
+                "--path",
+                "fixtures/deleted_secret.py",
+                "--exclude-snapshot-path",
+                ".npmrc",
+            ]
+            blocked = harness.cli(
+                repo,
+                "run",
+                *common,
+                "--workflow-id",
+                workflow_identifier,
+                "--phase",
+                "repair",
+                "--risk",
+                "security",
+                "--review-profile",
+                "security",
+                "--task",
+                task,
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(blocked.returncode, 2)
+            self.assertIn("likely sensitive material", blocked.stderr)
+            self.assertNotIn(synthetic_value, blocked.stderr)
+            self.assertEqual(harness.invocations(), [])
+            preflight = [
+                MM.read_json(path / "metadata.json")
+                for path in harness.run_directories()
+            ]
+            self.assertEqual(preflight[-1]["status"], "preflight_blocked")
+            self.assertNotIn("reviewers", preflight[-1])
+            self.assertIn("unrelated.txt", preflight[-1]["excluded_changed_paths"])
+            self.assertIn(
+                "src/external-link", preflight[-1]["excluded_changed_paths"]
+            )
+
+            scan = harness.cli(
+                repo,
+                "scan",
+                *common,
+                "--approve-findings",
+            )
+            scan_result = json.loads(scan.stdout)
+            finding_paths = {
+                item["path"] for item in scan_result["sensitive_findings"]
+            }
+            self.assertIn("fixtures/unchanged_secret.py", finding_paths)
+            self.assertIn("change.patch", finding_paths)
+            self.assertEqual(scan_result["blocked_paths"], [])
+            self.assertEqual(scan_result["external_symlinks"], [])
+            token = scan_result["approved_token"]
+            harness.queue("claude", {"kind": "report", "report": structured_report()})
+            reviewed = harness.cli(
+                repo,
+                "run",
+                *common,
+                "--workflow-id",
+                workflow_identifier,
+                "--phase",
+                "repair",
+                "--risk",
+                "security",
+                "--review-profile",
+                "security",
+                "--task",
+                task,
+                "--sensitive-scan-token",
+                token,
+                "--without-antigravity",
+                "--without-kimi",
+                provider_backed=True,
+            )
+            repair_dir = Path(
+                next(
+                    line.split(": ", 1)[1]
+                    for line in reviewed.stdout.splitlines()
+                    if line.startswith("Review artifacts: ")
+                )
+            )
+            repair_metadata = MM.read_json(repair_dir / "metadata.json")
+            self.assertEqual(repair_metadata["status"], "completed")
+            exclusion = repair_metadata["snapshot_exclusions"][0]
+            self.assertEqual(exclusion["path"], ".npmrc")
+            self.assertTrue(exclusion["git_blob"])
+            provider_view = harness.invocations()[0]
+            self.assertNotIn(".npmrc", provider_view["snapshot_files"])
+            self.assertIn("src/internal-link", provider_view["snapshot_files"])
+            self.assertNotIn(
+                "fixtures/deleted_secret.py", provider_view["snapshot_files"]
+            )
+
+            reused_token = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                workflow_identifier,
+                "--phase",
+                "confirmation",
+                "--reuse-contract",
+                "--sensitive-scan-token",
+                token,
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(reused_token.returncode, 2)
+            self.assertIn("already consumed", reused_token.stderr)
+            self.assertEqual(len(harness.invocations()), 1)
+
+            second_scan = json.loads(
+                harness.cli(
+                    repo, "scan", *common, "--approve-findings"
+                ).stdout
+            )
+            second_token = second_scan["approved_token"]
+            original_task = task_path.read_text(encoding="utf-8")
+            task_path.write_text(original_task + "# modified snapshot\n", encoding="utf-8")
+            mismatched_token = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                workflow_identifier,
+                "--phase",
+                "confirmation",
+                "--reuse-contract",
+                "--sensitive-scan-token",
+                second_token,
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(mismatched_token.returncode, 2)
+            self.assertIn("does not match the current snapshot", mismatched_token.stderr)
+            task_path.write_text(original_task, encoding="utf-8")
+            self.assertEqual(len(harness.invocations()), 1)
+
+            unchanged_secret.write_text(
+                'apiKey = "different-credential-value-654321"\n',
+                encoding="utf-8",
+            )
+            run(["git", "add", "fixtures/unchanged_secret.py"], cwd=repo)
+            run(["git", "commit", "-qm", "change synthetic fixture"], cwd=repo)
+            stale_approval = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                workflow_identifier,
+                "--phase",
+                "confirmation",
+                "--reuse-contract",
+                "--reuse-lineage-sensitive-approvals",
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(stale_approval.returncode, 2)
+            self.assertIn("New or changed findings require", stale_approval.stderr)
+            self.assertNotIn("different-credential-value", stale_approval.stderr)
+            unchanged_secret.write_text(
+                f'apiKey = "{synthetic_value}"\n', encoding="utf-8"
+            )
+            run(["git", "add", "fixtures/unchanged_secret.py"], cwd=repo)
+            run(["git", "commit", "-qm", "restore synthetic fixture"], cwd=repo)
+
+            incomplete = structured_report(
+                coverage_complete=False,
+                unreviewed_paths=["src/internal-link"],
+                limitations=["The symlink target was not followed independently."],
+            )
+            harness.queue("claude", {"kind": "report", "report": incomplete})
+            confirmation = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                workflow_identifier,
+                "--phase",
+                "confirmation",
+                "--reuse-contract",
+                "--reuse-lineage-sensitive-approvals",
+                "--without-antigravity",
+                "--without-kimi",
+                provider_backed=True,
+            )
+            confirmation_dir = Path(
+                next(
+                    line.split(": ", 1)[1]
+                    for line in confirmation.stdout.splitlines()
+                    if line.startswith("Review artifacts: ")
+                )
+            )
+            no_compensation = harness.cli(
+                repo,
+                "finalize",
+                "--run",
+                str(confirmation_dir),
+                "--codex-verdict",
+                "PASS_CLEAN",
+                "--codex-review",
+                "The provider report alone is insufficient.",
+                "--verification",
+                "security fixture checks passed",
+                check=False,
+            )
+            self.assertEqual(no_compensation.returncode, 2)
+            self.assertIn("explicit Codex compensation", no_compensation.stderr)
+            harness.cli(
+                repo,
+                "finalize",
+                "--run",
+                str(confirmation_dir),
+                "--codex-verdict",
+                "PASS_CLEAN",
+                "--codex-review",
+                "Inspected the omitted config and internal symlink target.",
+                "--verification",
+                "security fixture checks passed",
+                "--coverage-verification",
+                "Read .npmrc and src/task.py through src/internal-link; both are safe and task behavior is covered.",
+            )
+            verification = json.loads(
+                harness.cli(
+                    repo, "verify", "--run", str(confirmation_dir)
+                ).stdout
+            )
+            self.assertTrue(verification["fresh"])
+            self.assertFalse(verification["deployment_ready"])
+            status = json.loads(
+                harness.cli(
+                    repo, "workflow", "status", workflow_identifier
+                ).stdout
+            )
+            self.assertEqual(status["state"], "ready_to_finalize")
+            self.assertEqual(
+                status["external_review_coverage"]["headline"], "claude only"
+            )
+            continuation = json.loads(
+                harness.cli(
+                    repo, "continue", workflow_identifier, check=False
+                ).stdout
+            )
+            self.assertEqual(continuation["next"], "READY_TO_GATE")
+            audit = json.loads(
+                harness.cli(repo, "workflow", "audit", "--stale-days", "7").stdout
+            )
+            self.assertFalse(audit["mutated"])
+            harness.cli(repo, "workflow", "finalize", workflow_identifier)
+            completed_status = json.loads(
+                harness.cli(
+                    repo, "workflow", "status", workflow_identifier, check=False
+                ).stdout
+            )
+            self.assertEqual(completed_status["state"], "completed")
+            self.assertFalse(completed_status["deployment_ready"])
+
+            external_workflow = harness.cli(
+                repo,
+                "workflow",
+                "start",
+                "--review-mode",
+                "deep",
+            ).stdout.strip()
+            external_block = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--uncommitted",
+                "--workflow-id",
+                external_workflow,
+                "--exclude-snapshot-path",
+                ".npmrc",
+                "--risk",
+                "security",
+                "--task",
+                "Reject an external symlink before provider invocation.",
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(external_block.returncode, 2)
+            self.assertIn("external symlink escapes", external_block.stderr)
+            self.assertEqual(len(harness.invocations()), 2)
+
+            task_scoped_exclusion = harness.cli(
+                repo,
+                "scan",
+                "--repo",
+                str(repo),
+                "--uncommitted",
+                "--path",
+                ".npmrc",
+                "--exclude-snapshot-path",
+                ".npmrc",
+                check=False,
+            )
+            self.assertEqual(task_scoped_exclusion.returncode, 2)
+            self.assertIn("task-scoped or changed", task_scoped_exclusion.stderr)
+            original_npmrc = npmrc.read_text(encoding="utf-8")
+            npmrc.write_text(original_npmrc + "audit=true\n", encoding="utf-8")
+            changed_exclusion = harness.cli(
+                repo,
+                "scan",
+                *common,
+                check=False,
+            )
+            self.assertEqual(changed_exclusion.returncode, 2)
+            self.assertIn("must be unchanged", changed_exclusion.stderr)
+            npmrc.write_text(original_npmrc, encoding="utf-8")
+
+            authoritative_json = [
+                path
+                for run_dir in harness.run_directories()
+                for path in run_dir.glob("*.json")
+            ]
+            for path in authoritative_json:
+                self.assertNotIn(
+                    synthetic_value, path.read_text(encoding="utf-8"), str(path)
+                )
+
+    def test_repair_to_confirmation_campaign_enforces_authoritative_gate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "campaign-repo"
+            repo.mkdir()
+            initialize_repo(repo)
+            tests = repo / "tests"
+            tests.mkdir()
+            scheduler = repo / "src" / "scheduler.py"
+            scheduler.write_text(
+                "def schedule(store, queue, job):\n"
+                "    raise NotImplementedError\n",
+                encoding="utf-8",
+            )
+            scheduler_test = tests / "test_scheduler.py"
+            scheduler_test.write_text(
+                "import unittest\n\n"
+                "class SchedulerTest(unittest.TestCase):\n"
+                "    def test_placeholder(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            run(["git", "add", "src/scheduler.py", "tests/test_scheduler.py"], cwd=repo)
+            run(["git", "commit", "-qm", "add scheduler skeleton"], cwd=repo)
+            scheduler.write_text(
+                "def schedule(store, queue, job):\n"
+                "    queue.enqueue(job['id'])\n"
+                "    store.save(job)\n"
+                "    store.commit()\n",
+                encoding="utf-8",
+            )
+            scheduler_test.write_text(
+                "import pathlib\n"
+                "import sys\n"
+                "import unittest\n\n"
+                "sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / 'src'))\n"
+                "from scheduler import schedule\n\n"
+                "class SchedulerTest(unittest.TestCase):\n"
+                "    def test_schedules_job(self):\n"
+                "        events = []\n"
+                "        store = type('Store', (), {\n"
+                "            'save': lambda self, job: events.append('save'),\n"
+                "            'commit': lambda self: events.append('commit'),\n"
+                "        })()\n"
+                "        queue = type('Queue', (), {\n"
+                "            'enqueue': lambda self, job_id: events.append('enqueue'),\n"
+                "        })()\n"
+                "        schedule(store, queue, {'id': 'job-1'})\n"
+                "        self.assertCountEqual(events, ['save', 'commit', 'enqueue'])\n",
+                encoding="utf-8",
+            )
+            harness = FakeProviderHarness(root)
+            finding_report = structured_report(
+                verdict="PASS_WITH_FINDINGS",
+                findings=textwrap.dedent(
+                    """\
+                    ## [medium] Queue publication precedes durable commit
+                    - Location: src/scheduler.py:2
+                    - Trigger: The queue worker starts immediately after enqueue
+                    - Evidence: enqueue is called before save and commit
+                    - Impact: A worker can observe a job that is not durable
+                    - Smallest fix: Commit before enqueueing the protected task
+                    - Confidence: high
+                    """
+                ).strip(),
+                test_gaps=textwrap.dedent(
+                    """\
+                    ## [medium] Ordering is not asserted
+                    - Needed test: Assert save and commit happen before enqueue
+                    - Risk: A future refactor can reintroduce publication before durability
+                    """
+                ).strip(),
+                observations=textwrap.dedent(
+                    """\
+                    ## [low] Job identifiers are already stable
+                    - Location: src/scheduler.py:2
+                    - Evidence: enqueue receives the persisted job id
+                    - Why non-actionable: The identifier needs no code or test change
+                    """
+                ).strip(),
+            )
+            clean_report = structured_report()
+            harness.queue(
+                "claude",
+                {
+                    "kind": "report",
+                    "report": finding_report,
+                    "mutate_relative": "provider-marker.txt",
+                },
+                {"kind": "report", "report": clean_report},
+                {"kind": "report", "report": clean_report},
+            )
+            workflow_identifier = harness.cli(
+                repo,
+                "workflow",
+                "start",
+                "--name",
+                "scheduler commit-before-publish repair",
+                "--review-mode",
+                "balanced",
+                "--max-provider-attempts",
+                "6",
+            ).stdout.strip()
+            task = (
+                "Persist a scheduled job before publishing its background task, "
+                "with a regression test for call ordering."
+            )
+            initial = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--uncommitted",
+                "--workflow-id",
+                workflow_identifier,
+                "--phase",
+                "repair",
+                "--path",
+                "src/scheduler.py",
+                "--path",
+                "tests/test_scheduler.py",
+                "--risk",
+                "db-write",
+                "--review-profile",
+                "data-change",
+                "--task",
+                task,
+                "--without-antigravity",
+                "--without-kimi",
+                provider_backed=True,
+            )
+            initial_dir = Path(
+                next(
+                    line.split(": ", 1)[1]
+                    for line in initial.stdout.splitlines()
+                    if line.startswith("Review artifacts: ")
+                )
+            )
+            for artifact in (
+                "metadata.json",
+                "review-summary.json",
+                "triage.json",
+                "claude.md",
+            ):
+                self.assertTrue((initial_dir / artifact).is_file(), artifact)
+            self.assertFalse((initial_dir / "final.json").exists())
+            initial_triage = MM.read_json(initial_dir / "triage.json")
+            self.assertEqual(len(initial_triage["findings"]), 1)
+            self.assertEqual(len(initial_triage["test_gaps"]), 1)
+            self.assertEqual(len(initial_triage["observations"]), 1)
+            invocation = harness.invocations()[0]
+            self.assertNotEqual(Path(str(invocation["cwd"])), repo)
+            self.assertIn("/snapshot", str(invocation["cwd"]))
+            self.assertIn("src/scheduler.py", invocation["snapshot_files"])
+            self.assertFalse((repo / "provider-marker.txt").exists())
+
+            unresolved = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                workflow_identifier,
+                "--phase",
+                "repair",
+                "--reuse-contract",
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(unresolved.returncode, 2)
+            self.assertIn("fully triaged", unresolved.stderr)
+            self.assertEqual(len(harness.invocations()), 1)
+            decisions = [
+                {
+                    "finding": "claude-001",
+                    "decision": "accepted",
+                    "evidence": "The source calls enqueue before store.commit.",
+                    "action": "Move enqueue after the commit.",
+                },
+                {
+                    "finding": "claude-test-001",
+                    "decision": "accepted",
+                    "evidence": "The test ignores event order via assertCountEqual.",
+                    "action": "Assert the exact event sequence.",
+                },
+                {
+                    "finding": "claude-observation-001",
+                    "decision": "acknowledged",
+                    "evidence": "The stable job id is passed through unchanged.",
+                },
+            ]
+            harness.cli(
+                repo,
+                "decide-batch",
+                "--run",
+                str(initial_dir),
+                *sum(
+                    (["--item", json.dumps(item)] for item in decisions),
+                    [],
+                ),
+            )
+            accepted_block = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                workflow_identifier,
+                "--phase",
+                "repair",
+                "--reuse-contract",
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertEqual(accepted_block.returncode, 2)
+            self.assertIn("is accepted", accepted_block.stderr)
+            premature = harness.cli(
+                repo,
+                "decide-batch",
+                "--run",
+                str(initial_dir),
+                "--item",
+                json.dumps(
+                    {
+                        "finding": "claude-001",
+                        "decision": "fixed",
+                        "evidence": "Claimed fixed before source edit.",
+                        "verification": "Not yet valid.",
+                    }
+                ),
+                "--item",
+                json.dumps(
+                    {
+                        "finding": "claude-test-001",
+                        "decision": "covered",
+                        "evidence": "Claimed covered before source edit.",
+                        "verification": "Not yet valid.",
+                    }
+                ),
+                check=False,
+            )
+            self.assertEqual(premature.returncode, 2)
+            self.assertIn("task-scoped source is unchanged", premature.stderr)
+
+            scheduler.write_text(
+                "def schedule(store, queue, job):\n"
+                "    store.save(job)\n"
+                "    store.commit()\n"
+                "    queue.enqueue(job['id'])\n",
+                encoding="utf-8",
+            )
+            scheduler_test.write_text(
+                scheduler_test.read_text(encoding="utf-8").replace(
+                    "self.assertCountEqual(events, ['save', 'commit', 'enqueue'])",
+                    "self.assertEqual(events, ['save', 'commit', 'enqueue'])",
+                ),
+                encoding="utf-8",
+            )
+            local_test = run(
+                [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
+                cwd=repo,
+            )
+            self.assertEqual(local_test.returncode, 0)
+            harness.cli(
+                repo,
+                "decide-batch",
+                "--run",
+                str(initial_dir),
+                "--item",
+                json.dumps(
+                    {
+                        "finding": "claude-001",
+                        "decision": "fixed",
+                        "evidence": "Commit now precedes enqueue in scheduler.py.",
+                        "verification": "Ordering regression test passed.",
+                    }
+                ),
+                "--item",
+                json.dumps(
+                    {
+                        "finding": "claude-test-001",
+                        "decision": "covered",
+                        "evidence": "The test now asserts the exact event order.",
+                        "verification": "Ordering regression test passed.",
+                    }
+                ),
+            )
+            repaired = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                workflow_identifier,
+                "--phase",
+                "repair",
+                "--reuse-contract",
+                "--local-verification",
+                "python -m unittest discover -s tests: passed",
+                "--without-antigravity",
+                "--without-kimi",
+                provider_backed=True,
+            )
+            self.assertIn("PASS_CLEAN", repaired.stdout)
+
+            drift_commands = [
+                ["--uncommitted", "--path", "src/scheduler.py", "--risk", "db-write", "--review-profile", "data-change", "--task", task],
+                ["--uncommitted", "--path", "src/scheduler.py", "--path", "tests/test_scheduler.py", "--risk", "db-write", "--review-profile", "data-change", "--task", task + " drift"],
+                ["--uncommitted", "--path", "src/scheduler.py", "--path", "tests/test_scheduler.py", "--review-profile", "data-change", "--task", task],
+                ["--uncommitted", "--path", "src/scheduler.py", "--path", "tests/test_scheduler.py", "--risk", "db-write", "--task", task],
+                ["--base", "HEAD", "--path", "src/scheduler.py", "--path", "tests/test_scheduler.py", "--risk", "db-write", "--review-profile", "data-change", "--task", task],
+            ]
+            for drift in drift_commands:
+                blocked = harness.cli(
+                    repo,
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    workflow_identifier,
+                    "--phase",
+                    "confirmation",
+                    *drift,
+                    "--without-antigravity",
+                    "--without-kimi",
+                    check=False,
+                    provider_backed=True,
+                )
+                self.assertEqual(blocked.returncode, 2, blocked.stderr)
+                self.assertIn("Confirmation must reuse", blocked.stderr)
+            self.assertEqual(len(harness.invocations()), 2)
+            confirmation = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--workflow-id",
+                workflow_identifier,
+                "--phase",
+                "confirmation",
+                "--reuse-contract",
+                "--without-antigravity",
+                "--without-kimi",
+                provider_backed=True,
+            )
+            confirmation_dir = Path(
+                next(
+                    line.split(": ", 1)[1]
+                    for line in confirmation.stdout.splitlines()
+                    if line.startswith("Review artifacts: ")
+                )
+            )
+            self.assertFalse((confirmation_dir / "final.json").exists())
+            before_codex = harness.cli(
+                repo,
+                "verify",
+                "--run",
+                str(confirmation_dir),
+                check=False,
+            )
+            self.assertEqual(before_codex.returncode, 2)
+            self.assertIn("has not been finalized", before_codex.stderr)
+            harness.cli(
+                repo,
+                "finalize",
+                "--run",
+                str(confirmation_dir),
+                "--codex-verdict",
+                "PASS_CLEAN",
+                "--codex-review",
+                "Traced persistence through enqueue and reviewed the exact diff.",
+                "--verification",
+                "python -m unittest discover -s tests: passed",
+            )
+            local_verify = json.loads(
+                harness.cli(
+                    repo, "verify", "--run", str(confirmation_dir)
+                ).stdout
+            )
+            self.assertTrue(local_verify["fresh"])
+            self.assertFalse(local_verify["deployment_ready"])
+            run(["git", "add", "src/scheduler.py", "tests/test_scheduler.py"], cwd=repo)
+            run(["git", "commit", "-qm", "fix scheduler publish ordering"], cwd=repo)
+            harness.cli(
+                repo,
+                "attest-commit",
+                "--run",
+                str(confirmation_dir),
+                "--commit",
+                "HEAD",
+            )
+            committed_verify = json.loads(
+                harness.cli(
+                    repo, "verify", "--run", str(confirmation_dir)
+                ).stdout
+            )
+            self.assertTrue(committed_verify["deployment_ready"])
+            harness.cli(repo, "workflow", "finalize", workflow_identifier)
+            final_status = json.loads(
+                harness.cli(
+                    repo, "workflow", "status", workflow_identifier
+                ).stdout
+            )
+            self.assertEqual(final_status["state"], "completed")
+            self.assertTrue(final_status["deployment_ready"])
+            final = MM.read_json(confirmation_dir / "final.json")
+            self.assertEqual(final["status"], "PASS_CLEAN")
+            self.assertEqual(final["codex_verdict"], "PASS_CLEAN")
+            self.assertEqual(len(final["acknowledged_observations"]), 1)
+            self.assertEqual(len(harness.invocations()), 3)
+
+    def test_multi_repository_freshness_and_successor_campaign(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness = FakeProviderHarness(root)
+            repos: list[Path] = []
+            remotes: list[Path] = []
+            for name in ("scheduler-api", "scheduler-worker"):
+                repo = root / name
+                remote = root / f"{name}.git"
+                repo.mkdir()
+                initialize_repo(repo)
+                run(["git", "branch", "-M", "main"], cwd=repo)
+                remote.mkdir()
+                run(["git", "init", "--bare", "-q"], cwd=remote)
+                run(["git", "remote", "add", "origin", str(remote)], cwd=repo)
+                run(["git", "push", "-qu", "origin", "main"], cwd=repo)
+                (repo / "src" / "feature.py").write_text(
+                    "VALUE = 2\n", encoding="utf-8"
+                )
+                repos.append(repo)
+                remotes.append(remote)
+
+            def artifact_dir(completed: subprocess.CompletedProcess[str]) -> Path:
+                return Path(
+                    next(
+                        line.split(": ", 1)[1]
+                        for line in completed.stdout.splitlines()
+                        if line.startswith("Review artifacts: ")
+                    )
+                )
+
+            def review(
+                repo: Path,
+                workflow: str,
+                phase: str,
+                *,
+                reuse_lineage: bool = False,
+                task: str | None = None,
+            ) -> Path:
+                arguments = [
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    workflow,
+                    "--phase",
+                    phase,
+                ]
+                if phase == "repair" and not reuse_lineage:
+                    arguments.extend(
+                        [
+                            "--uncommitted",
+                            "--path",
+                            "src/feature.py",
+                            "--task",
+                            task or "Review the repository state transition.",
+                        ]
+                    )
+                else:
+                    arguments.append("--reuse-contract")
+                    if reuse_lineage:
+                        arguments.append("--reuse-lineage-sensitive-approvals")
+                arguments.extend(["--without-antigravity", "--without-kimi"])
+                return artifact_dir(
+                    harness.cli(
+                        repo,
+                        *arguments,
+                        provider_backed=True,
+                    )
+                )
+
+            deferred_report = structured_report(
+                verdict="PASS_WITH_FINDINGS",
+                findings=textwrap.dedent(
+                    """\
+                    ## [low] Compatibility constant remains provisional
+                    - Location: src/feature.py:1
+                    - Trigger: A legacy consumer still reads the old value
+                    - Evidence: The compatibility contract is intentionally external
+                    - Impact: Removal should wait for the consumer migration
+                    - Smallest fix: Track removal in the consumer migration
+                    - Confidence: medium
+                    """
+                ).strip(),
+            )
+            clean = structured_report()
+            harness.queue(
+                "claude",
+                {"kind": "report", "report": deferred_report},
+                {"kind": "report", "report": clean},
+                {"kind": "report", "report": clean},
+                {"kind": "report", "report": clean},
+            )
+            workflow = harness.cli(
+                repos[0],
+                "workflow",
+                "start",
+                "--name",
+                "two repository release gate",
+                "--review-mode",
+                "balanced",
+                "--max-provider-attempts",
+                "12",
+            ).stdout.strip()
+            repo_one_repair = review(
+                repos[0], workflow, "repair", task="Review API scheduling state."
+            )
+            harness.cli(
+                repos[0],
+                "decide",
+                "--run",
+                str(repo_one_repair),
+                "--finding",
+                "claude-001",
+                "--decision",
+                "deferred",
+                "--evidence",
+                "The compatibility consumer migration is outside this task.",
+                "--action",
+                "Remove the constant after the consumer migration lands.",
+            )
+            repo_one_final = review(repos[0], workflow, "confirmation")
+            harness.cli(
+                repos[0],
+                "finalize",
+                "--run",
+                str(repo_one_final),
+                "--codex-verdict",
+                "PASS_WITH_FINDINGS",
+                "--codex-review",
+                "The low-risk compatibility item is explicitly deferred.",
+            )
+            review(repos[1], workflow, "repair", task="Review worker scheduling state.")
+            repo_two_final = review(repos[1], workflow, "confirmation")
+            harness.cli(
+                repos[1],
+                "finalize",
+                "--run",
+                str(repo_two_final),
+                "--codex-verdict",
+                "PASS_CLEAN",
+                "--codex-review",
+                "The worker transition is clean and fully covered.",
+            )
+            local_status = json.loads(
+                harness.cli(
+                    repos[0], "workflow", "status", workflow, check=False
+                ).stdout
+            )
+            self.assertEqual(local_status["state"], "ready_to_finalize")
+            self.assertTrue(local_status["ready"])
+            self.assertFalse(local_status["deployment_ready"])
+            self.assertEqual(len(local_status["repositories"]), 2)
+
+            for repo, final_dir, remote in zip(
+                repos, (repo_one_final, repo_two_final), remotes
+            ):
+                run(["git", "add", "src/feature.py"], cwd=repo)
+                run(["git", "commit", "-qm", "update scheduling state"], cwd=repo)
+                local_head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+                remote_head = run(
+                    ["git", "--git-dir", str(remote), "rev-parse", "refs/heads/main"],
+                    cwd=repo,
+                ).stdout.strip()
+                self.assertNotEqual(local_head, remote_head)
+                harness.cli(
+                    repo,
+                    "attest-commit",
+                    "--run",
+                    str(final_dir),
+                    "--commit",
+                    "HEAD",
+                )
+            attested_status = json.loads(
+                harness.cli(repos[0], "workflow", "status", workflow).stdout
+            )
+            self.assertTrue(attested_status["deployment_ready"])
+            for item in attested_status["repositories"]:
+                self.assertNotIn("deployed", item)
+                self.assertNotIn("remote_branch_equal", item)
+            harness.cli(repos[0], "workflow", "finalize", workflow)
+            completed = json.loads(
+                harness.cli(repos[0], "workflow", "status", workflow).stdout
+            )
+            self.assertEqual(completed["state"], "completed")
+            completed_audit = json.loads(
+                harness.cli(repos[0], "workflow", "audit", "--format", "json").stdout
+            )
+            completed_states = {
+                item["workflow_id"]: item["state"]
+                for item in completed_audit["workflows"]
+            }
+            self.assertEqual(completed_states[workflow], "completed")
+            for repo in repos:
+                run(["git", "push", "-q", "origin", "main"], cwd=repo)
+                local_head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+                remote_head = run(
+                    ["git", "rev-parse", "refs/remotes/origin/main"], cwd=repo
+                ).stdout.strip()
+                self.assertEqual(local_head, remote_head)
+
+            (repos[0] / "src" / "feature.py").write_text(
+                "VALUE = 3\n", encoding="utf-8"
+            )
+            stale_verify = harness.cli(
+                repos[0], "verify", "--run", str(repo_one_final), check=False
+            )
+            self.assertEqual(stale_verify.returncode, 3)
+            stale_status = json.loads(
+                harness.cli(
+                    repos[0], "workflow", "status", workflow, check=False
+                ).stdout
+            )
+            self.assertEqual(stale_status["state"], "completed_stale")
+            stale_compact = harness.cli(
+                repos[0],
+                "workflow",
+                "status",
+                workflow,
+                "--format",
+                "compact",
+                check=False,
+            ).stdout
+            self.assertIn("state=completed_stale", stale_compact)
+            stale_audit = json.loads(
+                harness.cli(repos[0], "workflow", "audit", "--format", "json").stdout
+            )
+            stale_states = {
+                item["workflow_id"]: item["state"]
+                for item in stale_audit["workflows"]
+            }
+            self.assertEqual(stale_states[workflow], "completed_stale")
+
+            successor = harness.cli(
+                repos[0],
+                "workflow",
+                "supersede",
+                workflow,
+                "--reason",
+                "repository source changed after the authoritative finals",
+            ).stdout.strip()
+            (repos[1] / "src" / "feature.py").write_text(
+                "VALUE = 3\n", encoding="utf-8"
+            )
+            harness.queue(
+                "claude",
+                *({"kind": "report", "report": clean} for _ in range(6)),
+            )
+            review(repos[0], successor, "repair", reuse_lineage=True)
+            successor_one_final = review(
+                repos[0], successor, "confirmation", reuse_lineage=True
+            )
+            harness.cli(
+                repos[0],
+                "finalize",
+                "--run",
+                str(successor_one_final),
+                "--codex-verdict",
+                "PASS_WITH_FINDINGS",
+                "--codex-review",
+                "The inherited low-risk deferred item remains explicit.",
+            )
+            incomplete_successor = json.loads(
+                harness.cli(
+                    repos[0], "workflow", "status", successor, check=False
+                ).stdout
+            )
+            self.assertFalse(incomplete_successor["ready"])
+            missing = [
+                item
+                for item in incomplete_successor["repositories"]
+                if item["state"] == "not-reviewed"
+            ]
+            self.assertEqual(len(missing), 1)
+            self.assertEqual(missing[0]["repository"]["name"], repos[1].name)
+            successor_plan = json.loads(
+                harness.cli(repos[0], "continue", successor, check=False).stdout
+            )
+            self.assertEqual(successor_plan["next"], "NEEDS_REVIEW")
+            self.assertIn("--reuse-contract", successor_plan["actions"][0]["command"])
+            blocked_finalize = harness.cli(
+                repos[0], "workflow", "finalize", successor, check=False
+            )
+            self.assertEqual(blocked_finalize.returncode, 2)
+
+            review(repos[1], successor, "repair", reuse_lineage=True)
+            successor_two_final = review(
+                repos[1], successor, "confirmation", reuse_lineage=True
+            )
+            harness.cli(
+                repos[1],
+                "finalize",
+                "--run",
+                str(successor_two_final),
+                "--codex-verdict",
+                "PASS_CLEAN",
+                "--codex-review",
+                "The second repository is freshly confirmed.",
+            )
+            carried_final = MM.read_json(successor_one_final / "final.json")
+            self.assertEqual(carried_final["status"], "PASS_WITH_FINDINGS")
+            self.assertTrue(
+                any(
+                    item.get("title") == "Compatibility constant remains provisional"
+                    for item in carried_final["remaining_findings"]
+                )
+            )
+            ready_successor = json.loads(
+                harness.cli(repos[0], "workflow", "status", successor).stdout
+            )
+            self.assertEqual(ready_successor["state"], "ready_to_finalize")
+            ready_audit = json.loads(
+                harness.cli(repos[0], "workflow", "audit", "--format", "json").stdout
+            )
+            ready_states = {
+                item["workflow_id"]: item["state"]
+                for item in ready_audit["workflows"]
+            }
+            self.assertEqual(ready_states[successor], "ready_to_finalize")
+            self.assertEqual(ready_states[workflow], "superseded")
+
+            for repo, final_dir in zip(
+                repos, (successor_one_final, successor_two_final)
+            ):
+                run(["git", "add", "src/feature.py"], cwd=repo)
+                run(["git", "commit", "-qm", "advance successor state"], cwd=repo)
+                harness.cli(
+                    repo,
+                    "attest-commit",
+                    "--run",
+                    str(final_dir),
+                    "--commit",
+                    "HEAD",
+                )
+            harness.cli(repos[0], "workflow", "finalize", successor)
+
+            blocked_path = repos[0] / "src" / "blocked.py"
+            blocked_path.write_text("BLOCKED = True\n", encoding="utf-8")
+            active_workflow = harness.cli(
+                repos[0], "workflow", "start", "--name", "intentionally active"
+            ).stdout.strip()
+            blocked_workflow = harness.cli(
+                repos[0],
+                "workflow",
+                "start",
+                "--name",
+                "Codex blocked gate",
+                "--max-provider-attempts",
+                "4",
+            ).stdout.strip()
+            blocked_repair = artifact_dir(
+                harness.cli(
+                    repos[0],
+                    "run",
+                    "--repo",
+                    str(repos[0]),
+                    "--uncommitted",
+                    "--workflow-id",
+                    blocked_workflow,
+                    "--phase",
+                    "repair",
+                    "--path",
+                    "src/blocked.py",
+                    "--task",
+                    "Demonstrate an explicit Codex block.",
+                    "--without-antigravity",
+                    "--without-kimi",
+                    provider_backed=True,
+                )
+            )
+            self.assertTrue((blocked_repair / "review-summary.json").exists())
+            blocked_confirmation = review(
+                repos[0], blocked_workflow, "confirmation"
+            )
+            blocked_finalization = harness.cli(
+                repos[0],
+                "finalize",
+                "--run",
+                str(blocked_confirmation),
+                "--codex-verdict",
+                "BLOCK",
+                "--codex-review",
+                "Codex found the synthetic state unacceptable despite provider PASS.",
+                check=False,
+            )
+            self.assertEqual(blocked_finalization.returncode, 3)
+            blocked_status = json.loads(
+                harness.cli(
+                    repos[0], "workflow", "status", blocked_workflow, check=False
+                ).stdout
+            )
+            self.assertEqual(blocked_status["state"], "blocked")
+            final_audit = json.loads(
+                harness.cli(repos[0], "workflow", "audit", "--format", "json").stdout
+            )
+            final_states = {
+                item["workflow_id"]: item["state"]
+                for item in final_audit["workflows"]
+            }
+            self.assertEqual(final_states[active_workflow], "active")
+            self.assertEqual(final_states[blocked_workflow], "blocked")
+            self.assertEqual(final_states[successor], "completed")
+            self.assertEqual(final_states[workflow], "superseded")
+            self.assertEqual(len(harness.invocations()), 10)
+
     def test_supplemental_recheck_preserves_legacy_parent_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -7144,9 +9406,9 @@ class RunnerEndToEndTests(unittest.TestCase):
                     "--finding",
                     "claude-test-001",
                     "--decision",
-                    "covered",
+                    "rejected",
                     "--evidence",
-                    "The same focused behavior assertion covers this gap.",
+                    "The same focused behavior assertion already covers this gap.",
                     "--verification",
                     "unit test passed",
                 ],
@@ -7174,7 +9436,7 @@ class RunnerEndToEndTests(unittest.TestCase):
             )
             self.assertEqual(
                 triage["test_gaps"][0]["decision_history"][0]["decision"],
-                "covered",
+                "rejected",
             )
             repair_finalize = run(
                 [
@@ -7260,7 +9522,7 @@ class RunnerEndToEndTests(unittest.TestCase):
             )
             for item_id, decision in (
                 ("claude-001", "rejected"),
-                ("claude-test-001", "covered"),
+                ("claude-test-001", "rejected"),
             ):
                 command = [
                     *base,
@@ -7623,6 +9885,9 @@ class RunnerEndToEndTests(unittest.TestCase):
                 == "completed"
             )
             initial_run_dir = initial_metadata_path.parent
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 3\n", encoding="utf-8"
+            )
             run(
                 [
                     *base,
@@ -7640,9 +9905,6 @@ class RunnerEndToEndTests(unittest.TestCase):
                 ],
                 cwd=repo,
                 env=environment,
-            )
-            (repo / "src" / "feature.py").write_text(
-                "VALUE = 3\n", encoding="utf-8"
             )
             successor_identifier = run(
                 [

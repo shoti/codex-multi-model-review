@@ -26,6 +26,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import traceback
 import uuid
 from typing import Any, Iterable, Sequence
 
@@ -64,6 +65,7 @@ PROVIDER_HEALTH_PATH = CONFIG_DIR / "provider-health.json"
 RUNS_DIR = Path.home() / ".codex" / "review-runs"
 WORKFLOWS_DIR = RUNS_DIR / "workflows"
 SENSITIVE_SCANS_DIR = RUNS_DIR / "sensitive-scans"
+MINIMUM_PYTHON = (3, 12)
 SKILL_DIR = Path(__file__).resolve().parent.parent
 KIMI_AGENT_PATH = SKILL_DIR / "references" / "kimi-reviewer.md"
 ANTIGRAVITY_AGENT_PATH = SKILL_DIR / "references" / "antigravity-agent.md"
@@ -2253,6 +2255,29 @@ def update_terminal_error(
     return metadata
 
 
+def persist_internal_error(run_dir: Path, exc: Exception) -> Path:
+    """Persist actionable stack locations without exception values or locals."""
+    path = run_dir / "internal-error.json"
+    safe_write_json(
+        path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "error_type": type(exc).__name__,
+            "recorded_at": utc_now(),
+            "frames": [
+                {
+                    "file": frame.filename,
+                    "line": frame.lineno,
+                    "function": frame.name,
+                }
+                for frame in traceback.extract_tb(exc.__traceback__)
+            ],
+            "privacy": "exception message and local values omitted",
+        },
+    )
+    return path
+
+
 def elapsed_since(timestamp: str | None) -> float | None:
     if not timestamp:
         return None
@@ -2864,6 +2889,7 @@ def create_workflow(
     usage_based: bool = False,
     max_provider_attempts: int = 6,
     provider_use_policy: str = "explicit",
+    required_repositories: Sequence[dict[str, Any]] = (),
 ) -> None:
     policy = workflow_policy(
         max_budget_usd,
@@ -2887,8 +2913,40 @@ def create_workflow(
             "supplemental_of": supplemental_of,
             "supplemental_parent_run_id": supplemental_parent_run_id,
             "supplemental_parent_workflow_id": supplemental_parent_workflow_id,
+            "required_repositories": list(required_repositories),
         },
     )
+
+
+def normalized_required_repositories(
+    values: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    repositories: dict[str, dict[str, Any]] = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        key = str(value.get("id") or value.get("root") or "")
+        if not key:
+            continue
+        repositories[key] = dict(value)
+    return [repositories[key] for key in sorted(repositories)]
+
+
+def successor_required_repositories(
+    identifier: str, workflow: dict[str, Any]
+) -> list[dict[str, Any]]:
+    values = [
+        item
+        for item in workflow.get("required_repositories", [])
+        if isinstance(item, dict)
+    ]
+    for _, metadata in workflow_lineage_runs(identifier):
+        if metadata.get("phase") == "supplemental":
+            continue
+        repository = metadata.get("repository")
+        if isinstance(repository, dict):
+            values.append(repository)
+    return normalized_required_repositories(values)
 
 
 def workflow_requires_confirmation(identifier: str) -> bool:
@@ -3667,6 +3725,9 @@ def workflow_supersede_command(args: argparse.Namespace) -> int:
         review_mode = review_mode_from_policy(policy)
         usage_policy = policy.get("usage_policy")
         usage_policy = usage_policy if isinstance(usage_policy, dict) else None
+        required_repositories = successor_required_repositories(
+            args.workflow_id, old
+        )
         if args.by:
             if not replacement_path.exists():
                 raise ReviewError(
@@ -3707,6 +3768,20 @@ def workflow_supersede_command(args: argparse.Namespace) -> int:
             if args.workflow_id not in supersedes:
                 supersedes.append(args.workflow_id)
             replacement_document["supersedes"] = sorted(set(supersedes))
+            replacement_document["required_repositories"] = (
+                normalized_required_repositories(
+                    [
+                        *required_repositories,
+                        *[
+                            item
+                            for item in replacement_document.get(
+                                "required_repositories", []
+                            )
+                            if isinstance(item, dict)
+                        ],
+                    ]
+                )
+            )
             safe_write_json(replacement_path, replacement_document)
         else:
             create_workflow(
@@ -3726,6 +3801,7 @@ def workflow_supersede_command(args: argparse.Namespace) -> int:
                     if usage_policy
                     else "explicit"
                 ),
+                required_repositories=required_repositories,
             )
         old.update(
             {
@@ -5107,21 +5183,48 @@ def workflow_audit_report(stale_days: int) -> dict[str, Any]:
         workflow_final_path = WORKFLOWS_DIR / f"{identifier}.final.json"
         workflow_final = workflow_final_path.exists()
         persisted_status = str(document.get("status") or "active")
+        live_status: dict[str, Any] | None = None
+        can_recompute = any(
+            isinstance(metadata.get("repository"), dict)
+            for _, metadata in runs
+        )
+        if can_recompute and not untrusted_finals:
+            try:
+                live_status, _ = workflow_status(identifier)
+            except ReviewError:
+                live_status = None
         if persisted_status == "superseded":
             state = "superseded"
             action = "none"
         elif untrusted_finals:
             state = "legacy_untrusted_final"
             action = "start a fresh structured review; legacy finals cannot gate"
-        elif persisted_status == "completed" or workflow_final:
-            state = "completed"
-            action = "none"
         elif any(metadata.get("status") == "running" for _, metadata in runs):
             state = "running"
             action = "monitor"
         elif unresolved:
             state = "needs_triage"
             action = "decide pending or unresolved items"
+        elif live_status is not None:
+            state = str(live_status.get("state") or "active")
+            actions = {
+                "ready_to_finalize": "run workflow finalize",
+                "completed": "none",
+                "completed_stale": (
+                    "create a linked successor and obtain fresh repository gates"
+                ),
+                "completed_untrusted": (
+                    "start a fresh structured review; untrusted finals cannot gate"
+                ),
+                "blocked": "inspect the blocked authoritative final",
+                "confirmation_required": "run mandatory confirmation",
+                "preflight_blocked": "inspect preflight evidence and retry intentionally",
+                "active": "continue workflow",
+            }
+            action = actions.get(state, "inspect workflow status and continue")
+        elif persisted_status == "completed" or workflow_final:
+            state = "completed"
+            action = "none"
         elif run_finals:
             state = "unclosed_run_final"
             action = "verify freshness and run workflow finalize"
@@ -5338,6 +5441,48 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                 "accepts_reviews": not confirmation_complete,
             }
         )
+    current_repository_keys = {
+        str(
+            item.get("repository", {}).get("id")
+            or item.get("repository", {}).get("root")
+        )
+        for item in repositories
+        if isinstance(item.get("repository"), dict)
+    }
+    required_repositories = normalized_required_repositories(
+        [
+            item
+            for item in workflow_document.get("required_repositories", [])
+            if isinstance(item, dict)
+        ]
+    )
+    for repository in required_repositories:
+        key = str(repository.get("id") or repository.get("root") or "")
+        if not key or key in current_repository_keys:
+            continue
+        ready = False
+        repositories.append(
+            {
+                "repository": repository,
+                "round": None,
+                "phase": None,
+                "run_dir": None,
+                "state": "not-reviewed",
+                "confirmation_complete": False,
+                "fresh": False,
+                "freshness_mode": "not-reviewed-in-successor",
+                "triage_fresh": False,
+                "final_contract_trusted": False,
+                "final_contract_issues": [],
+                "commit": None,
+                "binding": "unreviewed",
+                "commit_attested": False,
+                "commit_bound": False,
+                "deployment_ready": False,
+                "final_status": None,
+                "accepts_reviews": True,
+            }
+        )
     if persisted_state == "superseded":
         state = "superseded"
     elif persisted_state == "completed":
@@ -5515,7 +5660,46 @@ def workflow_continue_plan(
         plan["next"] = "RUNNING"
         return plan
     latest_runs = latest_workflow_attempts(identifier)
+    missing_repositories = [
+        item
+        for item in status.get("repositories", [])
+        if isinstance(item, dict) and item.get("state") == "not-reviewed"
+    ]
+    for item in missing_repositories:
+        repository = item.get("repository")
+        repository = repository if isinstance(repository, dict) else {}
+        label = repository.get("name") or repository.get("root") or "unknown"
+        root = repository.get("root")
+        plan["actions"].append(
+            {
+                "repository": label,
+                "type": "review",
+                "phase": "repair",
+                "automatable": False,
+                "reason": (
+                    "This repository was required by the superseded lineage but "
+                    "has no review in the successor workflow."
+                ),
+                "command": shlex.join(
+                    [
+                        "mm-review",
+                        "run",
+                        "--repo",
+                        str(root or "<repository>"),
+                        "--workflow-id",
+                        identifier,
+                        "--phase",
+                        "repair",
+                        "--reuse-contract",
+                        "--reuse-lineage-sensitive-approvals",
+                    ]
+                ),
+            }
+        )
     if not latest_runs:
+        if missing_repositories:
+            plan["next"] = "NEEDS_REVIEW"
+            return plan
         plan["next"] = "NEEDS_INITIAL_REVIEW"
         plan["actions"].append(
             {
@@ -5543,6 +5727,8 @@ def workflow_continue_plan(
         "READY_TO_GATE": 2,
     }
     next_state = "READY_TO_GATE"
+    if missing_repositories:
+        next_state = "NEEDS_REVIEW"
     for run_dir, metadata in latest_runs:
         repository = metadata.get("repository")
         repository = repository if isinstance(repository, dict) else {}
@@ -6042,8 +6228,8 @@ def workflow_finalize_command(args: argparse.Namespace) -> int:
     if not ready:
         raise ReviewError(
             "Workflow is not ready: every completed round must be fully "
-            "triaged and every repository's latest round must have a fresh "
-            "PASS final.json."
+            "triaged and every required repository must have a latest fresh "
+            "PASS final.json in this workflow."
         )
     finalized_at = utc_now()
     status["finalized_at"] = finalized_at
@@ -6816,6 +7002,26 @@ def write_triage_decisions(
                     else None
                 ),
             )
+        source_resolutions = [
+            str(item.get("finding") or item.get("id") or "")
+            for item in decisions
+            if item.get("decision") in {"fixed", "covered"}
+        ]
+        metadata_path = run_dir / "metadata.json"
+        if source_resolutions and metadata_path.exists():
+            metadata = read_json(metadata_path)
+            reviewed_fingerprint = metadata.get("source_fingerprint")
+            if not isinstance(reviewed_fingerprint, str):
+                raise ReviewError(
+                    "Run metadata has no source fingerprint for a fixed or "
+                    "covered decision."
+                )
+            if current_run_fingerprint(metadata) == reviewed_fingerprint:
+                raise ReviewError(
+                    "Cannot mark fixed or covered while the task-scoped source "
+                    "is unchanged from the reviewed snapshot: "
+                    + ", ".join(source_resolutions)
+                )
         triage["updated_at"] = utc_now()
         safe_write_json(triage_path, triage)
     refresh_evidence_run(run_dir)
@@ -8350,14 +8556,18 @@ def resume_review_locked(
         )
         raise
     except Exception as exc:
+        diagnostic_path = persist_internal_error(run_dir, exc)
         update_terminal_error(
             run_dir,
             error_type=type(exc).__name__,
-            message=str(exc),
+            message="Unexpected internal runner failure.",
             status=resume_terminal_status,
             completed_at=utc_now(),
         )
-        raise
+        raise ReviewError(
+            "Unexpected resume failure; redacted private diagnostics are in "
+            f"{diagnostic_path}: {type(exc).__name__}"
+        ) from exc
     finally:
         shutil.rmtree(snapshot_dir, ignore_errors=True)
         release_workflow_budget_reservation(
@@ -9124,6 +9334,7 @@ def run_review_command(args: argparse.Namespace) -> int:
         )
         raise
     except Exception as exc:
+        diagnostic_path = persist_internal_error(run_dir, exc)
         update_terminal_error(
             run_dir,
             error_type=type(exc).__name__,
@@ -9135,8 +9346,8 @@ def run_review_command(args: argparse.Namespace) -> int:
             ),
         )
         raise ReviewError(
-            f"Unexpected runner failure; private diagnostics are in {run_dir}: "
-            f"{type(exc).__name__}"
+            "Unexpected runner failure; redacted private diagnostics are in "
+            f"{diagnostic_path}: {type(exc).__name__}"
         ) from exc
     finally:
         shutil.rmtree(snapshot_dir, ignore_errors=True)
@@ -9742,6 +9953,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if sys.version_info < MINIMUM_PYTHON:
+        required = ".".join(str(part) for part in MINIMUM_PYTHON)
+        current = ".".join(str(part) for part in sys.version_info[:3])
+        print(
+            f"error: Python {required} or newer is required; running {current}. "
+            "Invoke this runner with a supported interpreter.",
+            file=sys.stderr,
+        )
+        return 2
     parser = build_parser()
     args = parser.parse_args()
     try:
