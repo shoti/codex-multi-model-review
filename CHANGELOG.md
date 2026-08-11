@@ -7,6 +7,24 @@ All notable user-visible changes are documented here. This project follows
 
 ### Added
 
+- Add provenance-bound `--exclude-snapshot-path` support for exact unchanged
+  tracked sensitive files, with pinned contracts, freshness/resume validation,
+  manifest disclosure, and mandatory Codex coverage compensation.
+- Add schema-11 content-hash identities and explicit lineage reuse for already
+  inspected sensitive-content findings; new or changed findings still require a
+  one-shot scan token.
+- Add structured reviewer observations with mandatory Codex acknowledgment so
+  risk-relevant concerns cannot disappear into free-form Notes.
+- Add confirmation recovery-headroom warnings and an audited, increase-only
+  `workflow raise-provider-attempt-limit` command.
+- Add explicit working-tree, immutable-commit, and attested-commit bindings,
+  plus separate source-gate `ready` and `deployment_ready` status.
+- Require recorded formatter, lint/static-check, and full relevant local-test
+  evidence after fixes before another provider call, including across linked
+  successor workflows, and allow successors to reuse the pinned lineage
+  contract without resetting that gate. Evidence satisfies the gate for the
+  exact reviewed fingerprint and is required again after later source changes.
+
 - Add usage-aware `continue` and consolidated `gate` commands. Continuation is
   read-only by default, can consume one provider-review step only with explicit
   authorization or an `auto` provider-use policy, and never fabricates triage
@@ -90,6 +108,13 @@ All notable user-visible changes are documented here. This project follows
 - Validate the configured Kimi model alias before a review starts.
 
 ### Changed
+
+- Disabled providers now report `disabled`, enabled but unprobed providers
+  report `not_probed`, and neither is labeled ready. Successful Claude runs
+  persist redacted authentication/resource classification, while workflow
+  coverage headlines name only providers that actually returned evidence.
+- Reviewer Notes are limited to neutral context; possible defects, missing
+  tests, risks, and coverage limitations must use their structured sections.
 
 - New workflows use provider attempts and observed quota/readiness state rather
   than a cumulative dollar gate. Claude's required USD-denominated print-mode

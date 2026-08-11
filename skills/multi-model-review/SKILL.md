@@ -75,6 +75,20 @@ paths locally. Inspect that notice before paying a provider: unrelated changes
 may stay excluded, but a changed dependency needed by the reviewed behavior
 must be included in the task contract.
 
+An unchanged tracked file with a recognized sensitive name, such as `.npmrc`,
+may remain in the original repository while being omitted from provider data:
+
+```bash
+mm-review run ... --exclude-snapshot-path .npmrc
+```
+
+The runner accepts only an exact regular tracked file that is clean against
+`HEAD`, is not changed or task-scoped, and matches the sensitive-path policy.
+It records the Git blob, SHA-256, size, and reason, removes only the private
+snapshot copy, pins the exclusion in the review contract, verifies provenance
+on resume/freshness checks, and requires Codex coverage compensation before a
+final can pass. Never use an exclusion to hide task-relevant code.
+
 If secret screening blocks intentional test material, inspect it with the same
 scope and paths before invoking a provider:
 
@@ -84,10 +98,14 @@ mm-review scan --repo <repo> --uncommitted \
 mm-review run ... --sensitive-scan-token <returned-token>
 ```
 
-The approval is one-shot and bound to the exact repository, paths, findings,
+The initial approval is one-shot and bound to the exact repository, paths, findings,
 task source fingerprint, and complete outgoing-snapshot content fingerprint.
 It never approves sensitive paths or external symlinks. Direct reusable finding
 IDs and broad sensitive-path overrides are rejected.
+After that inspected approval, an unchanged schema-11 finding can be reused in
+the same task lineage with `--reuse-lineage-sensitive-approvals`. Reuse requires
+an exact match of path, line, rule, key, and line-content hash; any new or
+changed finding still requires a new one-shot scan token.
 
 4. Read every report and `review-summary.json`, including each reviewer's
    structured coverage declaration. Independently trace each finding and test
@@ -112,6 +130,10 @@ gap `covered` requires verification and a changed scoped fingerprint.
 Reviewer test gaps are contractually limited to medium/low. A blocker/high
 test-gap heading makes the provider report invalid, and the triage/final gate
 also refuses to defer such an item as defense in depth.
+Reviewers must put demonstrably no-impact/no-action facts in the structured
+`Observations` section, never in Notes. Codex must record `acknowledged` with
+evidence for every observation before finalization. Any plausible risk or
+recommended change remains a finding or test gap.
 When the item includes `memory_matches`, record whether those candidates were
 `useful`, `irrelevant`, or `mixed` with `--memory-assessment`. This feedback is
 Codex-only telemetry and must not influence or enter independent reviewer
@@ -126,7 +148,11 @@ mm-review decide-batch --run <run-dir> \
   --item '{"finding":"claude-test-001","decision":"covered","evidence":"..."}'
 ```
 
-5. Fix only accepted findings/gaps and rerun relevant tests. For database/API DSLs,
+5. Fix only accepted findings/gaps. Before consuming another provider attempt,
+   run the repository formatter, lint/static checks, and the complete relevant
+   local test suite. Record their results with repeated `--local-verification`
+   flags on the next `run`; the runner requires this evidence after a fixed
+   finding or covered gap changes the scoped fingerprint. For database/API DSLs,
    verify exact option nesting and postconditions with a behavior-level test or
    safe runtime check; a mock that only proves a method was called is not enough.
 6. Fully triage the current repair before starting the next. Any task-scoped
@@ -170,14 +196,28 @@ through `workflow supersede --by` must have the exact same provider-usage policy
 
 ```bash
 mm-review run --workflow-id <workflow-id> \
-  --phase confirmation --reuse-contract
+  --phase confirmation --reuse-contract \
+  --reuse-lineage-sensitive-approvals
 ```
 
 `--reuse-contract` loads the first completed repair's exact scope, paths,
-risks, profile, and task for that repository, preventing accidental
-confirmation drift. Omit the scope selector for a command that works with
+risks, profile, and task for that repository across the linked workflow
+lineage, preventing accidental confirmation drift without letting a successor
+reset post-fix local-verification requirements. Recorded evidence satisfies the
+gate for that exact fingerprint; any later source change requires fresh
+evidence. Omit the scope selector for a command that works with
 `--uncommitted`, `--base`, and `--commit` repair contracts. An explicit scope
 selector is accepted only when it resolves to the pinned scope.
+
+Before confirmation, inspect the attempt-headroom warning from `continue`.
+Confirmation should have its own attempt plus two recovery attempts available.
+If the deliberate original ceiling is too tight, increase it explicitly and
+auditably; it can never be lowered by this command:
+
+```bash
+mm-review workflow raise-provider-attempt-limit <workflow-id> --to <count> \
+  --reason "reserve confirmation recovery headroom"
+```
 
 Use the usage-aware continuation helper whenever the next lifecycle step is
 unclear:
@@ -190,7 +230,10 @@ It is read-only by default and returns the next exact action: initial review,
 triage, repair, confirmation, provider wait, Codex finalization, or gate closure.
 It includes provider authentication/resource mode, local attempt consumption,
 known cooldown/reset evidence, and `unknown` where remaining provider allowance
-is not observable. To authorize one available provider-review step:
+is not observable. Disabled providers report `disabled`, unprobed providers
+report `not_probed`, and neither is claimed as ready. The coverage headline
+names only providers that actually returned successful review evidence. To
+authorize one available provider-review step:
 
 ```bash
 mm-review continue <workflow-id> --execute-review
@@ -272,6 +315,13 @@ mm-review workflow finalize <workflow-id>
 `workflow status` distinguishes active work, `ready_to_finalize`, `completed`,
 `completed_stale`, blocked, and superseded states. A completed workflow rejects
 new reviews; create a linked successor for a source or contract change.
+It also distinguishes `ready` (fresh local source gate) from
+`deployment_ready` (an immutable commit review or explicit commit attestation).
+After committing exact reviewed bytes, run the exact `attest-commit` action
+shown by `workflow finalize` or `continue`, then verify again. Neither provider
+review nor commit attestation proves a deployed runtime, live data, broker,
+email, or API side effect; obtain that application-specific runtime evidence
+separately whenever the task requires it.
 
 If a finalized snapshot is unchanged and the user asks one additional focused
 question, use one supplemental review instead of another repair/confirmation

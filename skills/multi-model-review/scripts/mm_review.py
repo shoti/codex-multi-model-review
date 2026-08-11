@@ -109,7 +109,7 @@ PROVIDER_BINARIES = {
 }
 LEGACY_PROVIDER_ALIASES = {"gemini": "antigravity"}
 PROVIDER_CHOICES = (*PROVIDERS, *LEGACY_PROVIDER_ALIASES)
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 MAX_REPAIR_ROUNDS = 3
 RUN_PHASES = ("repair", "confirmation", "supplemental")
 DEFAULT_REVIEW_MODE = "balanced"
@@ -220,6 +220,7 @@ VALID_RISKS = {
 }
 VALID_DECISIONS = {"accepted", "deferred", "fixed", "rejected", "uncertain"}
 VALID_TEST_GAP_DECISIONS = {"accepted", "covered", "deferred", "rejected"}
+VALID_OBSERVATION_DECISIONS = {"acknowledged"}
 MEMORY_ASSESSMENTS = {"useful", "irrelevant", "mixed"}
 SEVERITY_ORDER = {"blocker": 4, "high": 3, "medium": 2, "low": 1}
 GATE_STATUSES = ("PASS_CLEAN", "PASS_WITH_FINDINGS", "BLOCK")
@@ -293,7 +294,7 @@ class ReviewResult:
 
 @dataclasses.dataclass(frozen=True)
 class ProviderReadiness:
-    ready: bool
+    ready: bool | None
     detail: str
     models: tuple[str, ...] = ()
     authentication_mode: str = "unknown"
@@ -307,6 +308,7 @@ class SensitiveFinding:
     line: int
     rule: str
     key: str | None = None
+    content_sha256: str = ""
 
     def display(self) -> str:
         key = f", key={self.key}" if self.key else ""
@@ -784,6 +786,106 @@ def normalize_path_filters(repo: Path, requested: Sequence[str]) -> tuple[str, .
     return tuple(sorted(set(normalized)))
 
 
+def resolve_snapshot_exclusions(
+    repo: Path,
+    requested: Sequence[str],
+    *,
+    task_paths: Sequence[str],
+    path_filters: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Validate exact unchanged sensitive files that stay out of reviewer data."""
+    normalized = normalize_path_filters(repo, requested)
+    task_set = set(task_paths)
+    exclusions: list[dict[str, Any]] = []
+    for relative_path in normalized:
+        source = repo / relative_path
+        tracked = run_command(
+            ["git", "ls-files", "--error-unmatch", "--", relative_path],
+            cwd=repo,
+            check=False,
+        )
+        if tracked.returncode != 0:
+            raise ReviewError(
+                "--exclude-snapshot-path accepts only tracked files: "
+                f"{relative_path}"
+            )
+        if not source.is_file() or source.is_symlink():
+            raise ReviewError(
+                "--exclude-snapshot-path accepts only regular files, not "
+                f"directories or symlinks: {relative_path}"
+            )
+        if not is_sensitive_path(relative_path):
+            raise ReviewError(
+                "Snapshot exclusions are restricted to recognized sensitive "
+                f"paths: {relative_path}"
+            )
+        status = run_command(
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                relative_path,
+            ],
+            cwd=repo,
+        ).stdout
+        if status:
+            raise ReviewError(
+                "A snapshot exclusion must be unchanged from HEAD: "
+                f"{relative_path}"
+            )
+        if relative_path in task_set or any(
+            relative_path == item
+            or relative_path.startswith(f"{item}/")
+            or item.startswith(f"{relative_path}/")
+            for item in path_filters
+        ):
+            raise ReviewError(
+                "A task-scoped or changed path cannot be excluded from review: "
+                f"{relative_path}"
+            )
+        git_blob = run_command(
+            ["git", "rev-parse", f"HEAD:{relative_path}"], cwd=repo
+        ).stdout.strip()
+        exclusions.append(
+            {
+                "path": relative_path,
+                "sha256": sha256_file(source),
+                "git_blob": git_blob,
+                "size_bytes": source.stat().st_size,
+                "reason": "recognized unchanged sensitive path",
+            }
+        )
+    return exclusions
+
+
+def validate_snapshot_exclusion_provenance(
+    repo: Path,
+    exclusions: Sequence[dict[str, Any]],
+    *,
+    task_paths: Sequence[str],
+    path_filters: Sequence[str],
+) -> list[dict[str, Any]]:
+    requested = [
+        str(item.get("path"))
+        for item in exclusions
+        if isinstance(item, dict) and item.get("path")
+    ]
+    current = resolve_snapshot_exclusions(
+        repo,
+        requested,
+        task_paths=task_paths,
+        path_filters=path_filters,
+    )
+    if current != list(exclusions):
+        raise ReviewError(
+            "Snapshot exclusion provenance no longer matches the reviewed "
+            "source. Start a fresh workflow round."
+        )
+    return current
+
+
 def matches_path_filters(path: str, path_filters: Sequence[str]) -> bool:
     return not path_filters or any(
         path == item or path.startswith(f"{item}/") for item in path_filters
@@ -1016,6 +1118,7 @@ def render_manifest(
     *,
     display_repo: Path | None = None,
     path_filters: Sequence[str] = (),
+    snapshot_exclusions: Sequence[dict[str, Any]] = (),
 ) -> str:
     status = ""
     if scope.kind != "commit":
@@ -1040,6 +1143,14 @@ def render_manifest(
         "Changed paths:",
     ]
     lines.extend(f"- {path}" for path in paths)
+    lines.extend(["", "Snapshot exclusions (not transmitted):"])
+    if snapshot_exclusions:
+        lines.extend(
+            f"- {item['path']} (sha256={item['sha256']})"
+            for item in snapshot_exclusions
+        )
+    else:
+        lines.append("- None.")
     if status:
         lines.extend(["", "Git status:", "```text", status, "```"])
     return "\n".join(lines) + "\n"
@@ -1116,7 +1227,10 @@ def sensitive_content_findings(
                     value = match.group(value_group).lower()
                     if any(marker in value for marker in SAFE_SECRET_MARKERS):
                         continue
-                identity = f"{relative_path}:{line_number}:{rule}"
+                content_sha256 = sha256_text(line)
+                identity = (
+                    f"{relative_path}:{line_number}:{rule}:{content_sha256}"
+                )
                 identifier = hashlib.sha256(identity.encode()).hexdigest()[:12]
                 findings[identity] = SensitiveFinding(
                     identifier=identifier,
@@ -1124,6 +1238,7 @@ def sensitive_content_findings(
                     line=line_number,
                     rule=rule,
                     key=secret_assignment_key(line),
+                    content_sha256=content_sha256,
                 )
     return [findings[key] for key in sorted(findings)]
 
@@ -1143,6 +1258,7 @@ def create_sensitive_scan_token(
     source_fingerprint: str,
     review_snapshot_fingerprint: str,
     findings: Sequence[SensitiveFinding],
+    snapshot_exclusions: Sequence[dict[str, Any]] = (),
 ) -> str:
     token = f"scan-{uuid.uuid4().hex}"
     safe_write_json(
@@ -1159,6 +1275,7 @@ def create_sensitive_scan_token(
             "paths": list(paths),
             "source_fingerprint": source_fingerprint,
             "review_snapshot_fingerprint": review_snapshot_fingerprint,
+            "snapshot_exclusions": list(snapshot_exclusions),
             "allowed_sensitive_findings": [
                 finding.identifier for finding in findings
             ],
@@ -1176,6 +1293,7 @@ def validate_sensitive_scan_token(
     paths: Sequence[str],
     source_fingerprint: str,
     review_snapshot_fingerprint: str,
+    snapshot_exclusions: Sequence[dict[str, Any]] = (),
 ) -> tuple[Path, dict[str, Any]]:
     path = sensitive_scan_path(token)
     if not path.exists():
@@ -1191,6 +1309,7 @@ def validate_sensitive_scan_token(
         "paths": list(paths),
         "source_fingerprint": source_fingerprint,
         "review_snapshot_fingerprint": review_snapshot_fingerprint,
+        "snapshot_exclusions": list(snapshot_exclusions),
     }
     mismatches = [key for key, item in expected.items() if value.get(key) != item]
     if mismatches:
@@ -1204,6 +1323,41 @@ def validate_sensitive_scan_token(
 def consume_sensitive_scan_token(path: Path, value: dict[str, Any]) -> None:
     value["consumed_at"] = utc_now()
     safe_write_json(path, value)
+
+
+def reusable_lineage_sensitive_approvals(
+    identifier: str,
+    repository_id: str,
+    findings: Sequence[SensitiveFinding],
+) -> tuple[set[str], list[str]]:
+    """Reuse only schema-11 approvals bound to identical finding content."""
+    current = {finding.identifier: dataclasses.asdict(finding) for finding in findings}
+    approved: set[str] = set()
+    source_runs: set[str] = set()
+    for _, metadata in workflow_lineage_runs(identifier):
+        if int(metadata.get("schema_version") or 0) < 11:
+            continue
+        repository = metadata.get("repository")
+        if not isinstance(repository, dict) or str(repository.get("id")) != repository_id:
+            continue
+        allowed = set(str(item) for item in metadata.get("allowed_sensitive_findings", []))
+        prior_findings = metadata.get("sensitive_findings")
+        if not allowed or not isinstance(prior_findings, list):
+            continue
+        prior_by_id = {
+            str(item.get("identifier")): item
+            for item in prior_findings
+            if isinstance(item, dict) and item.get("content_sha256")
+        }
+        matches = {
+            finding_id
+            for finding_id in allowed
+            if finding_id in current and prior_by_id.get(finding_id) == current[finding_id]
+        }
+        if matches:
+            approved.update(matches)
+            source_runs.add(str(metadata.get("run_id") or "unknown"))
+    return approved, sorted(source_runs)
 
 
 def update_digest_with_paths(
@@ -1389,6 +1543,28 @@ def create_snapshot(
     return snapshot_dir
 
 
+def apply_snapshot_exclusions(
+    snapshot_dir: Path, exclusions: Sequence[dict[str, Any]]
+) -> None:
+    for exclusion in exclusions:
+        relative_path = str(exclusion.get("path") or "")
+        target = snapshot_target(snapshot_dir, relative_path)
+        if not target.is_file() or target.is_symlink():
+            raise ReviewError(
+                "Snapshot exclusion does not resolve to the expected regular "
+                f"file: {relative_path}"
+            )
+        expected_sha = str(exclusion.get("sha256") or "")
+        if sha256_file(target) != expected_sha:
+            raise ReviewError(
+                "Snapshot exclusion content does not match its pinned "
+                f"provenance: {relative_path}. For a historical --commit "
+                "scope, verify that the reviewed commit contains the same "
+                "file content as current HEAD, or omit the exclusion."
+            )
+        target.unlink()
+
+
 def snapshot_review_paths(snapshot_dir: Path) -> list[str]:
     """List every file or symlink observable by an external reviewer."""
     return sorted(
@@ -1562,8 +1738,9 @@ For each actionable finding:
 - Smallest fix: concise recommendation
 - Confidence: high, medium, or low
 
-An observation with no reachable impact or no recommended action is not a
-finding. Put it in Notes so it does not create false triage work.
+Any concern with plausible reachable impact or a recommended code/test change
+is a finding or test gap, even when it appears pre-existing or outside the
+preferred design direction. Do not bury risk-relevant concerns in Notes.
 
 Write "None." when there are no actionable findings.
 
@@ -1577,6 +1754,17 @@ Use medium for changed risk-profiled behavior and low for bounded coverage
 debt. Write "None." when no actionable test gap remains. Do not duplicate a
 correctness finding here.
 
+# Observations
+For each demonstrably non-actionable observation:
+## [low] Short title
+- Location: repository-relative-file:line, or Not specified
+- Evidence: concrete fact that was verified
+- Why non-actionable: why it has no reachable impact and needs no code/test action
+
+Write "None." when there are no observations. Observations are audited and
+must be acknowledged by Codex, but they do not lower a clean verdict. If you
+cannot demonstrate that an item has no reachable impact, report it as a finding.
+
 # Coverage
 - Complete: yes or no
 - Unreviewed changed paths: a JSON string array, for example [] or ["src/a.ts"]
@@ -1588,7 +1776,8 @@ name every known unreviewed changed path and describe remaining limitations.
 Do not hide incomplete coverage in Notes.
 
 # Notes
-Optional concise assumptions or areas you could not verify.
+Optional concise assumptions or neutral context only. Never put a possible
+defect, risk, missing test, or coverage limitation here.
 """
 
 
@@ -2144,6 +2333,25 @@ def freshness_status(
     scope = scope_from_metadata(metadata)
     filters = tuple(str(item) for item in metadata.get("path_filters", []))
     reviewed_paths = sorted(str(item) for item in metadata.get("paths", []))
+    snapshot_exclusions = [
+        item
+        for item in metadata.get("snapshot_exclusions", [])
+        if isinstance(item, dict)
+    ]
+    try:
+        validate_snapshot_exclusion_provenance(
+            repo,
+            snapshot_exclusions,
+            task_paths=reviewed_paths,
+            path_filters=filters,
+        )
+    except ReviewError:
+        return {
+            "fresh": False,
+            "mode": "snapshot-exclusion-stale",
+            "current_fingerprint": None,
+            "commit": None,
+        }
 
     if scope.kind == "commit" and scope.value:
         exists = run_command(
@@ -2283,9 +2491,33 @@ def freshness_status(
     }
 
 
+def commit_is_attested(final: dict[str, Any], commit: str | None) -> bool:
+    if not commit:
+        return False
+    attestations = final.get("commit_attestations")
+    return isinstance(attestations, list) and any(
+        isinstance(item, dict) and item.get("commit") == commit
+        for item in attestations
+    )
+
+
+def review_binding(
+    metadata: dict[str, Any], final: dict[str, Any], commit: str | None
+) -> tuple[str, bool]:
+    try:
+        scope = scope_from_metadata(metadata)
+    except ReviewError:
+        scope = None
+    if scope is not None and scope.kind == "commit" and commit:
+        return "immutable_commit", True
+    if commit_is_attested(final, commit):
+        return "attested_commit", True
+    return "working_tree_only", False
+
+
 def triage_items(triage: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for key in ("findings", "test_gaps"):
+    for key in ("findings", "test_gaps", "observations"):
         value = triage.get(key, [])
         if isinstance(value, list):
             items.extend(item for item in value if isinstance(item, dict))
@@ -2295,11 +2527,12 @@ def triage_items(triage: dict[str, Any]) -> list[dict[str, Any]]:
 def pending_triage_ids(triage: dict[str, Any]) -> list[str]:
     pending: list[str] = []
     for item in triage_items(triage):
-        valid = (
-            VALID_TEST_GAP_DECISIONS
-            if item.get("kind") == "test_gap"
-            else VALID_DECISIONS
-        )
+        if item.get("kind") == "test_gap":
+            valid = VALID_TEST_GAP_DECISIONS
+        elif item.get("kind") == "observation":
+            valid = VALID_OBSERVATION_DECISIONS
+        else:
+            valid = VALID_DECISIONS
         if item.get("decision") not in valid:
             pending.append(str(item.get("id")))
     return pending
@@ -2376,6 +2609,65 @@ def ensure_prior_rounds_triaged(
             "Cannot start a new round until every earlier completed round is "
             "fully triaged and resolved:\n- " + "\n- ".join(issues)
         )
+
+
+def local_verification_required(
+    identifier: str,
+    repository_id: str,
+    current_fingerprint: str,
+) -> bool:
+    events: list[tuple[tuple[str, int, str], str, bool, bool]] = []
+    for run_dir, metadata in workflow_lineage_runs(identifier):
+        repository = metadata.get("repository")
+        if (
+            metadata.get("status") != "completed"
+            or not isinstance(repository, dict)
+            or str(repository.get("id")) != repository_id
+        ):
+            continue
+        triage_path = run_dir / "triage.json"
+        if not triage_path.exists():
+            continue
+        has_resolved_item = any(
+            item.get("decision") in {"fixed", "covered"}
+            for item in triage_items(read_json(triage_path))
+        )
+        has_local_evidence = bool(
+            metadata.get("local_verification_before_provider")
+        )
+        timestamp = str(
+            metadata.get("completed_at")
+            or metadata.get("created_at")
+            or metadata.get("started_at")
+            or ""
+        )
+        events.append(
+            (
+                (
+                    timestamp,
+                    int(metadata.get("round") or 0),
+                    str(metadata.get("run_id") or run_dir),
+                ),
+                str(metadata.get("source_fingerprint") or ""),
+                has_resolved_item,
+                has_local_evidence,
+            )
+        )
+    events.sort(key=lambda item: item[0])
+    requiring_fix_keys = [
+        key
+        for key, fingerprint_value, has_resolved_item, _ in events
+        if has_resolved_item and fingerprint_value != current_fingerprint
+    ]
+    if not requiring_fix_keys:
+        return False
+    latest_fix_key = requiring_fix_keys[-1]
+    return not any(
+        key > latest_fix_key
+        and fingerprint_value == current_fingerprint
+        and has_local_evidence
+        for key, fingerprint_value, _, has_local_evidence in events
+    )
 
 
 def workflow_id() -> str:
@@ -2681,6 +2973,39 @@ def workflow_provider_attempts(identifier: str) -> dict[str, int]:
     return counts
 
 
+def latest_provider_resource_metadata(
+    identifier: str, provider: str
+) -> tuple[str, str]:
+    """Return the latest persisted redacted auth/resource classification."""
+    latest: tuple[str, str, str] | None = None
+    for _, metadata in workflow_lineage_runs(identifier):
+        reviewers = metadata.get("reviewers")
+        reviewer = reviewers.get(provider) if isinstance(reviewers, dict) else None
+        if not isinstance(reviewer, dict):
+            continue
+        authentication_mode = str(reviewer.get("authentication_mode") or "unknown")
+        usage_resource = str(reviewer.get("usage_resource") or "unknown")
+        observed_at = str(
+            reviewer.get("completed_at")
+            or reviewer.get("started_at")
+            or metadata.get("completed_at")
+            or metadata.get("created_at")
+            or ""
+        )
+        candidate = (observed_at, authentication_mode, usage_resource)
+        if latest is None or candidate[0] > latest[0]:
+            latest = candidate
+    return (latest[1], latest[2]) if latest else ("unknown", "unknown")
+
+
+def readiness_status(*, enabled: bool, readiness: ProviderReadiness) -> str:
+    if not enabled:
+        return "disabled"
+    if readiness.ready is None:
+        return "not_probed"
+    return "ready" if readiness.ready else "unready"
+
+
 def provider_usage_snapshot(
     identifier: str, *, probe_readiness: bool = False
 ) -> dict[str, Any]:
@@ -2693,26 +3018,29 @@ def provider_usage_snapshot(
         model = str(config[provider].get("model") or "")
         enabled = bool(config[provider].get("enabled"))
         cooldown = active_provider_cooldown(provider)
+        persisted_auth, persisted_resource = latest_provider_resource_metadata(
+            identifier, provider
+        )
         if not enabled:
-            readiness = ProviderReadiness(True, "not probed while disabled")
+            readiness = ProviderReadiness(
+                None,
+                "disabled; readiness not probed",
+                authentication_mode=persisted_auth,
+                usage_resource=persisted_resource,
+            )
         elif probe_readiness:
             readiness = provider_readiness(provider, model)
         else:
-            authentication_mode = "unknown"
-            usage_resource = "provider_allowance"
+            authentication_mode = persisted_auth
+            usage_resource = persisted_resource
             if provider == "claude":
-                authentication_mode = (
-                    "api_billed" if os.environ.get("ANTHROPIC_API_KEY") else "unknown"
-                )
-                usage_resource = (
-                    "api_tokens"
-                    if authentication_mode == "api_billed"
-                    else "unknown"
-                )
+                if os.environ.get("ANTHROPIC_API_KEY"):
+                    authentication_mode = "api_billed"
+                    usage_resource = "api_tokens"
             readiness = ProviderReadiness(
-                cooldown is None,
+                False if cooldown else None,
                 (
-                    "no active quota cooldown; readiness not probed"
+                    "readiness not probed"
                     if cooldown is None
                     else f"quota cooldown until {cooldown}"
                 ),
@@ -2722,6 +3050,9 @@ def provider_usage_snapshot(
         providers[provider] = {
             "enabled": enabled,
             "ready": readiness.ready,
+            "readiness_status": readiness_status(
+                enabled=enabled, readiness=readiness
+            ),
             "detail": readiness.detail,
             "authentication_mode": readiness.authentication_mode,
             "usage_resource": readiness.usage_resource,
@@ -2748,9 +3079,15 @@ def provider_usage_snapshot(
 def reviewer_resource_metadata(reviewer: Reviewer) -> dict[str, str]:
     authentication_mode = "unknown"
     usage_resource = "provider_allowance"
-    if reviewer.name == "claude" and os.environ.get("ANTHROPIC_API_KEY"):
-        authentication_mode = "api_billed"
-        usage_resource = "api_tokens"
+    if reviewer.name == "claude":
+        authentication_mode, _ = claude_authentication_mode(reviewer.command[0])
+        usage_resource = (
+            "included_plan_allowance"
+            if authentication_mode == "subscription"
+            else "api_tokens"
+            if authentication_mode == "api_billed"
+            else "unknown"
+        )
     return {
         "usage_resource": usage_resource,
         "authentication_mode": authentication_mode,
@@ -3108,11 +3445,19 @@ def validate_workflow_phase(
 
 
 def baseline_review_contract(
-    identifier: str, repository_id: str
+    identifier: str,
+    repository_id: str,
+    *,
+    include_lineage: bool = False,
 ) -> dict[str, Any] | None:
+    runs = (
+        workflow_lineage_runs(identifier)
+        if include_lineage
+        else workflow_runs(identifier)
+    )
     completed = [
         metadata
-        for _, metadata in workflow_runs(identifier)
+        for _, metadata in runs
         if isinstance(metadata.get("repository"), dict)
         and str(metadata["repository"].get("id")) == repository_id
         and metadata.get("status") == "completed"
@@ -3132,6 +3477,11 @@ def baseline_review_contract(
         "risks": baseline.get("risks", []),
         "review_profile": baseline.get("review_profile", "normal"),
         "task": baseline.get("task"),
+        "snapshot_exclusion_paths": [
+            str(item.get("path"))
+            for item in baseline.get("snapshot_exclusions", [])
+            if isinstance(item, dict) and item.get("path")
+        ],
     }
 
 
@@ -3165,6 +3515,7 @@ def validate_review_contract(
     risks: Sequence[str],
     review_profile: str,
     task: str | None,
+    snapshot_exclusion_paths: Sequence[str] = (),
 ) -> None:
     expected = baseline_review_contract(identifier, repository_id)
     if expected is None:
@@ -3175,6 +3526,7 @@ def validate_review_contract(
         "risks": sorted(set(risks)),
         "review_profile": review_profile,
         "task": task,
+        "snapshot_exclusion_paths": list(snapshot_exclusion_paths),
     }
     mismatches = [
         key for key in expected if expected[key] != actual[key]
@@ -3233,6 +3585,61 @@ def workflow_start_command(args: argparse.Namespace) -> int:
         ),
     )
     print(identifier)
+    return 0
+
+
+def workflow_raise_provider_attempt_limit_command(
+    args: argparse.Namespace,
+) -> int:
+    os.umask(0o077)
+    reason = args.reason.strip()
+    if not reason:
+        raise ReviewError("--reason cannot be empty.")
+    if len(reason) > MAX_NOTE_CHARS:
+        raise ReviewError(f"--reason must be at most {MAX_NOTE_CHARS} characters.")
+    if args.to < 1:
+        raise ReviewError("--to must be at least 1.")
+    identifier = args.workflow_id
+    lineage_root = workflow_lineage_root(identifier)
+    lineage_lock = WORKFLOWS_DIR / f"{lineage_root}.provider-usage"
+    document_path = workflow_path(identifier)
+    with exclusive_file_lock(lineage_lock):
+        with exclusive_file_lock(document_path):
+            document = require_active_workflow(identifier)
+            policy = document.get("policy")
+            usage_policy = policy.get("usage_policy") if isinstance(policy, dict) else None
+            if not isinstance(usage_policy, dict):
+                raise ReviewError(
+                    "Only provider-usage workflows have an attempt limit to raise."
+                )
+            previous = usage_policy.get("max_attempts_per_provider")
+            if not isinstance(previous, int) or previous < 1:
+                raise ReviewError("Workflow has an invalid provider-attempt policy.")
+            if args.to <= previous:
+                raise ReviewError(
+                    f"--to must increase the current limit ({previous}); it cannot "
+                    "lower or reassert the ceiling."
+                )
+            changed_at = utc_now()
+            usage_policy["max_attempts_per_provider"] = args.to
+            history = document.setdefault("provider_attempt_limit_history", [])
+            if not isinstance(history, list):
+                history = []
+                document["provider_attempt_limit_history"] = history
+            history.append(
+                {
+                    "previous": previous,
+                    "new": args.to,
+                    "reason": reason,
+                    "changed_at": changed_at,
+                    "lineage_root": lineage_root,
+                }
+            )
+            safe_write_json(document_path, document)
+    print(
+        f"Provider attempt limit raised: {previous} -> {args.to}; "
+        f"workflow={identifier}; lineage_root={lineage_root}"
+    )
     return 0
 
 
@@ -4687,11 +5094,12 @@ def workflow_audit_report(stale_days: int) -> dict[str, Any]:
                 continue
             for item in triage_items(read_json(triage_path)):
                 decision = item.get("decision")
-                valid = (
-                    VALID_TEST_GAP_DECISIONS
-                    if item.get("kind") == "test_gap"
-                    else VALID_DECISIONS
-                )
+                if item.get("kind") == "test_gap":
+                    valid = VALID_TEST_GAP_DECISIONS
+                elif item.get("kind") == "observation":
+                    valid = VALID_OBSERVATION_DECISIONS
+                else:
+                    valid = VALID_DECISIONS
                 if decision not in valid or decision in {"accepted", "uncertain"}:
                     unresolved.append(
                         f"{metadata.get('run_id') or run_dir.name}:{item.get('id')}"
@@ -4869,6 +5277,10 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
         triage_fresh = False
         final_contract_trusted = False
         final_contract_issues: list[str] = []
+        binding = "unfinalized"
+        commit_attested = False
+        commit_bound = False
+        deployment_ready = False
         if final_path.exists():
             final = read_json(final_path)
             final_status = final.get("status")
@@ -4886,6 +5298,8 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                     run_dir, metadata, final
                 )
                 fresh = fresh and triage_fresh and final_contract_trusted
+                binding, commit_bound = review_binding(metadata, final, commit)
+                commit_attested = commit_is_attested(final, commit)
             except ReviewError:
                 fresh = False
             passing_status = str(final_status).startswith("PASS") or (
@@ -4893,6 +5307,9 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                 and final_status != "SUPPLEMENTAL_BLOCK"
             )
             state = "ready" if fresh and passing_status else "blocked"
+            deployment_ready = bool(
+                fresh and passing_status and commit_bound
+            )
         phase = str(metadata.get("phase", "repair"))
         confirmation_complete = phase in {"confirmation", "supplemental"}
         if requires_confirmation and not confirmation_complete:
@@ -4913,6 +5330,10 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                 "final_contract_trusted": final_contract_trusted,
                 "final_contract_issues": final_contract_issues,
                 "commit": commit,
+                "binding": binding,
+                "commit_attested": commit_attested,
+                "commit_bound": commit_bound,
+                "deployment_ready": deployment_ready,
                 "final_status": final_status,
                 "accepts_reviews": not confirmation_complete,
             }
@@ -4948,16 +5369,52 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
         state = "active"
     lineage_ids = workflow_lineage_ids(identifier)
     lineage_runs = workflow_lineage_runs(identifier)
+    attempted_providers: set[str] = set()
+    successful_providers: set[str] = set()
+    for _, metadata in lineage_runs:
+        reviewers = metadata.get("reviewers")
+        if not isinstance(reviewers, dict):
+            continue
+        for provider, value in reviewers.items():
+            if provider not in PROVIDERS or not isinstance(value, dict):
+                continue
+            attempts = reviewer_attempts(value)
+            if attempts:
+                attempted_providers.add(provider)
+            if any(reviewer_attempt_succeeded(item) for item in attempts):
+                successful_providers.add(provider)
+    config = load_config()
+    enabled_providers = [
+        provider for provider in PROVIDERS if bool(config[provider].get("enabled"))
+    ]
+    actual_names = [provider for provider in PROVIDERS if provider in successful_providers]
+    coverage_headline = (
+        " + ".join(actual_names)
+        if len(actual_names) > 1
+        else f"{actual_names[0]} only"
+        if actual_names
+        else "no successful external provider"
+    )
     artifact_run_dirs = {
         run_dir for run_dir, _ in [*all_runs, *lineage_runs]
     }
     artifact_bytes_by_run = {
         run_dir: run_artifact_bytes(run_dir) for run_dir in artifact_run_dirs
     }
+    deployment_ready = (
+        workflow_document.get("kind", "standard") != "supplemental"
+        and bool(ready)
+        and all(
+        bool(item.get("deployment_ready"))
+        for item in repositories
+        if item.get("phase") != "supplemental"
+        )
+    )
     return {
         "workflow_id": identifier,
         "workflow": workflow_document,
         "ready": ready,
+        "deployment_ready": deployment_ready,
         "state": state,
         "lineage_root": lineage_ids[0] if lineage_ids else identifier,
         "lineage_workflows": lineage_ids,
@@ -4971,6 +5428,15 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
             lineage_runs, artifact_bytes_by_run
         ),
         "provider_usage": provider_usage_snapshot(identifier),
+        "external_review_coverage": {
+            "headline": coverage_headline,
+            "attempted_providers": sorted(attempted_providers),
+            "successful_providers": sorted(successful_providers),
+            "enabled_providers": enabled_providers,
+            "disabled_providers": [
+                provider for provider in PROVIDERS if provider not in enabled_providers
+            ],
+        },
         "repositories": repositories,
     }, ready
 
@@ -5011,12 +5477,36 @@ def workflow_continue_plan(
         "workflow_id": identifier,
         "state": state,
         "ready": ready,
+        "deployment_ready": bool(status.get("deployment_ready")),
         "provider_usage": usage,
         "actions": [],
         "checked_at": utc_now(),
     }
     if state in {"completed", "completed_stale", "completed_untrusted"}:
         plan["next"] = "COMPLETE" if state == "completed" else "BLOCKED"
+        if state == "completed" and not status.get("deployment_ready"):
+            plan["post_commit_actions"] = [
+                {
+                    "repository": (
+                        item.get("repository", {}).get("name")
+                        if isinstance(item.get("repository"), dict)
+                        else "unknown"
+                    ),
+                    "type": "attest_commit",
+                    "command": (
+                        "mm-review attest-commit --run "
+                        f"{shlex.quote(str(item.get('run_dir')))} --commit HEAD"
+                    ),
+                    "reason": (
+                        "The source gate passes, but no equivalent commit is bound "
+                        "to this final yet."
+                    ),
+                }
+                for item in status.get("repositories", [])
+                if isinstance(item, dict)
+                and item.get("phase") != "supplemental"
+                and not item.get("deployment_ready")
+            ]
         return plan
     if state == "superseded":
         plan["next"] = "SUPERSEDED"
@@ -5154,7 +5644,8 @@ def workflow_continue_plan(
                         {
                             "type": "review",
                             "phase": phase,
-                            "automatable": True,
+                            "automatable": not changed_after_fix,
+                            "local_gate_required": changed_after_fix,
                             "command": shlex.join(
                                 [
                                     "mm-review",
@@ -5166,10 +5657,47 @@ def workflow_continue_plan(
                                     "--phase",
                                     phase,
                                     "--reuse-contract",
+                                    "--reuse-lineage-sensitive-approvals",
+                                    *(
+                                        [
+                                            "--local-verification",
+                                            "<formatter, lint/static checks, and full relevant tests passed>",
+                                        ]
+                                        if changed_after_fix
+                                        else []
+                                    ),
                                 ]
                             ),
                         }
                     )
+                    if phase == "confirmation":
+                        providers = usage.get("providers")
+                        providers = providers if isinstance(providers, dict) else {}
+                        low_headroom = [
+                            provider
+                            for provider, value in providers.items()
+                            if isinstance(value, dict)
+                            and value.get("enabled")
+                            and value.get("attempts_remaining") is not None
+                            and int(value["attempts_remaining"]) < 3
+                        ]
+                        if low_headroom:
+                            recommended_to = max(
+                                int(providers[name].get("attempts") or 0) + 3
+                                for name in low_headroom
+                            )
+                            action["attempt_headroom_warning"] = {
+                                "providers": low_headroom,
+                                "reason": (
+                                    "Confirmation has less than one attempt plus "
+                                    "two recovery attempts available."
+                                ),
+                                "raise_command": (
+                                    "mm-review workflow raise-provider-attempt-limit "
+                                    f"{shlex.quote(identifier)} --to {recommended_to} "
+                                    '--reason "reserve confirmation recovery headroom"'
+                                ),
+                            }
                 else:
                     final_path = (
                         run_dir / "supplemental.json"
@@ -5248,6 +5776,20 @@ def render_continue_plan_compact(plan: dict[str, Any]) -> str:
             f"- {action.get('repository', 'workflow')}: {action.get('type')}"
             + (f"; {action.get('command')}" if action.get("command") else "")
         )
+        warning = action.get("attempt_headroom_warning")
+        if isinstance(warning, dict):
+            lines.append(
+                "  warning: "
+                + str(warning.get("reason"))
+                + "; "
+                + str(warning.get("raise_command"))
+            )
+    for action in plan.get("post_commit_actions", []):
+        if isinstance(action, dict):
+            lines.append(
+                f"- post-commit {action.get('repository', 'workflow')}: "
+                f"{action.get('command')}"
+            )
     lines.append("Use --format json for provider allowance and readiness evidence.")
     return "\n".join(lines)
 
@@ -5427,6 +5969,8 @@ def render_workflow_status_compact(status: dict[str, Any]) -> str:
         (
             f"Workflow {status.get('workflow_id')}: state={status.get('state')}, "
             f"ready={str(bool(status.get('ready'))).lower()}, "
+            "deployment_ready="
+            f"{str(bool(status.get('deployment_ready'))).lower()}, "
             f"lineage={status.get('lineage_root')}"
         ),
         (
@@ -5437,6 +5981,12 @@ def render_workflow_status_compact(status: dict[str, Any]) -> str:
             f"duration={float(metrics.get('reviewer_duration_seconds') or 0):.1f}s"
         ),
     ]
+    external_coverage = status.get("external_review_coverage")
+    if isinstance(external_coverage, dict):
+        lines.append(
+            "External review coverage: "
+            + str(external_coverage.get("headline") or "unknown")
+        )
     active_runs = status.get("active_runs")
     if isinstance(active_runs, list) and active_runs:
         lines.append("Active runs:")
@@ -5460,7 +6010,8 @@ def render_workflow_status_compact(status: dict[str, Any]) -> str:
             lines.append(
                 f"- {label}: round={item.get('round')} phase={item.get('phase')} "
                 f"state={item.get('state')} final={item.get('final_status')} "
-                f"fresh={item.get('fresh')}"
+                f"fresh={item.get('fresh')} binding={item.get('binding')} "
+                f"deployment_ready={item.get('deployment_ready')}"
             )
     issues = status.get("history_issues")
     if isinstance(issues, list) and issues:
@@ -5480,7 +6031,7 @@ def render_workflow_status_compact(status: dict[str, Any]) -> str:
                     f"resource={value.get('usage_resource')}, "
                     f"attempts={value.get('attempts')}, "
                     f"remaining={remaining if remaining is not None else 'unknown'}, "
-                    f"ready={value.get('ready')}"
+                    f"readiness_status={value.get('readiness_status')}"
                 )
     lines.append("Use --format json for complete workflow policy and metrics.")
     return "\n".join(lines)
@@ -5507,7 +6058,23 @@ def workflow_finalize_command(args: argparse.Namespace) -> int:
         workflow_document["completed_at"] = finalized_at
         safe_write_json(final_path, status)
         safe_write_json(workflow_document_path, workflow_document)
-    print(f"Workflow PASS: {args.workflow_id}")
+    print(f"Workflow PASS (source gate only): {args.workflow_id}")
+    if not status.get("deployment_ready"):
+        print(
+            "Deployment binding is incomplete. This proves the reviewed local "
+            "source gate, not a committed or deployed revision. After committing "
+            "the exact reviewed bytes, run:",
+        )
+        for item in status.get("repositories", []):
+            if (
+                isinstance(item, dict)
+                and item.get("phase") != "supplemental"
+                and not item.get("deployment_ready")
+            ):
+                print(
+                    "- mm-review attest-commit --run "
+                    f"{shlex.quote(str(item.get('run_dir')))} --commit HEAD"
+                )
     return 0
 
 
@@ -5729,12 +6296,13 @@ def status_command(_: argparse.Namespace) -> int:
         readiness = (
             provider_readiness(provider, str(model))
             if enabled
-            else ProviderReadiness(True, "not probed while disabled")
+            else ProviderReadiness(None, "disabled; readiness not probed")
         )
         cli_version = version_of(command) if enabled else "not probed"
         print(
             f"{provider}: {state}, model={model}{policy}, "
             f"CLI={cli_version}, "
+            f"readiness_status={readiness_status(enabled=enabled, readiness=readiness)}, "
             f"readiness={readiness.detail}, "
             f"auth={readiness.authentication_mode}, "
             f"usage_resource={readiness.usage_resource}"
@@ -6005,7 +6573,7 @@ def doctor_command(args: argparse.Namespace) -> int:
         readiness = (
             provider_readiness(provider, str(config[provider]["model"]))
             if enabled
-            else ProviderReadiness(True, "not probed while disabled")
+            else ProviderReadiness(None, "disabled; readiness not probed")
         )
         checks.append(
             {
@@ -6015,6 +6583,9 @@ def doctor_command(args: argparse.Namespace) -> int:
                     config[provider].get("allow_run_override", True)
                 ),
                 "ok": readiness.ready,
+                "readiness_status": readiness_status(
+                    enabled=enabled, readiness=readiness
+                ),
                 "detail": readiness.detail,
                 "models": list(readiness.models),
             }
@@ -6138,7 +6709,12 @@ def apply_triage_decision(
             f"Available: {available or '(none)'}"
         )
     kind = str(selected.get("kind") or "finding")
-    valid = VALID_TEST_GAP_DECISIONS if kind == "test_gap" else VALID_DECISIONS
+    if kind == "test_gap":
+        valid = VALID_TEST_GAP_DECISIONS
+    elif kind == "observation":
+        valid = VALID_OBSERVATION_DECISIONS
+    else:
+        valid = VALID_DECISIONS
     if decision not in valid:
         raise ReviewError(
             f"Decision {decision} is invalid for {kind} {identifier}; "
@@ -6604,7 +7180,7 @@ def finalize_command(args: argparse.Namespace) -> int:
                     candidate_metadata.get("run_id") or candidate_dir.name
                 )
                 raise ReviewError(
-                    "Every finding and test gap must be decided before "
+                    "Every finding, test gap, and observation must be decided before "
                     f"finalization: {run_identifier}:"
                     + f", {run_identifier}:".join(pending)
                 )
@@ -6620,6 +7196,7 @@ def finalize_command(args: argparse.Namespace) -> int:
     triage_text = current_snapshot[3]
     history_findings: list[tuple[dict[str, Any], Path, dict[str, Any]]] = []
     history_test_gaps: list[tuple[dict[str, Any], Path, dict[str, Any]]] = []
+    history_observations: list[tuple[dict[str, Any], Path, dict[str, Any]]] = []
     triage_sha256s: dict[str, str] = {}
     for (
         candidate_dir,
@@ -6639,6 +7216,11 @@ def finalize_command(args: argparse.Namespace) -> int:
         history_test_gaps.extend(
             (item, candidate_dir, candidate_metadata)
             for item in candidate_triage.get("test_gaps", [])
+            if isinstance(item, dict)
+        )
+        history_observations.extend(
+            (item, candidate_dir, candidate_metadata)
+            for item in candidate_triage.get("observations", [])
             if isinstance(item, dict)
         )
     history_findings = effective_finalization_items(
@@ -6676,7 +7258,12 @@ def finalize_command(args: argparse.Namespace) -> int:
         if metadata.get("coverage_contract_required") is True
         else []
     )
-    if incomplete_coverage and not coverage_verification:
+    snapshot_exclusions = [
+        item
+        for item in metadata.get("snapshot_exclusions", [])
+        if isinstance(item, dict)
+    ]
+    if (incomplete_coverage or snapshot_exclusions) and not coverage_verification:
         details = []
         for item in incomplete_coverage:
             paths = item.get("unreviewed_changed_paths") or []
@@ -6685,9 +7272,15 @@ def finalize_command(args: argparse.Namespace) -> int:
                 f"{item['reviewer']}: paths={paths or ['not specified']}; "
                 f"limitations={limitations or ['not specified']}"
             )
+        if snapshot_exclusions:
+            details.append(
+                "snapshot exclusions: "
+                + ", ".join(str(item.get("path")) for item in snapshot_exclusions)
+            )
         raise ReviewError(
-            "Confirmation coverage is incomplete. Run another independent "
-            "review or provide concrete Codex compensation with "
+            "Confirmation coverage is incomplete or intentionally excluded and "
+            "needs explicit Codex compensation. Run "
+            "another independent review where possible or provide concrete "
             "--coverage-verification after inspecting every uncovered area:\n- "
             + "\n- ".join(details)
         )
@@ -6757,8 +7350,10 @@ def finalize_command(args: argparse.Namespace) -> int:
             "incomplete_reviewers": incomplete_coverage,
             "codex_compensating_verification": coverage_verification,
             "gate_compensated": bool(
-                incomplete_coverage and coverage_verification
+                (incomplete_coverage or snapshot_exclusions)
+                and coverage_verification
             ),
+            "snapshot_exclusions": snapshot_exclusions,
         },
         "remaining_findings": remaining,
         "remaining_finding_ids": [str(item.get("id")) for item in remaining],
@@ -6766,6 +7361,11 @@ def finalize_command(args: argparse.Namespace) -> int:
         "remaining_test_gap_ids": [
             str(item.get("id"))
             for item in accepted_test_gaps + deferred_test_gaps
+        ],
+        "acknowledged_observations": [
+            final_item_reference(item, candidate_dir, candidate_metadata)
+            for item, candidate_dir, candidate_metadata in history_observations
+            if item.get("decision") == "acknowledged"
         ],
     }
     final_name = "supplemental.json" if phase == "supplemental" else "final.json"
@@ -6796,6 +7396,18 @@ def verify_command(args: argparse.Namespace) -> int:
     triage_fresh = final_triage_is_fresh(run_dir, metadata, final)
     fresh = source_fresh and triage_fresh and final_contract_trusted
     status = final.get("status")
+    commit = freshness.get("commit")
+    binding, commit_bound = review_binding(metadata, final, commit)
+    successful = str(status).startswith("PASS") or status in {
+        "SUPPLEMENTAL_CLEAN",
+        "SUPPLEMENTAL_WITH_FINDINGS",
+    }
+    deployment_ready = bool(
+        fresh
+        and successful
+        and commit_bound
+        and metadata.get("phase") != "supplemental"
+    )
     print(
         json.dumps(
             {
@@ -6807,17 +7419,17 @@ def verify_command(args: argparse.Namespace) -> int:
                 "final_contract_trusted": final_contract_trusted,
                 "final_contract_issues": final_contract_issues,
                 "freshness_mode": freshness["mode"],
-                "commit": freshness.get("commit"),
+                "commit": commit,
+                "binding": binding,
+                "commit_bound": commit_bound,
+                "commit_attested": commit_is_attested(final, commit),
+                "deployment_ready": deployment_ready,
                 "reviewed_fingerprint": final.get("source_fingerprint"),
                 "current_fingerprint": freshness.get("current_fingerprint"),
             },
             indent=2,
         )
     )
-    successful = str(status).startswith("PASS") or status in {
-        "SUPPLEMENTAL_CLEAN",
-        "SUPPLEMENTAL_WITH_FINDINGS",
-    }
     return 0 if fresh and successful else 3
 
 
@@ -6912,6 +7524,19 @@ def attest_commit_command(args: argparse.Namespace) -> int:
                 }
             )
         safe_write_json(final_path, final)
+    workflow_identifier = str(metadata.get("workflow_id") or "")
+    workflow_final_path = (
+        WORKFLOWS_DIR / f"{workflow_identifier}.final.json"
+        if workflow_identifier
+        else None
+    )
+    if workflow_final_path is not None and workflow_final_path.exists():
+        with exclusive_file_lock(workflow_final_path):
+            status, _ = workflow_status(workflow_identifier)
+            prior_workflow_final = read_json(workflow_final_path)
+            if prior_workflow_final.get("finalized_at"):
+                status["finalized_at"] = prior_workflow_final["finalized_at"]
+            safe_write_json(workflow_final_path, status)
     print(f"Commit attested: {commit}; final={final_path}")
     return 0
 
@@ -6922,6 +7547,12 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
     path_filters = normalize_path_filters(repo, args.path)
     scope = resolve_scope(args, repo, path_filters)
     paths = changed_paths(repo, scope, path_filters)
+    snapshot_exclusions = resolve_snapshot_exclusions(
+        repo,
+        args.exclude_snapshot_path,
+        task_paths=paths,
+        path_filters=path_filters,
+    )
     patch = render_patch(repo, scope, path_filters)
     if not paths and not patch.strip():
         raise ReviewError(f"No changes found for {scope.label}.")
@@ -6936,6 +7567,7 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
             overlay_paths,
             scan_dir,
         )
+        apply_snapshot_exclusions(snapshot_dir, snapshot_exclusions)
         current_paths = changed_paths(repo, scope, path_filters)
         current_overlay_paths = snapshot_overlay_paths(
             repo, scope, current_paths, path_filters
@@ -6943,10 +7575,17 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
         current_fingerprint = fingerprint(
             repo, scope, current_paths, path_filters
         )
+        current_exclusions = resolve_snapshot_exclusions(
+            repo,
+            args.exclude_snapshot_path,
+            task_paths=current_paths,
+            path_filters=path_filters,
+        )
         if (
             paths != current_paths
             or overlay_paths != current_overlay_paths
             or source_fingerprint != current_fingerprint
+            or snapshot_exclusions != current_exclusions
         ):
             raise ReviewError(
                 "The review scope changed during sensitive preflight; rerun "
@@ -6971,6 +7610,7 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
             source_fingerprint=source_fingerprint,
             review_snapshot_fingerprint=review_snapshot_fingerprint,
             findings=findings,
+            snapshot_exclusions=snapshot_exclusions,
         )
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -6979,6 +7619,7 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
         "path_filters": list(path_filters),
         "paths": paths,
         "snapshot_overlay_paths": overlay_paths,
+        "snapshot_exclusions": snapshot_exclusions,
         "review_snapshot_file_count": len(review_paths),
         "review_snapshot_fingerprint": review_snapshot_fingerprint,
         "source_fingerprint": source_fingerprint,
@@ -7219,7 +7860,7 @@ def persist_review_results(
             "updated_at": utc_now(),
             "findings": [triage_entry(item) for item in all_findings],
             "test_gaps": [triage_entry(item) for item in all_test_gaps],
-            "observations": all_observations,
+            "observations": [triage_entry(item) for item in all_observations],
             "review_coverage": {
                 name: review.get("coverage")
                 for name, review in parsed_reviews.items()
@@ -7441,6 +8082,17 @@ def resume_review_locked(
     path_filters = tuple(str(item) for item in metadata.get("path_filters", []))
     paths = [str(item) for item in metadata.get("paths", [])]
     current_paths = changed_paths(repo, scope, path_filters)
+    snapshot_exclusions = [
+        item
+        for item in metadata.get("snapshot_exclusions", [])
+        if isinstance(item, dict)
+    ]
+    validate_snapshot_exclusion_provenance(
+        repo,
+        snapshot_exclusions,
+        task_paths=current_paths,
+        path_filters=path_filters,
+    )
     overlay_paths = snapshot_overlay_paths(repo, scope, paths, path_filters)
     expected_overlay_paths = metadata.get("snapshot_overlay_paths")
     if isinstance(expected_overlay_paths, list) and overlay_paths != sorted(
@@ -7576,6 +8228,7 @@ def resume_review_locked(
             overlay_paths,
             run_dir,
         )
+        apply_snapshot_exclusions(snapshot_dir, snapshot_exclusions)
         if external_snapshot_symlinks(snapshot_dir):
             raise ReviewError(
                 "Cannot resume because the recreated snapshot has an external symlink."
@@ -7722,6 +8375,11 @@ def run_review_command(args: argparse.Namespace) -> int:
             "--sensitive-scan-token. Sensitive paths and external symlinks "
             "must be removed from the outgoing snapshot."
         )
+    if args.sensitive_scan_token and args.reuse_lineage_sensitive_approvals:
+        raise ReviewError(
+            "Choose either --sensitive-scan-token or "
+            "--reuse-lineage-sensitive-approvals, not both."
+        )
     config = load_config()
     supplemental_parent: tuple[Path, dict[str, Any], dict[str, Any]] | None = None
     if args.supplemental_of:
@@ -7762,6 +8420,14 @@ def run_review_command(args: argparse.Namespace) -> int:
         args.repo = str(parent_repository.get("root"))
         args.phase = "supplemental"
         args.path = list(parent_metadata.get("path_filters") or [])
+        args.exclude_snapshot_path = [
+            str(item.get("path"))
+            for item in parent_metadata.get("snapshot_exclusions", [])
+            if isinstance(item, dict) and item.get("path")
+        ]
+        args.reuse_lineage_sensitive_approvals = bool(
+            parent_metadata.get("allowed_sensitive_findings")
+        )
         args.risk = list(parent_metadata.get("risks") or [])
         args.review_profile = str(parent_metadata.get("review_profile") or "normal")
         args.uncommitted = False
@@ -7859,13 +8525,16 @@ def run_review_command(args: argparse.Namespace) -> int:
             or args.risk
             or args.task is not None
             or args.review_profile != "normal"
+            or args.exclude_snapshot_path
         ):
             raise ReviewError(
                 "--reuse-contract cannot be combined with path, risk, profile, "
                 "or task overrides."
             )
         pinned = baseline_review_contract(
-            selected_workflow, str(repository["id"])
+            selected_workflow,
+            str(repository["id"]),
+            include_lineage=True,
         )
         if pinned is None:
             raise ReviewError(
@@ -7895,10 +8564,19 @@ def run_review_command(args: argparse.Namespace) -> int:
         args.risk = list(pinned.get("risks") or [])
         args.review_profile = str(pinned.get("review_profile") or "normal")
         args.task = pinned.get("task")
+        args.exclude_snapshot_path = list(
+            pinned.get("snapshot_exclusion_paths") or []
+        )
 
     path_filters = normalize_path_filters(repo, args.path)
     scope = reused_scope or resolve_scope(args, repo, path_filters)
     paths = changed_paths(repo, scope, path_filters)
+    snapshot_exclusions = resolve_snapshot_exclusions(
+        repo,
+        args.exclude_snapshot_path,
+        task_paths=paths,
+        path_filters=path_filters,
+    )
     overlay_paths = snapshot_overlay_paths(repo, scope, paths, path_filters)
     patch = render_patch(repo, scope, path_filters)
     if not paths and not patch.strip():
@@ -7942,6 +8620,7 @@ def run_review_command(args: argparse.Namespace) -> int:
         "path_filters": list(path_filters),
         "paths": paths,
         "snapshot_overlay_paths": overlay_paths,
+        "snapshot_exclusions": snapshot_exclusions,
         "excluded_changed_paths": excluded_paths,
         "risks": sorted(set(args.risk)),
         "review_profile": args.review_profile,
@@ -7963,6 +8642,13 @@ def run_review_command(args: argparse.Namespace) -> int:
         "sensitive_override": False,
         "allowed_sensitive_findings": [],
         "sensitive_scan_token": args.sensitive_scan_token,
+        "sensitive_approval_mode": (
+            "lineage_reuse"
+            if args.reuse_lineage_sensitive_approvals
+            else "one_shot_token"
+            if args.sensitive_scan_token
+            else "none"
+        ),
     }
     safe_write_json(run_dir / "metadata.json", metadata)
 
@@ -7996,6 +8682,9 @@ def run_review_command(args: argparse.Namespace) -> int:
             risks=args.risk,
             review_profile=args.review_profile,
             task=args.task,
+            snapshot_exclusion_paths=[
+                str(item["path"]) for item in snapshot_exclusions
+            ],
         )
         ensure_prior_rounds_triaged(
             selected_workflow,
@@ -8003,6 +8692,24 @@ def run_review_command(args: argparse.Namespace) -> int:
             round_number,
             before,
         )
+        local_verification = [
+            item.strip() for item in args.local_verification if item.strip()
+        ]
+        if any(len(item) > MAX_NOTE_CHARS for item in local_verification):
+            raise ReviewError(
+                f"Each --local-verification must be at most {MAX_NOTE_CHARS} characters."
+            )
+        if local_verification_required(
+            selected_workflow, str(repository["id"]), before
+        ) and not local_verification:
+            raise ReviewError(
+                "Source changed after an accepted fix or covered test gap. "
+                "Before another paid/provider review, run the repository's "
+                "formatter, lint/static checks, and full relevant local test "
+                "suite, then record the results with one or more "
+                "--local-verification values."
+            )
+        metadata["local_verification_before_provider"] = local_verification
         reviewers = reviewer_definitions(args, config)
         budget_estimates = reviewer_budget_estimates(
             reviewers,
@@ -8017,12 +8724,46 @@ def run_review_command(args: argparse.Namespace) -> int:
                 budget_estimates, "claude"
             ),
         )
+        attempt_headroom_warnings: list[dict[str, Any]] = []
+        if (
+            args.phase == "confirmation"
+            and isinstance(workflow_budget, dict)
+            and workflow_budget.get("mode") == "provider_allowance"
+        ):
+            maximum = workflow_budget.get("max_attempts_per_provider")
+            attempts_before = workflow_budget.get("attempts_before_run")
+            attempts_before = (
+                attempts_before if isinstance(attempts_before, dict) else {}
+            )
+            if isinstance(maximum, int):
+                for reviewer in reviewers:
+                    used = int(attempts_before.get(reviewer.name) or 0)
+                    if maximum - used < 3:
+                        warning = {
+                            "provider": reviewer.name,
+                            "attempts_before": used,
+                            "max_attempts": maximum,
+                            "recommended_limit": used + 3,
+                        }
+                        attempt_headroom_warnings.append(warning)
+                        print(
+                            "Warning: confirmation has limited recovery "
+                            f"headroom for {reviewer.name} ({used}/{maximum} "
+                            "attempts already used). Before consuming this "
+                            "attempt, consider: mm-review workflow "
+                            f"raise-provider-attempt-limit {selected_workflow} "
+                            f"--to {used + 3} --reason \"reserve confirmation "
+                            "recovery headroom\"",
+                            flush=True,
+                        )
+        metadata["attempt_headroom_warnings"] = attempt_headroom_warnings
         snapshot_dir = create_snapshot(
             repo,
             scope,
             overlay_paths,
             run_dir,
         )
+        apply_snapshot_exclusions(snapshot_dir, snapshot_exclusions)
         snapshot_paths = changed_paths(repo, scope, path_filters)
         current_overlay_paths = snapshot_overlay_paths(
             repo, scope, snapshot_paths, path_filters
@@ -8030,10 +8771,17 @@ def run_review_command(args: argparse.Namespace) -> int:
         snapshot_source_fingerprint = fingerprint(
             repo, scope, snapshot_paths, path_filters
         )
+        current_snapshot_exclusions = resolve_snapshot_exclusions(
+            repo,
+            args.exclude_snapshot_path,
+            task_paths=snapshot_paths,
+            path_filters=path_filters,
+        )
         if (
             before != snapshot_source_fingerprint
             or paths != snapshot_paths
             or overlay_paths != current_overlay_paths
+            or snapshot_exclusions != current_snapshot_exclusions
         ):
             raise ReviewError(
                 "The review scope changed while the private snapshot was being "
@@ -8056,6 +8804,7 @@ def run_review_command(args: argparse.Namespace) -> int:
                 paths=paths,
                 source_fingerprint=before,
                 review_snapshot_fingerprint=review_snapshot_fingerprint,
+                snapshot_exclusions=snapshot_exclusions,
             )
         external_symlinks = external_snapshot_symlinks(snapshot_dir)
         content_findings = sensitive_content_findings(
@@ -8066,7 +8815,17 @@ def run_review_command(args: argparse.Namespace) -> int:
             if scan_token_value
             else []
         )
-        allowed_ids = token_allowed_ids
+        lineage_allowed_ids: set[str] = set()
+        lineage_approval_sources: list[str] = []
+        if args.reuse_lineage_sensitive_approvals:
+            lineage_allowed_ids, lineage_approval_sources = (
+                reusable_lineage_sensitive_approvals(
+                    selected_workflow,
+                    str(repository["id"]),
+                    content_findings,
+                )
+            )
+        allowed_ids = token_allowed_ids | lineage_allowed_ids
         known_ids = {item.identifier for item in content_findings}
         unknown_ids = sorted(allowed_ids - known_ids)
         if unknown_ids:
@@ -8081,6 +8840,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             dataclasses.asdict(item) for item in content_findings
         ]
         metadata["allowed_sensitive_findings"] = sorted(allowed_ids)
+        metadata["lineage_sensitive_approval_sources"] = lineage_approval_sources
         metadata["review_snapshot_file_count"] = len(review_paths)
         metadata["review_snapshot_fingerprint"] = review_snapshot_fingerprint
         if blocked_paths:
@@ -8113,9 +8873,11 @@ def run_review_command(args: argparse.Namespace) -> int:
                 "Review blocked because likely sensitive material is in the "
                 "private snapshot:\n"
                 + "\n".join(details)
-                + "\nRun `mm-review scan ... --approve-findings`, inspect the "
-                "redacted findings, then consume its one-shot exact-snapshot "
-                "token with --sensitive-scan-token."
+                + "\nNew or changed findings require `mm-review scan ... "
+                "--approve-findings`; inspect the redacted findings, then "
+                "consume its one-shot exact-snapshot token. Unchanged "
+                "schema-11 approvals can be reused explicitly with "
+                "--reuse-lineage-sensitive-approvals."
             )
 
         safe_write(
@@ -8126,6 +8888,7 @@ def run_review_command(args: argparse.Namespace) -> int:
                 overlay_paths,
                 display_repo=snapshot_dir,
                 path_filters=path_filters,
+                snapshot_exclusions=snapshot_exclusions,
             ),
         )
         prompt = build_prompt(
@@ -8640,6 +9403,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="json",
         help="Output format; JSON remains the complete machine-readable default",
     )
+    workflow_raise_attempts_parser = workflow_subparsers.add_parser(
+        "raise-provider-attempt-limit",
+        help=(
+            "Explicitly and auditably increase the active lineage's provider "
+            "attempt ceiling"
+        ),
+    )
+    workflow_raise_attempts_parser.add_argument("workflow_id")
+    workflow_raise_attempts_parser.add_argument("--to", type=int, required=True)
+    workflow_raise_attempts_parser.add_argument("--reason", required=True)
     workflow_audit_parser = workflow_subparsers.add_parser(
         "audit", help="Read-only lifecycle audit across all stored workflows"
     )
@@ -8680,6 +9453,15 @@ def build_parser() -> argparse.ArgumentParser:
     scan_scope.add_argument("--base")
     scan_scope.add_argument("--commit")
     scan_parser.add_argument("--path", action="append", default=[])
+    scan_parser.add_argument(
+        "--exclude-snapshot-path",
+        action="append",
+        default=[],
+        help=(
+            "Keep one exact unchanged tracked sensitive file out of the "
+            "external snapshot; repeat as needed"
+        ),
+    )
     scan_parser.add_argument(
         "--approve-findings",
         action="store_true",
@@ -8730,6 +9512,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Repository-relative task path to include; repeat for multiple paths. "
             "Unrelated dirty overlays stay outside the snapshot, but unchanged "
             "tracked files remain visible to reviewers."
+        ),
+    )
+    run_parser.add_argument(
+        "--exclude-snapshot-path",
+        action="append",
+        default=[],
+        help=(
+            "Keep one exact unchanged tracked sensitive file out of the "
+            "external snapshot and record its hash provenance; repeat as needed"
         ),
     )
     run_parser.add_argument(
@@ -8821,6 +9612,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--sensitive-scan-token",
         help="Consume one exact-fingerprint token created by `mm-review scan`",
     )
+    run_parser.add_argument(
+        "--reuse-lineage-sensitive-approvals",
+        action="store_true",
+        help=(
+            "Reuse only prior schema-11 approvals whose path, rule, line, and "
+            "content hash exactly match in this workflow lineage"
+        ),
+    )
+    run_parser.add_argument(
+        "--local-verification",
+        action="append",
+        default=[],
+        help=(
+            "Record formatter, lint/static-check, or full local-test evidence "
+            "completed after fixes and before this provider call; repeat as needed"
+        ),
+    )
 
     resume = subparsers.add_parser(
         "resume", help="Retry only failed reviewers for a fresh partial run"
@@ -8845,7 +9653,11 @@ def build_parser() -> argparse.ArgumentParser:
     decide.add_argument(
         "--decision",
         required=True,
-        choices=sorted(VALID_DECISIONS | VALID_TEST_GAP_DECISIONS),
+        choices=sorted(
+            VALID_DECISIONS
+            | VALID_TEST_GAP_DECISIONS
+            | VALID_OBSERVATION_DECISIONS
+        ),
     )
     decide.add_argument("--evidence", required=True)
     decide.add_argument("--action")
@@ -8858,7 +9670,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     decide_batch = subparsers.add_parser(
         "decide-batch",
-        help="Atomically record multiple finding/test-gap decisions",
+        help="Atomically record finding, test-gap, and observation decisions",
     )
     decide_batch.add_argument("--run", required=True, help="Review run directory")
     decide_batch.add_argument(
@@ -8995,6 +9807,8 @@ def main() -> int:
                 return workflow_start_command(args)
             if args.workflow_command == "status":
                 return workflow_status_command(args)
+            if args.workflow_command == "raise-provider-attempt-limit":
+                return workflow_raise_provider_attempt_limit_command(args)
             if args.workflow_command == "audit":
                 return workflow_audit_command(args)
             if args.workflow_command == "finalize":

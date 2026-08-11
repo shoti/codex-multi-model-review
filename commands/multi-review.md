@@ -36,6 +36,10 @@ repository. Do not stop after collecting reviewer reports.
 6. Derive task-specific `--path` filters so unrelated dirty files are excluded.
    Inspect the runner's excluded-path notice and add any changed dependency the
    reviewed behavior needs.
+   If an unchanged tracked recognized sensitive file such as `.npmrc` is
+   irrelevant but present in the full snapshot, use the exact
+   `--exclude-snapshot-path` flag. Inspect and record its provenance; never
+   exclude a changed or task-relevant path.
 7. Select applicable risks and a review profile. Risks include auth, backfill,
    db-write, email-send, email-deliverability, external-api, migration,
    security, and trading.
@@ -69,6 +73,9 @@ enabled. Codex remains implementer, finding verifier, and final gate.
    The scan covers and fingerprints the complete outgoing repository snapshot,
    including unchanged tracked files; direct IDs and broad overrides are not
    accepted.
+   On later lineage rounds, use `--reuse-lineage-sensitive-approvals` only for
+   exact schema-11 content-hash matches; new or changed findings need a new
+   one-shot token.
 2. Read every reviewer report completely.
    If a run is `partial`, keep the source unchanged and use `mm-review resume`
    so only failed reviewers are retried. If Claude reached its native
@@ -78,12 +85,16 @@ enabled. Codex remains implementer, finding verifier, and final gate.
    weaker cap blindly.
    The USD denomination is Claude CLI's native stop and an API-price equivalent,
    not proof of subscription billing.
-3. Independently trace every finding and test gap against the actual code path.
+3. Independently trace every finding, test gap, and structured observation
+   against the actual code path.
    Record every result with `mm-review decide` or one atomic
    `mm-review decide-batch`; model agreement alone is not evidence.
 4. Fix only accepted findings, keeping changes surgical.
 5. Run relevant tests and behavior-level checks. For DB writes, migrations,
    backfills, and external APIs, verify exact operation shape and postconditions.
+   After a fix, run formatter, lint/static checks, and the full relevant local
+   suite before another provider call, then record the results with
+   `--local-verification`.
 6. After a fix, update the original accepted finding to `fixed` with
    verification (or an accepted test gap to `covered`). Confirm the repair has
    no pending, accepted, or uncertain decisions. Any scoped source change makes
@@ -91,8 +102,16 @@ enabled. Codex remains implementer, finding verifier, and final gate.
 7. After the selected mode's repair limit, run one `--phase confirmation
    --reuse-contract` with no planned source changes. Only that confirmation can
    be finalized. If scoped source changes after confirmation, explicitly use
-   `workflow supersede` and review under its successor. Keep scope, path
-   filters, risks, review profile, and task text identical within one workflow.
+   `workflow supersede` and review under its successor. Contract reuse and
+   post-fix local-verification requirements follow the linked lineage; use
+   `--reuse-contract` when the successor intentionally keeps the same scope.
+   Evidence satisfies the gate for the exact reviewed fingerprint and must be
+   refreshed after later source changes.
+   Keep scope, path filters, risks, review profile, and task text identical
+   within one workflow.
+   Check `continue` for confirmation recovery-headroom warnings. If needed,
+   explicitly increase the ceiling with `workflow raise-provider-attempt-limit
+   --to <count> --reason <reason>`; never hide the change or lower the ceiling.
 8. Use `mm-review continue <workflow-id>` for a read-only next-action plan.
    Add `--execute-review` only when provider allowance may be consumed. Use
    `mm-review gate <workflow-id>` to consolidate Codex finalization,
@@ -114,12 +133,15 @@ Before finishing:
   `finalize`, `verify`, then `workflow finalize`;
 - if a reviewed working tree is later committed with user authorization, run
   `mm-review attest-commit --run <run-dir> --commit HEAD` and verify again.
+- distinguish a fresh local `ready` gate from `deployment_ready`; neither state
+  proves live runtime or external-side-effect success without separate evidence.
 
 ## Summary
 
 Report:
 
-- workflow ID, final round, reviewer models, scope, paths, and risk profiles;
+- workflow ID, final round, reviewer models that actually succeeded, scope,
+  paths, exclusions, and risk profiles;
 - aggregate reviewer runtime, attempts, tokens, API-price equivalent, and turns
   from workflow status;
 - accepted and fixed findings;
