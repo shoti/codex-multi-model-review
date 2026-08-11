@@ -83,6 +83,8 @@ flowchart TD
 - At least one installed and authenticated reviewer CLI.
 
 The runner has no third-party Python dependencies.
+It fails immediately with an actionable version error before creating a
+workflow or invoking a provider when the interpreter is older than Python 3.12.
 
 | Reviewer | Default | Executable | Notes |
 |---|---:|---|---|
@@ -161,9 +163,10 @@ The normal Codex-driven flow is:
    per-provider attempt ceiling.
 3. Run a repair review against explicit scope, paths, risks, and intent.
 4. Verify and disposition every finding and test gap.
-5. Fix accepted items, then run formatter, lint/static checks, and the complete
-   relevant local suite before another provider call; record the results with
-   `--local-verification`.
+5. Fix accepted items. A `fixed` or `covered` decision requires verification
+   and task-scoped bytes that differ from the reviewed snapshot. Then run
+   formatter, lint/static checks, and the complete relevant suite before another
+   provider call; record the results with `--local-verification`.
 6. Repeat only when necessary, within the selected repair-round limit.
 7. Run one mandatory confirmation with no further source changes planned,
    reusing the pinned repair contract.
@@ -199,7 +202,10 @@ successor is not a fresh allowance. Post-fix local-verification requirements
 also follow the lineage. A successor may use `--reuse-contract` to keep the
 original pinned contract, or specify a new contract intentionally. Recorded
 evidence satisfies the requirement for that exact fingerprint; later source
-changes require fresh local evidence.
+changes require fresh local evidence. A successor also inherits the complete
+set of repositories reviewed by its ancestors. Every inherited repository must
+produce a fresh successor final before the workflow can close; omitting one is
+reported as `not-reviewed`, not silently treated as reduced scope.
 
 Secret and symlink checks that stop before any provider invocation are reported
 as `preflight_blocked`, separately from failed reviews and provider failures.
@@ -427,9 +433,10 @@ opt-in, points back to full artifacts/evidence, and automatically falls back to
 JSON if it would emit more UTF-8 bytes.
 Analytics keeps explicit adaptive-mode lineages separate from modes inferred
 for legacy workflows, reports unclassified legacy run records, and exposes
-API-equivalent/duration/patch distributions. `workflow audit` is read-only: it identifies
-pending triage, unclosed run finals, failures, and stale incomplete work without
-rewriting or deleting evidence.
+API-equivalent/duration/patch distributions. `workflow audit` is read-only: it
+recomputes modern workflow freshness and identifies pending triage, unclosed run
+finals, blocked gates, `ready_to_finalize`, `completed_stale`, failures, and stale
+incomplete work without rewriting or deleting evidence.
 
 ### Evidence memory
 

@@ -59,6 +59,8 @@ ceiling. Successful and failed attempts follow every linked successor;
 supersession never resets task usage.
 Claude, Antigravity, and Kimi receive fresh independent read-only sessions when
 enabled. Codex remains implementer, finding verifier, and final gate.
+Run the bundled runner with Python 3.12 or newer; verify the interpreter rather
+than assuming the macOS `/usr/bin/python3` is supported.
 
 ## Commands
 
@@ -95,16 +97,20 @@ enabled. Codex remains implementer, finding verifier, and final gate.
    After a fix, run formatter, lint/static checks, and the full relevant local
    suite before another provider call, then record the results with
    `--local-verification`.
-6. After a fix, update the original accepted finding to `fixed` with
-   verification (or an accepted test gap to `covered`). Confirm the repair has
-   no pending, accepted, or uncertain decisions. Any scoped source change makes
-   it stale; run another repair if needed.
+6. After a fix changes the scoped source, update the original accepted finding
+   to `fixed` with verification (or an accepted test gap to `covered`). The
+   runner rejects either resolved transition while the reviewed scoped bytes
+   are unchanged. Confirm the repair has no pending, accepted, or uncertain
+   decisions. Any scoped source change makes the round stale; run another repair
+   if needed.
 7. After the selected mode's repair limit, run one `--phase confirmation
    --reuse-contract` with no planned source changes. Only that confirmation can
    be finalized. If scoped source changes after confirmation, explicitly use
    `workflow supersede` and review under its successor. Contract reuse and
    post-fix local-verification requirements follow the linked lineage; use
    `--reuse-contract` when the successor intentionally keeps the same scope.
+   The successor inherits every repository from the superseded lineage; each
+   inherited repository needs a fresh successor final before workflow closure.
    Evidence satisfies the gate for the exact reviewed fingerprint and must be
    refreshed after later source changes.
    Keep scope, path filters, risks, review profile, and task text identical

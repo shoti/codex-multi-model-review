@@ -8,7 +8,8 @@ import os
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Iterable, Sequence
+from contextlib import contextmanager
+from typing import Any, Iterable, Iterator, Sequence
 
 
 SCHEMA_VERSION = 1
@@ -140,6 +141,17 @@ def _connect(database_path: Path) -> sqlite3.Connection:
     return connection
 
 
+@contextmanager
+def _open_database(database_path: Path) -> Iterator[sqlite3.Connection]:
+    """Yield a transactional connection and always release its file handle."""
+    connection = _connect(database_path)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def _read_object(path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -202,7 +214,7 @@ def upsert_run(
                 str(metadata.get("created_at") or "") or None,
             )
         )
-    with _connect(database_path) as connection:
+    with _open_database(database_path) as connection:
         connection.execute("DELETE FROM evidence WHERE run_id = ?", (run_id,))
         connection.executemany(
             """
@@ -233,7 +245,7 @@ def rebuild(
     indexed_runs = 0
     indexed_items = 0
     try:
-        with _connect(temporary) as connection:
+        with _open_database(temporary) as connection:
             connection.execute("DELETE FROM evidence")
         for run_dir, lineage_root in runs:
             count = upsert_run(temporary, run_dir, lineage_root=lineage_root)
@@ -280,7 +292,7 @@ def search(
     if decided_only:
         clauses.append("decision IN ('fixed', 'rejected', 'covered', 'deferred')")
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    with _connect(database_path) as connection:
+    with _open_database(database_path) as connection:
         rows = connection.execute(
             "SELECT * FROM evidence" + where + " ORDER BY created_at DESC",
             parameters,
@@ -333,7 +345,7 @@ def status(database_path: Path) -> dict[str, Any]:
             "exists": False,
             "evidence_items": 0,
         }
-    with _connect(database_path) as connection:
+    with _open_database(database_path) as connection:
         evidence_items = int(
             connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
         )
