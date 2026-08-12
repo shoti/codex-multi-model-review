@@ -311,8 +311,8 @@ pending findings/test gaps, accepted unresolved test gaps, risk-profiled runs
 without verification, and accepted/uncertain blocker or high confirmation
 findings.
 If finalized confirmation later becomes stale because scoped source changes,
-create an explicit successor; a completed confirmation intentionally closes
-its workflow:
+`continue` reports `NEEDS_SUCCESSOR` and prints the exact non-automatic
+successor command. A completed confirmation intentionally closes its workflow:
 
 ```bash
 mm-review workflow supersede <workflow-id> --reason "<contract or source change>"

@@ -6116,6 +6116,20 @@ def _current_run_source_changed(run_dir: Path, metadata: dict[str, Any]) -> bool
     )
 
 
+def repository_has_stale_passing_final(repository: dict[str, Any]) -> bool:
+    final_status = str(repository.get("final_status") or "")
+    passing = final_status.startswith("PASS") or (
+        final_status.startswith("SUPPLEMENTAL_")
+        and final_status != "SUPPLEMENTAL_BLOCK"
+    )
+    return bool(
+        repository.get("state") == "blocked"
+        and repository.get("final_contract_trusted")
+        and passing
+        and not repository.get("fresh")
+    )
+
+
 def workflow_continue_plan(
     identifier: str, *, probe_usage: bool = False
 ) -> dict[str, Any]:
@@ -6131,7 +6145,48 @@ def workflow_continue_plan(
         "actions": [],
         "checked_at": utc_now(),
     }
-    if state in {"completed", "completed_stale", "completed_untrusted"}:
+    repositories = [
+        item
+        for item in status.get("repositories", [])
+        if isinstance(item, dict)
+    ]
+    stale_passing_finals = [
+        item for item in repositories if repository_has_stale_passing_final(item)
+    ]
+    has_other_blocked_final = any(
+        item.get("state") == "blocked"
+        and not repository_has_stale_passing_final(item)
+        for item in repositories
+    )
+    if state == "completed_stale" or (
+        state == "blocked"
+        and stale_passing_finals
+        and not has_other_blocked_final
+    ):
+        plan["next"] = "NEEDS_SUCCESSOR"
+        plan["actions"].append(
+            {
+                "type": "successor",
+                "automatable": False,
+                "reason": (
+                    "The authoritative final is no longer fresh. Preserve the "
+                    "workflow's finalized evidence and create a linked successor "
+                    "for fresh repository gates."
+                ),
+                "command": shlex.join(
+                    [
+                        "mm-review",
+                        "workflow",
+                        "supersede",
+                        identifier,
+                        "--reason",
+                        "authoritative final became stale",
+                    ]
+                ),
+            }
+        )
+        return plan
+    if state in {"completed", "completed_untrusted"}:
         plan["next"] = "COMPLETE" if state == "completed" else "BLOCKED"
         if state == "completed" and not status.get("deployment_ready"):
             plan["post_commit_actions"] = [
@@ -6482,6 +6537,103 @@ def render_continue_plan_compact(plan: dict[str, Any]) -> str:
             )
     lines.append("Use --format json for provider allowance and readiness evidence.")
     return "\n".join(lines)
+
+
+def review_next_guidance(
+    parsed_reviews: dict[str, Any],
+    phase: str,
+    *,
+    has_snapshot_exclusions: bool = False,
+) -> str:
+    has_findings = any(
+        isinstance(review, dict) and bool(review.get("findings"))
+        for review in parsed_reviews.values()
+    )
+    has_test_gaps = any(
+        isinstance(review, dict) and bool(review.get("test_gaps"))
+        for review in parsed_reviews.values()
+    )
+    has_observations = any(
+        isinstance(review, dict) and bool(review.get("observations"))
+        for review in parsed_reviews.values()
+    )
+    has_incomplete_coverage = any(
+        isinstance(review, dict)
+        and isinstance(review.get("coverage"), dict)
+        and review["coverage"].get("complete") is not True
+        for review in parsed_reviews.values()
+    )
+    needs_coverage_compensation = phase in {"confirmation", "supplemental"} and (
+        has_incomplete_coverage or has_snapshot_exclusions
+    )
+    coverage_guidance = (
+        " Run another independent review where possible or inspect every "
+        "uncovered or excluded area and provide concrete "
+        "`--coverage-verification` before finalization."
+        if needs_coverage_compensation
+        else ""
+    )
+    if has_findings or has_test_gaps or has_observations:
+        actions: list[str] = []
+        decisions: list[str] = []
+        if has_findings:
+            decisions.append("every finding")
+        if has_test_gaps:
+            decisions.append("every test gap")
+        if decisions:
+            actions.append("decide " + " and ".join(decisions))
+        if has_observations:
+            actions.append("acknowledge every observation")
+        guidance = (
+            f"Next: {' and '.join(actions)} with `mm-review decide` or "
+            f"`decide-batch` before continuing.{coverage_guidance}"
+        )
+        if phase == "confirmation":
+            return (
+                f"{guidance} If source must change, use a linked successor; "
+                "otherwise perform Codex final verification, then finalize "
+                "and verify this confirmation."
+            )
+        if phase == "supplemental":
+            return (
+                f"{guidance} If source must change, use a linked successor; "
+                "otherwise perform Codex final verification, then finalize "
+                "and verify this supplemental evidence; it does not replace "
+                "the parent gate."
+            )
+        return guidance
+    if phase == "repair":
+        return (
+            "Next: no triage decisions are required. Run the mandatory "
+            "confirmation against unchanged source with `--reuse-contract`."
+        )
+    if phase == "confirmation":
+        return (
+            "Next: no triage decisions are required."
+            f"{coverage_guidance} Perform Codex final verification, then "
+            "finalize and verify this confirmation."
+        )
+    return (
+        "Next: no triage decisions are required."
+        f"{coverage_guidance} Perform Codex final verification, then finalize "
+        "and verify this supplemental evidence; it does not replace the parent "
+        "gate."
+    )
+
+
+def completed_review_next_guidance(
+    run_dir: Path,
+    metadata: dict[str, Any],
+) -> str:
+    summary = read_json(run_dir / "review-summary.json")
+    reviews = summary.get("reviews")
+    if not isinstance(reviews, dict):
+        raise ReviewError("Completed review summary has no structured reviews.")
+    return review_next_guidance(
+        reviews,
+        str(metadata.get("phase") or "repair"),
+        has_snapshot_exclusions=bool(metadata.get("snapshot_exclusions")),
+    )
 
 
 def _execute_continue_action(identifier: str, action: dict[str, Any]) -> str:
@@ -9132,6 +9284,7 @@ def resume_review_locked(
                 + ", ".join(invalid_reports)
             )
         print(f"Review resumed and completed: {run_dir}")
+        print(completed_review_next_guidance(run_dir, metadata))
         return 0
     except ReviewError as exc:
         current_status = read_json(run_dir / "metadata.json").get("status")
@@ -9923,17 +10076,7 @@ def run_review_command(args: argparse.Namespace) -> int:
                 "Reviewer output failed the report contract: "
                 + ", ".join(sorted(set(invalid_reports)))
             )
-        if args.phase == "supplemental":
-            print(
-                "Next: decide every finding and test gap, then finalize this "
-                "supplemental evidence. It does not replace the parent gate."
-            )
-        else:
-            print(
-                "Next: decide every finding and test gap with `mm-review decide` "
-                "or `decide-batch`. Repair rounds lead to another repair or the "
-                "mandatory confirmation round; only confirmation can be finalized."
-            )
+        print(completed_review_next_guidance(run_dir, metadata))
         return 0
     except KeyboardInterrupt:
         update_metadata(
