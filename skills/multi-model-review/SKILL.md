@@ -371,6 +371,31 @@ invalidates the gate. If attestation fails, report that failure explicitly;
 do not imply that the commit was bound merely because the branch head matches
 its remote.
 
+When the user explicitly authorizes both commit and push, also produce a
+concise, paste-ready GitHub PR description after the push. This is part of the
+handoff even when the user does not separately ask for PR copy; it does not
+authorize opening or updating a PR. Base the description on the verified task
+evidence and choose the matching shape:
+
+- Evidence-based fix: `## Production evidence` gives the shortest useful
+  causal timeline, impact/scope, and relevant current state; `## Fix` explains
+  the behavior changed and the invariant now enforced.
+- Fix without production evidence: `## Summary` explains the defect, impact,
+  and verified root cause when known; `## Fix` explains the behavioral
+  correction and why it addresses the problem.
+- New feature: `## Summary` states the capability and why it exists;
+  `## What changed` lists the important user-visible behavior, invariants, and
+  operational controls.
+
+Use only verified facts. Never manufacture production evidence or turn an
+inference into a timeline claim. Prefer exact timestamps, counts, and durable
+identifiers only when they materially establish causality or scope and are safe
+to publish. Optimize for a human or AI reading the old PR later: preserve the
+problem, why it happened, and the resulting behavior. Omit routine test-pass
+lists, changed-file inventories, review workflow metadata, and low-level
+implementation detail. Mention compatibility, rollout, migration, or known
+limitations only when they materially affect the merge decision.
+
 Do not commit, push, open a PR, deploy, or change production state unless the
 user separately authorizes it.
 

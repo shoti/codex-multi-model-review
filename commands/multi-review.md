@@ -141,6 +141,9 @@ Before finishing:
   `mm-review attest-commit --run <run-dir> --commit HEAD` and verify again.
 - distinguish a fresh local `ready` gate from `deployment_ready`; neither state
   proves live runtime or external-side-effect success without separate evidence.
+- when the user explicitly authorizes commit and push, provide a concise,
+  paste-ready GitHub PR description after pushing. Do not treat that authority
+  as permission to open or update a PR.
 
 ## Summary
 
@@ -166,3 +169,16 @@ finish; do not expose it in reviewer prompts.
 
 Suggest commit or merge only when the result is ready, but do not perform either
 without explicit permission.
+
+After an authorized commit and push, select the PR-description structure that
+matches the work:
+
+- evidence-based fix: `Production evidence` and `Fix`;
+- fix without production evidence: `Summary` and `Fix`;
+- new feature: `Summary` and `What changed`.
+
+Keep only verified, durable context: the problem and impact, causal evidence or
+root cause, and the resulting behavior or invariants. Omit routine test lists,
+file inventories, review metadata, and incidental implementation detail. Use
+exact timestamps, counts, or identifiers only when they materially prove
+causality or scope and are safe to publish. Never invent production evidence.

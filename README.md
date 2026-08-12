@@ -174,6 +174,8 @@ The normal Codex-driven flow is:
    workflow so its state becomes explicitly `completed`.
 9. If authorized later, attest the unchanged reviewed snapshot to its commit.
    A local source gate and a deployment-bound gate are reported separately.
+10. When the user authorizes commit and push, provide concise, paste-ready PR
+    copy focused on the problem, evidence or root cause, and resulting behavior.
 
 If the confirmation reviewer reports incomplete coverage, finalization stops.
 Run another independent review or inspect every disclosed path and limitation,
@@ -645,6 +647,11 @@ providers.
 - A later scoped edit requires a new workflow after confirmation.
 - Commits, pushes, merges, deployments, migrations, backfills, messages, and
   live transactions remain outside the plugin's authority.
+- An explicit commit-and-push request produces a concise GitHub PR description,
+  but does not authorize opening or updating the PR. Evidence-based fixes use
+  `Production evidence` and `Fix`; ordinary fixes use `Summary` and `Fix`; new
+  features use `Summary` and `What changed`. Routine test and file inventories
+  are intentionally omitted unless they materially affect the merge decision.
 
 ## Contributing and security
 
