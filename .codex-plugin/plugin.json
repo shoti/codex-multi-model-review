@@ -1,6 +1,6 @@
 {
   "name": "multi-model-review",
-  "version": "0.1.0+codex.20260811200745",
+  "version": "0.1.0+codex.20260812091439",
   "description": "Run resumable task-scoped reviews with provider-allowance controls, locked Codex triage, mandatory confirmation, and fresh final gates.",
   "author": {
     "name": "Shoti",
@@ -20,14 +20,15 @@
   "interface": {
     "displayName": "Multi-Model Review",
     "shortDescription": "Auditable multi-model review",
-    "longDescription": "Codex implements and verifies. Structured Claude, optional Antigravity, and optional Kimi inspect immutable repository snapshots in read-only sessions. Workflows use provider-allowance and readiness controls, preserve and resume partial results, pin task scope, record typed failures and evidence-backed triage, require confirmation, and verify commit-aware freshness.",
+    "longDescription": "Codex implements and verifies. Structured Claude, optional Antigravity, and optional Kimi inspect immutable repository snapshots in read-only sessions. Workflows use provider-allowance and readiness controls, preserve and resume partial results, pin task scope, record typed failures and evidence-backed triage, require confirmation, verify commit-aware freshness, and support commit-and-push GitHub PR handoffs.",
     "developerName": "Shoti",
     "category": "Developer Tools",
     "capabilities": [
       "Read-only external reviews",
       "Auditable finding triage",
       "Resumable partial reviews",
-      "Freshness-checked final gates"
+      "Freshness-checked final gates",
+      "Commit-and-push GitHub PR handoffs"
     ],
     "defaultPrompt": [
       "Review my task-scoped changes with provider-allowance controls, decide every finding and test gap, then complete a mandatory confirmation gate.",
