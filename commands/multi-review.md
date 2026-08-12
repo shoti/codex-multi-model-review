@@ -141,9 +141,9 @@ Before finishing:
   `mm-review attest-commit --run <run-dir> --commit HEAD` and verify again.
 - distinguish a fresh local `ready` gate from `deployment_ready`; neither state
   proves live runtime or external-side-effect success without separate evidence.
-- when the user explicitly authorizes commit and push, provide a concise,
-  paste-ready GitHub PR description after pushing. Do not treat that authority
-  as permission to open or update a PR.
+- when the user explicitly authorizes commit and push, generate a concise
+  GitHub PR description after pushing and create the branch's PR or update its
+  open PR. Do not treat that authority as permission for unrelated PR changes.
 
 ## Summary
 
@@ -183,13 +183,14 @@ file inventories, review metadata, and incidental implementation detail. Use
 exact timestamps, counts, or identifiers only when they materially prove
 causality or scope and are safe to publish. Never invent production evidence.
 
-Writing that description to GitHub requires separate explicit authority to
-create/open the PR or update its description; `commit and push` alone is not
-enough. Before any write, use `gh auth status` and read-only `gh pr view` to
-verify the account, repository, branch, pushed HEAD, base branch, existing PR,
-and current body. Never print or retrieve the token. Do not silently create a
-PR when only an update was authorized, and do not overwrite material human
-content without showing the proposed replacement and obtaining approval.
+An explicit request to commit and push also authorizes writing the generated
+description to GitHub for that branch. Update its open PR, or create a new PR
+against the verified base branch when none is open. A commit-only, push-only,
+or copy-only request does not authorize a PR write. Before any write, use
+`gh auth status` and read-only PR lookup to verify the account, repository,
+branch, pushed HEAD, base branch, existing PR state, and current body. Never
+print or retrieve the token. Do not overwrite material human content without
+showing the proposed replacement and obtaining approval.
 
 Use explicit `gh pr create --base ... --head ... --title ... --body-file ...`
 or `gh pr edit --body-file ...` with a private temporary body file. Remove the

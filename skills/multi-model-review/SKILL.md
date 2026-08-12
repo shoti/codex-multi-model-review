@@ -372,10 +372,10 @@ do not imply that the commit was bound merely because the branch head matches
 its remote.
 
 When the user explicitly authorizes both commit and push, also produce a
-concise, paste-ready GitHub PR description after the push. This is part of the
-handoff even when the user does not separately ask for PR copy; it does not
-authorize opening or updating a PR. Base the description on the verified task
-evidence and choose the matching shape:
+concise GitHub PR description after the push and write it to the branch's open
+PR, or create the PR when none is open. This is part of the handoff even when
+the user does not separately ask for PR copy. Base the description on the
+verified task evidence and choose the matching shape:
 
 - Evidence-based fix: `## Production evidence` gives the shortest useful
   causal timeline, impact/scope, and relevant current state; `## Fix` explains
@@ -396,17 +396,21 @@ lists, changed-file inventories, review workflow metadata, and low-level
 implementation detail. Mention compatibility, rollout, migration, or known
 limitations only when they materially affect the merge decision.
 
-GitHub PR writes require separate, explicit authority and an authenticated
-GitHub CLI. `commit and push` alone never authorizes creating or editing a PR.
-When the user explicitly asks to open/create a PR or update its description:
+An explicit request to commit and push also authorizes creating the branch's PR
+with the generated description or updating its open PR. A commit-only,
+push-only, or copy-only request does not authorize a PR write. An explicit
+open/create/update-PR request remains sufficient authority as well. These writes
+require an authenticated GitHub CLI:
 
 1. Run `gh auth status --hostname github.com` without printing or retrieving the
    token. Verify the authenticated account, repository owner/name, remote,
    current branch, pushed HEAD, and intended base branch. Stop and ask if any of
    them are ambiguous or mismatched.
-2. Use `gh pr view --json number,url,state,title,body,baseRefName,headRefName`
-   first. If the user authorized only an update and no open PR exists, stop;
-   never silently create one. If an existing body contains material human
+2. Look up open PRs for the exact head branch before writing. If one exists,
+   read its number, URL, state, title, body, base, and head. If none is open, a
+   commit-and-push or create-PR request authorizes creating one against the
+   verified base; an update-only request does not. Never reopen a closed PR
+   unless explicitly requested. If an open PR body contains material human
    content rather than only the repository's blank template, show the proposed
    replacement and obtain explicit approval before overwriting it.
 3. Create with explicit `--base`, `--head`, `--title`, and `--body-file`, or
@@ -420,12 +424,13 @@ When the user explicitly asks to open/create a PR or update its description:
 5. Read the PR back with `gh pr view` and verify the URL, base/head branches,
    title, and exact body. Report any mismatch or partial failure.
 
-If GitHub CLI is missing, unauthenticated, or lacks access, stop with the exact
-readiness problem. Still provide paste-ready PR copy, but never claim the
-description was assigned on GitHub.
+If GitHub CLI is missing, unauthenticated, or lacks access, stop the PR handoff
+with the exact readiness problem after preserving any successful commit and
+push. Still provide paste-ready PR copy, but never claim the description was
+assigned on GitHub.
 
 Do not commit, push, open a PR, deploy, or change production state unless the
-user separately authorizes it.
+user authorizes the applicable handoff as described above.
 
 ## Control reviewers
 
