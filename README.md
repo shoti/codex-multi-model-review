@@ -81,6 +81,8 @@ flowchart TD
 - Git.
 - A current Codex CLI with `codex plugin` support.
 - At least one installed and authenticated reviewer CLI.
+- GitHub CLI (`gh`), authenticated, only when Codex should create or update a
+  pull request.
 
 The runner has no third-party Python dependencies.
 It fails immediately with an actionable version error before creating a
@@ -177,6 +179,11 @@ The normal Codex-driven flow is:
    workflow so its state becomes explicitly `completed`.
 9. If authorized later, attest the unchanged reviewed snapshot to its commit.
    A local source gate and a deployment-bound gate are reported separately.
+10. When the user authorizes commit and push, generate concise PR copy focused
+    on the problem, evidence or root cause, and resulting behavior, then create
+    the branch's PR with that description or update its open PR. Verify the
+    account, repository, branches, existing body, and post-write result with
+    GitHub CLI; no other PR mutations are implied.
 
 If the confirmation reviewer reports incomplete coverage, finalization stops.
 Run another independent review or inspect every disclosed path and limitation,
@@ -654,6 +661,16 @@ providers.
 - A later scoped edit requires a new workflow after confirmation.
 - Commits, pushes, merges, deployments, migrations, backfills, messages, and
   live transactions remain outside the plugin's authority.
+- An explicit commit-and-push request produces a concise GitHub PR description
+  and authorizes creating the branch's PR or updating its open PR. Evidence-based
+  fixes use `Production evidence` and `Fix`; ordinary fixes use `Summary` and
+  `Fix`; new features use `Summary` and `What changed`. Routine test and file
+  inventories are intentionally omitted unless they materially affect the merge
+  decision.
+- The workflow verifies account/repository/branch targeting, protects material
+  existing descriptions from silent overwrite, uses a private body file, reads
+  the result back, and never treats commit-and-push authority as permission for
+  reviewers, labels, comments, merges, or other GitHub changes.
 
 ## Contributing and security
 
