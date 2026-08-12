@@ -74,6 +74,7 @@ _COMMAND_LINEAGE_GROUPS: dict[str, set[str]] | None = None
 _COMMAND_LINEAGE_GROUPS_READY = False
 MINIMUM_PYTHON = (3, 12)
 SKILL_DIR = Path(__file__).resolve().parent.parent
+PLUGIN_ROOT = SKILL_DIR.parents[1]
 KIMI_AGENT_PATH = SKILL_DIR / "references" / "kimi-reviewer.md"
 ANTIGRAVITY_AGENT_PATH = SKILL_DIR / "references" / "antigravity-agent.md"
 ANTIGRAVITY_AGENT_NAME = "codex-multi-model-review-read-only-v1"
@@ -348,6 +349,24 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ReviewError(f"Expected a JSON object in {path}.")
     return value
+
+
+def runtime_identity(
+    *,
+    plugin_root: Path | None = None,
+    runner_path: Path | None = None,
+) -> dict[str, str]:
+    """Identify the exact plugin bundle and runner producing an artifact."""
+    root = (plugin_root or PLUGIN_ROOT).resolve()
+    runner = (runner_path or Path(__file__)).resolve()
+    manifest = read_json(root / ".codex-plugin" / "plugin.json")
+    return {
+        "plugin_name": str(manifest.get("name") or "unknown"),
+        "plugin_version": str(manifest.get("version") or "unknown"),
+        "plugin_root": str(root),
+        "runner_path": str(runner),
+        "runner_sha256": sha256_file(runner),
+    }
 
 
 def safe_write_json(path: Path, value: dict[str, Any]) -> None:
@@ -1928,6 +1947,15 @@ verify the exact operation shape, option nesting, and postconditions against
 types, official contracts, or established repository patterns. A mocked
 "method was called" test is insufficient when malformed options can silently
 turn a write into a no-op; require a behavior-level assertion where practical.
+
+When changed control flow adds or moves a loop, trace every helper called from
+that loop far enough to identify hidden database, network, filesystem, broker,
+queue, or model I/O. Calculate the reachable call-count scaling across nested
+dimensions such as recipients, cohorts, steps, variants, retries, and pages. A
+new N-times or N-by-M external-I/O amplification is a production-operability
+finding when reachable; do not demote it to an unbenchmarked note or test gap
+merely because latency was not measured. Ask for a bounded call-count or
+behavior-level regression when it protects the changed invariant.
 
 Return Markdown using this exact structure:
 
@@ -5175,6 +5203,7 @@ def historical_budget_estimate(
             recommended is not None and configured_budget_usd < recommended
         ),
         "minimum_viable_launch_guard_enforced": True,
+        "last_chance_recommendation_guard_enforced": True,
         "automatic_policy_change": False,
     }
 
@@ -5211,6 +5240,165 @@ def minimum_viable_reviewer_budget(
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return MIN_CLAUDE_REVIEW_BUDGET_USD
     return max(MIN_CLAUDE_REVIEW_BUDGET_USD, float(value))
+
+
+def required_successful_provider_rounds(phase: str) -> int:
+    """Return the minimum provider calls still needed from this launch point."""
+    return 2 if phase == "repair" else 1
+
+
+def review_admission_assessment(
+    reviewers: Sequence[Reviewer],
+    *,
+    phase: str,
+    workflow_budget: dict[str, Any] | None,
+    budget_estimates: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Assess whether a provider run can still reach a compliant final gate."""
+    assessment: dict[str, Any] = {
+        "phase": phase,
+        "blocked": False,
+        "providers": [],
+    }
+    if (
+        not isinstance(workflow_budget, dict)
+        or workflow_budget.get("mode") != "provider_allowance"
+    ):
+        return assessment
+
+    maximum = workflow_budget.get("max_attempts_per_provider")
+    attempts_before = workflow_budget.get("attempts_before_run")
+    reserved_before = workflow_budget.get("reserved_before_run")
+    if not isinstance(maximum, int):
+        return assessment
+    attempts_before = attempts_before if isinstance(attempts_before, dict) else {}
+    reserved_before = reserved_before if isinstance(reserved_before, dict) else {}
+    required = required_successful_provider_rounds(phase)
+
+    for reviewer in reviewers:
+        used = int(attempts_before.get(reviewer.name) or 0)
+        reserved = int(reserved_before.get(reviewer.name) or 0)
+        remaining = max(0, maximum - used - reserved)
+        recovery_headroom = max(0, remaining - required)
+        estimate = budget_estimates.get(reviewer.name)
+        recommendation = (
+            estimate.get("recommended_budget_usd")
+            if isinstance(estimate, dict)
+            else None
+        )
+        configured = (
+            estimate.get("configured_budget_usd")
+            if isinstance(estimate, dict)
+            else None
+        )
+        sample_count = int(estimate.get("sample_count") or 0) if estimate else 0
+        confidence = str(estimate.get("confidence") or "low") if estimate else "low"
+        recommendation_is_actionable = (
+            reviewer.name == "claude"
+            and isinstance(recommendation, (int, float))
+            and not isinstance(recommendation, bool)
+            and isinstance(configured, (int, float))
+            and not isinstance(configured, bool)
+            and sample_count >= MIN_BUDGET_ESTIMATE_SAMPLES
+            and confidence in {"medium", "high"}
+        )
+        below_recommendation = bool(
+            recommendation_is_actionable
+            and float(configured) < float(recommendation)
+        )
+        insufficient_attempts = remaining < required
+        no_recovery_underfunded = remaining == required and below_recommendation
+        blocked = insufficient_attempts or no_recovery_underfunded
+        provider_assessment = {
+            "provider": reviewer.name,
+            "attempts_before": used,
+            "reserved_before": reserved,
+            "max_attempts": maximum,
+            "attempts_remaining_before_run": remaining,
+            "required_successful_rounds": required,
+            "recovery_attempts_after_required_rounds": recovery_headroom,
+            "configured_budget_usd": configured,
+            "recommended_budget_usd": recommendation,
+            "budget_evidence_samples": sample_count,
+            "budget_evidence_confidence": confidence,
+            "configured_below_recommendation": below_recommendation,
+            "blocked": blocked,
+            "block_reason": (
+                "insufficient_attempts"
+                if insufficient_attempts
+                else "underfunded_without_recovery_headroom"
+                if no_recovery_underfunded
+                else None
+            ),
+        }
+        assessment["providers"].append(provider_assessment)
+        assessment["blocked"] = bool(assessment["blocked"] or blocked)
+    return assessment
+
+
+def enforce_review_admission(
+    assessment: dict[str, Any],
+    *,
+    workflow_id: str,
+) -> None:
+    blocked = [
+        item
+        for item in assessment.get("providers", [])
+        if isinstance(item, dict) and item.get("blocked")
+    ]
+    if not blocked:
+        return
+
+    details: list[str] = []
+    required_limit = 0
+    for item in blocked:
+        provider = str(item["provider"])
+        used = int(item["attempts_before"])
+        reserved = int(item["reserved_before"])
+        required = int(item["required_successful_rounds"])
+        remaining = int(item["attempts_remaining_before_run"])
+        required_limit = max(required_limit, used + reserved + required + 1)
+        if item["block_reason"] == "insufficient_attempts":
+            details.append(
+                f"{provider} has {remaining} attempt(s) remaining but {required} "
+                "successful round(s) are still required"
+            )
+            continue
+        details.append(
+            f"{provider} has no recovery attempt beyond the {required} required "
+            f"round(s), while its configured API-equivalent stop "
+            f"${float(item['configured_budget_usd']):.2f} is below the "
+            f"${float(item['recommended_budget_usd']):.2f} historical "
+            f"recommendation ({item['budget_evidence_samples']} samples, "
+            f"{item['budget_evidence_confidence']} confidence)"
+        )
+
+    budget_override = next(
+        (
+            float(item["recommended_budget_usd"])
+            for item in blocked
+            if item.get("block_reason") == "underfunded_without_recovery_headroom"
+        ),
+        None,
+    )
+    alternatives = []
+    if budget_override is not None:
+        alternatives.append(
+            f"rerun with --claude-max-budget-usd {budget_override:.2f}"
+        )
+    alternatives.append(
+        "increase audited recovery headroom with `mm-review workflow "
+        f"raise-provider-attempt-limit {workflow_id} --to {required_limit} "
+        "--reason \"reserve review recovery headroom\"`"
+    )
+    raise ReviewError(
+        f"Workflow {workflow_id} review admission blocked before invoking a "
+        "provider: "
+        + "; ".join(details)
+        + ". No provider was started; "
+        + " or ".join(alternatives)
+        + "."
+    )
 
 
 def reviewer_command_value(reviewer: Reviewer, flag: str) -> str | None:
@@ -6786,6 +6974,14 @@ def provider_readiness(
 
 def status_command(_: argparse.Namespace) -> int:
     config = load_config()
+    identity = runtime_identity()
+    print(
+        "Runtime: "
+        f"plugin={identity['plugin_name']} "
+        f"version={identity['plugin_version']} "
+        f"runner_sha256={identity['runner_sha256']} "
+        f"root={identity['plugin_root']}"
+    )
     print(f"Config: {CONFIG_PATH}")
     ready = True
     for provider in PROVIDERS:
@@ -7188,6 +7384,7 @@ def doctor_command(args: argparse.Namespace) -> int:
                 "ready": ready,
                 "live_probe": bool(args.live),
                 "checked_at": utc_now(),
+                "runtime_identity": runtime_identity(),
                 "checks": checks,
             },
             indent=2,
@@ -9266,6 +9463,7 @@ def run_review_command(args: argparse.Namespace) -> int:
                 if args.sensitive_scan_token
                 else "none"
             ),
+            "runtime_identity": runtime_identity(),
         }
         safe_write_json(run_dir / "metadata.json", metadata)
 
@@ -9335,6 +9533,25 @@ def run_review_command(args: argparse.Namespace) -> int:
             minimum_provider_budget_usd=minimum_viable_reviewer_budget(
                 budget_estimates, "claude"
             ),
+        )
+        review_admission = review_admission_assessment(
+            reviewers,
+            phase=args.phase,
+            workflow_budget=workflow_budget,
+            budget_estimates=budget_estimates,
+        )
+        metadata["budget_estimates"] = budget_estimates
+        metadata["workflow_usage"] = (
+            workflow_budget
+            if isinstance(workflow_budget, dict)
+            and workflow_budget.get("mode") == "provider_allowance"
+            else None
+        )
+        metadata["review_admission"] = review_admission
+        safe_write_json(run_dir / "metadata.json", metadata)
+        enforce_review_admission(
+            review_admission,
+            workflow_id=selected_workflow,
         )
         attempt_headroom_warnings: list[dict[str, Any]] = []
         if (

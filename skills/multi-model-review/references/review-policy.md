@@ -74,6 +74,14 @@ Examples:
 A green mock-based suite is not proof when the production adapter can silently
 accept a malformed call as a no-op.
 
+When changed control flow introduces or expands a loop, trace the helpers inside
+it for hidden database, network, filesystem, broker, queue, or model I/O. Bound
+the call count across the real cardinalities (for example recipients, cohorts,
+steps, variants, retries, and pages). Reachable N-times or N-by-M external-I/O
+amplification is a production-operability finding even without a benchmark; do
+not reject the corresponding test gap as speculative until the helper I/O and
+cardinality have been inspected.
+
 ## Coverage completeness
 
 Every new reviewer report must declare whether it read every changed file and

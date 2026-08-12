@@ -29,6 +29,9 @@ repository. Do not stop after collecting reviewer reports.
 5. Run `mm-review doctor` and stop if the plugin/cache or an enabled reviewer is
    not ready. Use `mm-review doctor --live` before the first allowance-consuming run
    in a session or after a provider failure.
+   Inspect the reported plugin version, root, runner path, and SHA-256. During
+   plugin development, invoke the intended source runner directly so a stale
+   installed bundle cannot masquerade as the reviewed implementation.
    Antigravity readiness must prove authenticated model access, not only that
    `agy` exists on PATH.
    If a crashed process leaves an orphaned running artifact, verify the recorded
@@ -118,6 +121,11 @@ than assuming the macOS `/usr/bin/python3` is supported.
    Check `continue` for confirmation recovery-headroom warnings. If needed,
    explicitly increase the ceiling with `workflow raise-provider-attempt-limit
    --to <count> --reason <reason>`; never hide the change or lower the ceiling.
+   A repair must retain an attempt for mandatory confirmation. If only the
+   required repair and confirmation attempts remain, use Claude's recorded
+   historical recommendation or restore an audited recovery attempt before
+   invoking a provider. The same rule applies to an underfunded final
+   confirmation attempt; the runner enforces both before allowance is consumed.
 8. Use `mm-review continue <workflow-id>` for a read-only next-action plan.
    Add `--execute-review` only when provider allowance may be consumed. Use
    `mm-review gate <workflow-id>` to consolidate Codex finalization,

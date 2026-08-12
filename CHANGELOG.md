@@ -7,6 +7,13 @@ All notable user-visible changes are documented here. This project follows
 
 ### Fixed
 
+- Block repair before provider invocation when the remaining attempt allowance
+  cannot reach mandatory confirmation, or when a last-chance Claude call is
+  below a medium/high-confidence historical stop recommendation. Preserve the
+  evidence in the preflight artifact without consuming an attempt, including
+  for an underfunded final confirmation attempt.
+- Make external-I/O amplification inside changed loops an explicit reviewer and
+  Codex-triage concern instead of an unbenchmarked note or speculative test gap.
 - Isolate every provider in a per-attempt input directory so resumed reviewers
   cannot read peer reports, Codex triage, workflow summaries, or run metadata.
 - Restore tracked `export-ignore` files to immutable snapshots from raw Git
@@ -29,6 +36,8 @@ All notable user-visible changes are documented here. This project follows
 
 ### Added
 
+- Record the exact plugin name/version, bundle root, runner path, and runner
+  SHA-256 in diagnostics, status output, and every run artifact.
 - Add provenance-bound `--exclude-snapshot-path` support for exact unchanged
   tracked sensitive files, with pinned contracts, freshness/resume validation,
   manifest disclosure, and mandatory Codex coverage compensation.
