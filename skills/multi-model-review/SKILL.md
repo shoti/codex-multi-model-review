@@ -50,10 +50,18 @@ mm-review budget-estimate --uncommitted \
   --review-mode <fast|balanced|deep> --claude-effort <effort>
 ```
 
-Treat the recommendation as advisory. Never lower review quality from historical
-usage evidence. The runner records provider authentication mode, readiness,
-attempts, quota cooldowns, and tokens; remaining subscription allowance stays
-`unknown` when a provider does not expose it.
+Treat the recommendation as advisory while ordinary recovery headroom remains.
+When a repair has exactly enough attempts left for repair plus mandatory
+confirmation, or confirmation has only its final allowed attempt, the runner
+fails closed before provider invocation if Claude's configured stop is below a
+medium/high-confidence recommendation. It also blocks any repair that cannot
+leave an attempt for confirmation. Raise the one-run stop to the recorded
+recommendation or use the audited
+`workflow raise-provider-attempt-limit` command to restore recovery headroom.
+Never lower review quality from historical usage evidence. The runner records
+provider authentication mode, readiness, attempts, quota cooldowns, and tokens;
+remaining subscription allowance stays `unknown` when a provider does not
+expose it.
 
 3. Run repair round 1 in each affected repository. Round numbering is automatic
    when `--round` is omitted. Prefer repeatable `--path` filters over temporary
@@ -496,6 +504,10 @@ bundled Python command. Run `doctor` before the first review in a session when
 CLI availability or model configuration is uncertain. It checks plugin/cache
 parity, private storage modes, CLI flags, and static readiness; `doctor --live`
 adds a tiny Claude probe capped at $0.10 and probes any other enabled provider.
+Inspect the reported runtime plugin version, root, runner path, and SHA-256.
+Artifacts persist the same identity. During local plugin development, invoke
+the intended source runner directly; a cached runner can prove parity only for
+the bundle it belongs to, not that a separate source checkout is newer.
 Interrupted reviews terminate their child process groups and are marked failed.
 If a crash leaves running metadata whose recorded PID is no longer alive, use
 `recover`; it refuses to overwrite a live process. Status calls `agy models`, so

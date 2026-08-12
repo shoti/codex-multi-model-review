@@ -321,6 +321,31 @@ class FakeProviderHarness:
 
 
 class RunnerUnitTests(unittest.TestCase):
+    def test_runtime_identity_records_exact_bundle_and_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "plugin"
+            manifest = root / ".codex-plugin" / "plugin.json"
+            runner = root / "skills" / "review" / "scripts" / "runner.py"
+            manifest.parent.mkdir(parents=True)
+            runner.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps({"name": "review-test", "version": "1.2.3"}),
+                encoding="utf-8",
+            )
+            runner.write_text("print('runner')\n", encoding="utf-8")
+
+            identity = MM.runtime_identity(
+                plugin_root=root,
+                runner_path=runner,
+            )
+            expected_runner_sha256 = MM.sha256_file(runner)
+
+        self.assertEqual(identity["plugin_name"], "review-test")
+        self.assertEqual(identity["plugin_version"], "1.2.3")
+        self.assertEqual(identity["plugin_root"], str(root.resolve()))
+        self.assertEqual(identity["runner_path"], str(runner.resolve()))
+        self.assertEqual(identity["runner_sha256"], expected_runner_sha256)
+
     def test_main_rejects_unsupported_python_before_argument_parsing(self) -> None:
         error = io.StringIO()
         with (
@@ -3500,6 +3525,10 @@ None.
         )
         self.assertIn("# Coverage", prompt)
         self.assertIn("Do not hide incomplete coverage in Notes", prompt)
+        self.assertIn("trace every helper called from that loop", collapsed_prompt)
+        self.assertIn(
+            "N-times or N-by-M external-I/O amplification", collapsed_prompt
+        )
 
         structured_gap = MM.parse_review_report(
             "kimi",
@@ -4334,6 +4363,148 @@ None.
                 reserved=0.0,
                 minimum_provider_budget_usd=1.10,
             )
+
+    def test_repair_admission_blocks_underfunded_last_chance(self) -> None:
+        reviewer = MM.Reviewer(
+            "claude",
+            ("claude", "--max-budget-usd", "1.25"),
+            {},
+            "sonnet",
+            "fake",
+        )
+        assessment = MM.review_admission_assessment(
+            [reviewer],
+            phase="repair",
+            workflow_budget={
+                "mode": "provider_allowance",
+                "max_attempts_per_provider": 6,
+                "attempts_before_run": {"claude": 4},
+                "reserved_before_run": {"claude": 0},
+            },
+            budget_estimates={
+                "claude": {
+                    "configured_budget_usd": 1.25,
+                    "recommended_budget_usd": 1.82,
+                    "sample_count": 261,
+                    "confidence": "high",
+                }
+            },
+        )
+
+        provider = assessment["providers"][0]
+        self.assertTrue(assessment["blocked"])
+        self.assertEqual(
+            provider["block_reason"], "underfunded_without_recovery_headroom"
+        )
+        self.assertEqual(provider["required_successful_rounds"], 2)
+        self.assertEqual(provider["recovery_attempts_after_required_rounds"], 0)
+        with self.assertRaisesRegex(
+            MM.ReviewError,
+            r"No provider was started.*--claude-max-budget-usd 1\.82.*--to 7",
+        ):
+            MM.enforce_review_admission(assessment, workflow_id="wf-test")
+
+    def test_repair_admission_blocks_when_confirmation_cannot_be_reached(self) -> None:
+        reviewer = MM.Reviewer(
+            "claude",
+            ("claude", "--max-budget-usd", "2.00"),
+            {},
+            "sonnet",
+            "fake",
+        )
+        assessment = MM.review_admission_assessment(
+            [reviewer],
+            phase="repair",
+            workflow_budget={
+                "mode": "provider_allowance",
+                "max_attempts_per_provider": 6,
+                "attempts_before_run": {"claude": 5},
+                "reserved_before_run": {"claude": 0},
+            },
+            budget_estimates={},
+        )
+
+        self.assertTrue(assessment["blocked"])
+        self.assertEqual(
+            assessment["providers"][0]["block_reason"],
+            "insufficient_attempts",
+        )
+        with self.assertRaisesRegex(
+            MM.ReviewError,
+            r"1 attempt\(s\) remaining but 2 successful round\(s\).*--to 8",
+        ):
+            MM.enforce_review_admission(assessment, workflow_id="wf-test")
+
+    def test_repair_admission_allows_recommended_budget_at_exact_headroom(self) -> None:
+        reviewer = MM.Reviewer(
+            "claude",
+            ("claude", "--max-budget-usd", "1.82"),
+            {},
+            "sonnet",
+            "fake",
+        )
+        assessment = MM.review_admission_assessment(
+            [reviewer],
+            phase="repair",
+            workflow_budget={
+                "mode": "provider_allowance",
+                "max_attempts_per_provider": 6,
+                "attempts_before_run": {"claude": 4},
+                "reserved_before_run": {"claude": 0},
+            },
+            budget_estimates={
+                "claude": {
+                    "configured_budget_usd": 1.82,
+                    "recommended_budget_usd": 1.82,
+                    "sample_count": 261,
+                    "confidence": "high",
+                }
+            },
+        )
+
+        self.assertFalse(assessment["blocked"])
+        MM.enforce_review_admission(assessment, workflow_id="wf-test")
+
+    def test_confirmation_admission_blocks_underfunded_last_attempt(self) -> None:
+        reviewer = MM.Reviewer(
+            "claude",
+            ("claude", "--max-budget-usd", "1.25"),
+            {},
+            "sonnet",
+            "fake",
+        )
+        assessment = MM.review_admission_assessment(
+            [reviewer],
+            phase="confirmation",
+            workflow_budget={
+                "mode": "provider_allowance",
+                "max_attempts_per_provider": 6,
+                "attempts_before_run": {"claude": 5},
+                "reserved_before_run": {"claude": 0},
+            },
+            budget_estimates={
+                "claude": {
+                    "configured_budget_usd": 1.25,
+                    "recommended_budget_usd": 1.82,
+                    "sample_count": 261,
+                    "confidence": "high",
+                }
+            },
+        )
+
+        provider = assessment["providers"][0]
+        self.assertTrue(assessment["blocked"])
+        self.assertEqual(assessment["phase"], "confirmation")
+        self.assertEqual(provider["required_successful_rounds"], 1)
+        self.assertEqual(provider["attempts_remaining_before_run"], 1)
+        self.assertEqual(
+            provider["block_reason"], "underfunded_without_recovery_headroom"
+        )
+        with self.assertRaisesRegex(
+            MM.ReviewError,
+            r"1 required round\(s\).*--claude-max-budget-usd 1\.82.*--to 7",
+        ):
+            MM.enforce_review_admission(assessment, workflow_id="wf-test")
 
     def test_supplemental_siblings_share_parent_lineage_reservations(self) -> None:
         reviewer = MM.Reviewer(
@@ -7592,6 +7763,132 @@ None.
 
 
 class RunnerEndToEndTests(unittest.TestCase):
+    def test_last_chance_budget_guard_blocks_without_consuming_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "admission-repo"
+            repo.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            harness = FakeProviderHarness(root)
+            history_root = (
+                harness.home / ".codex" / "review-runs" / "historical-repo"
+            )
+            for index in range(5):
+                run_dir = history_root / f"history-{index}"
+                run_dir.mkdir(parents=True)
+                (run_dir / "change.patch").write_text(
+                    "x" * 100, encoding="utf-8"
+                )
+                MM.safe_write_json(
+                    run_dir / "metadata.json",
+                    {
+                        "created_at": MM.utc_now(),
+                        "review_mode": "deep",
+                        "review_policy": {"claude_effort": "medium"},
+                        "reviewers": {
+                            "claude": {
+                                "model": "sonnet",
+                                "exit_code": 0,
+                                "verdict": "PASS_CLEAN",
+                                "report_contract_valid": True,
+                                "failure_category": None,
+                                "usage": {"total_cost_usd": 2.0},
+                            }
+                        },
+                    },
+                )
+
+            workflow = harness.cli(
+                repo,
+                "workflow",
+                "start",
+                "--review-mode",
+                "deep",
+                "--max-provider-attempts",
+                "2",
+            ).stdout.strip()
+            blocked = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--uncommitted",
+                "--workflow-id",
+                workflow,
+                "--phase",
+                "repair",
+                "--path",
+                "src/feature.py",
+                "--task",
+                "Exercise the final-attempt admission guard.",
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+
+            self.assertEqual(blocked.returncode, 2)
+            self.assertIn("review admission blocked", blocked.stderr)
+            self.assertIn("No provider was started", blocked.stderr)
+            self.assertIn("--claude-max-budget-usd 2.50", blocked.stderr)
+            self.assertEqual(harness.invocations(), [])
+            blocked_runs = [
+                path
+                for path in harness.run_directories()
+                if MM.read_json(path / "metadata.json").get("status")
+                == "preflight_blocked"
+            ]
+            self.assertEqual(len(blocked_runs), 1)
+            blocked_metadata = MM.read_json(blocked_runs[0] / "metadata.json")
+            self.assertTrue(blocked_metadata["review_admission"]["blocked"])
+            self.assertEqual(
+                blocked_metadata["review_admission"]["providers"][0][
+                    "block_reason"
+                ],
+                "underfunded_without_recovery_headroom",
+            )
+            self.assertIn("runner_sha256", blocked_metadata["runtime_identity"])
+
+            harness.queue("claude", {"kind": "report", "report": structured_report()})
+            completed = harness.cli(
+                repo,
+                "run",
+                "--repo",
+                str(repo),
+                "--uncommitted",
+                "--workflow-id",
+                workflow,
+                "--phase",
+                "repair",
+                "--path",
+                "src/feature.py",
+                "--task",
+                "Exercise the final-attempt admission guard.",
+                "--claude-max-budget-usd",
+                "2.50",
+                "--without-antigravity",
+                "--without-kimi",
+                provider_backed=True,
+            )
+
+            completed_dir = next(
+                path
+                for path in harness.run_directories()
+                if MM.read_json(path / "metadata.json").get("workflow_id")
+                == workflow
+                and MM.read_json(path / "metadata.json").get("status")
+                == "completed"
+            )
+            completed_metadata = MM.read_json(completed_dir / "metadata.json")
+            self.assertEqual(completed_metadata["status"], "completed")
+            self.assertFalse(completed_metadata["review_admission"]["blocked"])
+            self.assertEqual(
+                [item["provider"] for item in harness.invocations()], ["claude"]
+            )
+
     def test_failure_resume_and_attempt_accounting_campaign(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

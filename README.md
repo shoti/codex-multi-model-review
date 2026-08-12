@@ -154,7 +154,10 @@ python3 <plugin-root>/skills/multi-model-review/scripts/mm_review.py doctor
 ```
 
 `mm-review` is an optional local PATH shortcut. The bundled Python command
-always works.
+always works. `doctor` reports the exact plugin version, plugin root, runner
+path, and runner SHA-256; review artifacts persist the same identity. When
+developing the plugin, invoke the intended source runner directly—a cached
+runner can establish parity only with its own installed bundle.
 
 ## Workflow
 
@@ -244,7 +247,13 @@ or stop override instead of silently repeating the same capped attempt.
 Before confirmation, `continue` warns when fewer than three attempts remain for
 an enabled provider. Use `workflow raise-provider-attempt-limit --to <count>
 --reason <reason>` for an explicit increase; the audit record is append-only and
-the command cannot lower the ceiling.
+the command cannot lower the ceiling. A repair is blocked before provider
+invocation if too few attempts remain to reach mandatory confirmation. When
+repair plus confirmation consume all remaining headroom, Claude is also blocked
+if its configured stop is below a medium/high-confidence historical
+recommendation. The same underfunded last-chance guard applies when confirmation
+has only its final allowed attempt. The preflight artifact records the evidence
+and none of these blocks consumes a provider attempt.
 
 Resume holds a run-specific lock for the complete transaction. Overlapping
 attempts against one artifact serialize; after the first succeeds, the next
