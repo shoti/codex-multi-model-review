@@ -35,7 +35,11 @@ small, auditable, and compatible with Python 3.12 or newer on Linux and macOS.
 Run:
 
 ```bash
-python3 -m py_compile skills/multi-model-review/scripts/mm_review.py
+python3 -m py_compile \
+  skills/multi-model-review/scripts/mm_review.py \
+  skills/multi-model-review/scripts/review_contract.py \
+  skills/multi-model-review/scripts/evidence_memory.py \
+  skills/multi-model-review/scripts/review_metrics.py
 python3 skills/multi-model-review/scripts/test_mm_review.py
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 python3 -m json.tool .agents/plugins/marketplace.json >/dev/null

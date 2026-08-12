@@ -37,6 +37,8 @@ jobs:
           python -m py_compile
           skills/multi-model-review/scripts/mm_review.py
           skills/multi-model-review/scripts/review_contract.py
+          skills/multi-model-review/scripts/evidence_memory.py
+          skills/multi-model-review/scripts/review_metrics.py
 
       - name: Validate JSON
         run: |

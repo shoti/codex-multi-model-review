@@ -41,6 +41,7 @@ from evidence_memory import (
     normalized_text,
     rebuild as rebuild_evidence_memory,
     search as search_evidence_memory,
+    search_many as search_evidence_memory_many,
     status as evidence_memory_status,
     upsert_run as upsert_evidence_run,
 )
@@ -65,6 +66,12 @@ PROVIDER_HEALTH_PATH = CONFIG_DIR / "provider-health.json"
 RUNS_DIR = Path.home() / ".codex" / "review-runs"
 WORKFLOWS_DIR = RUNS_DIR / "workflows"
 SENSITIVE_SCANS_DIR = RUNS_DIR / "sensitive-scans"
+_COMMAND_RUN_METADATA_CACHE: list[tuple[Path, dict[str, Any]]] | None = None
+_COMMAND_RUNS_BY_WORKFLOW: dict[str, list[tuple[Path, dict[str, Any]]]] | None = None
+_COMMAND_WORKFLOW_ANCESTRY_CACHE: dict[str, list[str]] | None = None
+_COMMAND_WORKFLOW_ROOT_CACHE: dict[str, str] | None = None
+_COMMAND_LINEAGE_GROUPS: dict[str, set[str]] | None = None
+_COMMAND_LINEAGE_GROUPS_READY = False
 MINIMUM_PYTHON = (3, 12)
 SKILL_DIR = Path(__file__).resolve().parent.parent
 KIMI_AGENT_PATH = SKILL_DIR / "references" / "kimi-reviewer.md"
@@ -204,7 +211,6 @@ SAFE_SECRET_MARKERS = {
     "redacted",
     "sample",
 }
-MAX_SECRET_SCAN_BYTES_PER_FILE = 2 * 1024 * 1024
 MAX_TASK_CHARS = 16_000
 MAX_NOTE_CHARS = 8_000
 GIT_TIMEOUT_SECONDS = 300
@@ -385,6 +391,39 @@ def exclusive_file_lock(target: Path) -> Any:
         yield
 
 
+@contextmanager
+def workflow_query_cache() -> Any:
+    """Reuse one immutable artifact/workflow view during read-only reporting."""
+    global _COMMAND_RUN_METADATA_CACHE
+    global _COMMAND_RUNS_BY_WORKFLOW
+    global _COMMAND_WORKFLOW_ANCESTRY_CACHE
+    global _COMMAND_WORKFLOW_ROOT_CACHE
+    global _COMMAND_LINEAGE_GROUPS
+    global _COMMAND_LINEAGE_GROUPS_READY
+    if _COMMAND_RUN_METADATA_CACHE is not None:
+        yield
+        return
+    run_metadata = all_run_metadata()
+    _COMMAND_RUN_METADATA_CACHE = run_metadata
+    _COMMAND_RUNS_BY_WORKFLOW = {}
+    for item in run_metadata:
+        identifier = str(item[1].get("workflow_id") or "")
+        _COMMAND_RUNS_BY_WORKFLOW.setdefault(identifier, []).append(item)
+    _COMMAND_WORKFLOW_ANCESTRY_CACHE = {}
+    _COMMAND_WORKFLOW_ROOT_CACHE = {}
+    _COMMAND_LINEAGE_GROUPS = {}
+    _COMMAND_LINEAGE_GROUPS_READY = False
+    try:
+        yield
+    finally:
+        _COMMAND_RUN_METADATA_CACHE = None
+        _COMMAND_RUNS_BY_WORKFLOW = None
+        _COMMAND_WORKFLOW_ANCESTRY_CACHE = None
+        _COMMAND_WORKFLOW_ROOT_CACHE = None
+        _COMMAND_LINEAGE_GROUPS = None
+        _COMMAND_LINEAGE_GROUPS_READY = False
+
+
 def run_command(
     command: Sequence[str],
     *,
@@ -416,6 +455,73 @@ def run_command(
             f"Command timed out after {timeout_seconds} seconds in {cwd}: "
             f"{shlex.join(command)}"
         ) from exc
+
+
+def run_bytes_command(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    timeout_seconds: int = GIT_TIMEOUT_SECONDS,
+    input_bytes: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run Git plumbing without decoding repository blob contents."""
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            input=input_bytes,
+            capture_output=True,
+            check=True,
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError as exc:
+        raise ReviewError(f"Required command is unavailable: {command[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or b"").decode(
+            "utf-8", errors="replace"
+        ).strip().splitlines()
+        summary = detail[0] if detail else f"exit code {exc.returncode}"
+        raise ReviewError(
+            f"Command failed in {cwd}: {shlex.join(command)} ({summary})"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ReviewError(
+            f"Command timed out after {timeout_seconds} seconds in {cwd}: "
+            f"{shlex.join(command)}"
+        ) from exc
+
+
+def git_blob_contents(repo: Path, object_ids: Sequence[str]) -> list[bytes]:
+    """Read multiple Git blobs with one filter-free plumbing subprocess."""
+    if not object_ids:
+        return []
+    result = run_bytes_command(
+        ["git", "cat-file", "--batch"],
+        cwd=repo,
+        input_bytes=("\n".join(object_ids) + "\n").encode("ascii"),
+    )
+    contents: list[bytes] = []
+    offset = 0
+    for expected in object_ids:
+        header_end = result.stdout.find(b"\n", offset)
+        if header_end < 0:
+            raise ReviewError("Git blob batch response ended before its header.")
+        header = result.stdout[offset:header_end].split()
+        if len(header) != 3 or header[1] != b"blob":
+            raise ReviewError(f"Git did not return blob content for {expected}.")
+        try:
+            size = int(header[2])
+        except ValueError as exc:
+            raise ReviewError("Git blob batch response had an invalid size.") from exc
+        content_start = header_end + 1
+        content_end = content_start + size
+        if result.stdout[content_end : content_end + 1] != b"\n":
+            raise ReviewError("Git blob batch response ended before its content.")
+        contents.append(result.stdout[content_start:content_end])
+        offset = content_end + 1
+    if offset != len(result.stdout):
+        raise ReviewError("Git blob batch response contained unexpected trailing data.")
+    return contents
 
 
 def load_config() -> dict[str, Any]:
@@ -511,7 +617,13 @@ def write_config(config: dict[str, Any]) -> None:
 def sanitized_failure_text(*values: str) -> str:
     text = "\n".join(value for value in values if value).strip()
     text = re.sub(r"(?i)(bearer\s+)[^\s]+", r"\1***", text)
-    text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "sk-***", text)
+    for rule, pattern in SENSITIVE_CONTENT_PATTERNS.items():
+        text = pattern.sub(f"[REDACTED: {rule}]", text)
+    for rule, pattern in (
+        ("literal secret-like assignment", SECRET_ASSIGNMENT_PATTERN),
+        ("dotenv secret-like assignment", DOTENV_ASSIGNMENT_PATTERN),
+    ):
+        text = pattern.sub(f"[REDACTED: {rule}]", text)
     return text[:2_000]
 
 
@@ -1179,34 +1291,10 @@ def secret_assignment_key(line: str) -> str | None:
 def sensitive_content_findings(
     repo: Path, paths: Sequence[str], patch: str
 ) -> list[SensitiveFinding]:
-    sources: list[tuple[str, str]] = []
-    for relative_path in paths:
-        path = repo / relative_path
-        if not path.is_file() or path.is_symlink():
-            continue
-        try:
-            with path.open("rb") as changed_file:
-                content = changed_file.read(MAX_SECRET_SCAN_BYTES_PER_FILE)
-        except OSError as exc:
-            raise ReviewError(f"Cannot scan {path} for sensitive content: {exc}") from exc
-        if b"\0" not in content:
-            sources.append(
-                (relative_path, content.decode("utf-8", errors="replace"))
-            )
-
-    # Current file contents already cover added/context lines. Scan only deleted
-    # patch lines so removed credentials are still blocked without reporting the
-    # same current fixture once under its source path and again under change.patch.
-    deleted_patch = "\n".join(
-        line[1:] if line.startswith("-") and not line.startswith("---") else ""
-        for line in patch.splitlines()
-    )
-    if deleted_patch.strip():
-        sources.append(("change.patch", deleted_patch))
-
     findings: dict[str, SensitiveFinding] = {}
-    for relative_path, text in sources:
-        for line_number, line in enumerate(text.splitlines(), start=1):
+
+    def scan_lines(relative_path: str, lines: Iterable[str]) -> None:
+        for line_number, line in enumerate(lines, start=1):
             checks: list[tuple[str, re.Pattern[str], int | None]] = [
                 (label, pattern, None)
                 for label, pattern in SENSITIVE_CONTENT_PATTERNS.items()
@@ -1223,16 +1311,14 @@ def sensitive_content_findings(
             )
             for rule, pattern, value_group in checks:
                 match = pattern.search(line)
-                if not match:
+                if match is None:
                     continue
                 if value_group is not None:
                     value = match.group(value_group).lower()
                     if any(marker in value for marker in SAFE_SECRET_MARKERS):
                         continue
-                content_sha256 = sha256_text(line)
-                identity = (
-                    f"{relative_path}:{line_number}:{rule}:{content_sha256}"
-                )
+                content_sha256 = sha256_text(line.rstrip("\r\n"))
+                identity = f"{relative_path}:{line_number}:{rule}:{content_sha256}"
                 identifier = hashlib.sha256(identity.encode()).hexdigest()[:12]
                 findings[identity] = SensitiveFinding(
                     identifier=identifier,
@@ -1242,6 +1328,41 @@ def sensitive_content_findings(
                     key=secret_assignment_key(line),
                     content_sha256=content_sha256,
                 )
+
+    for relative_path in paths:
+        path = repo / relative_path
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            with path.open("rb") as changed_file:
+                is_binary = any(
+                    b"\0" in chunk
+                    for chunk in iter(
+                        lambda: changed_file.read(1024 * 1024), b""
+                    )
+                )
+        except OSError as exc:
+            raise ReviewError(f"Cannot scan {path} for sensitive content: {exc}") from exc
+        if is_binary:
+            continue
+        try:
+            with path.open(encoding="utf-8", errors="replace") as source:
+                scan_lines(relative_path, source)
+        except OSError as exc:
+            raise ReviewError(f"Cannot scan {path} for sensitive content: {exc}") from exc
+
+    # Current file contents already cover added/context lines. Scan only deleted
+    # patch lines so removed credentials are still blocked without reporting the
+    # same current fixture once under its source path and again under change.patch.
+    deleted_patch = "\n".join(
+        line[1:]
+        if line.startswith("-")
+        and not re.match(r"^--- (?:a/|/dev/null)", line)
+        else ""
+        for line in patch.splitlines()
+    )
+    if deleted_patch.strip():
+        scan_lines("change.patch", deleted_patch.splitlines())
     return [findings[key] for key in sorted(findings)]
 
 
@@ -1424,6 +1545,65 @@ def safe_write(path: Path, content: str) -> None:
     path.chmod(0o600)
 
 
+def stage_reviewer_inputs(
+    workspace_dir: Path,
+    run_dir: Path,
+    reviewers: Sequence[Reviewer],
+    *,
+    repo: Path,
+    scope: Scope,
+    task: str | None,
+    risks: Sequence[str],
+    review_profile: str,
+    phase: str,
+) -> dict[str, tuple[Path, str]]:
+    """Create provider-visible inputs outside the private artifact directory."""
+    inputs: dict[str, tuple[Path, str]] = {}
+    input_root = workspace_dir / "reviewer-input"
+    input_root.mkdir(parents=True, mode=0o700)
+    for reviewer in reviewers:
+        provider_dir = input_root / reviewer.name
+        provider_dir.mkdir(mode=0o700)
+        safe_write(
+            provider_dir / "change.patch",
+            (run_dir / "change.patch").read_text(encoding="utf-8"),
+        )
+        safe_write(
+            provider_dir / "manifest.md",
+            (run_dir / "manifest.md").read_text(encoding="utf-8"),
+        )
+        provider_prompt = build_prompt(
+            repo=repo,
+            scope=scope,
+            patch_path=provider_dir / "change.patch",
+            manifest_path=provider_dir / "manifest.md",
+            task=task,
+            risks=risks,
+            review_profile=review_profile,
+            phase=phase,
+        )
+        safe_write(provider_dir / "prompt.md", provider_prompt)
+        inputs[reviewer.name] = (provider_dir, provider_prompt)
+    return inputs
+
+
+def record_reviewer_prompt_hashes(
+    metadata: dict[str, Any],
+    reviewer_inputs: dict[str, tuple[Path, str]],
+) -> None:
+    """Bind reviewer metadata to the exact provider-visible prompt bytes."""
+    reviewers = metadata.get("reviewers")
+    if not isinstance(reviewers, dict):
+        reviewers = {}
+        metadata["reviewers"] = reviewers
+    for name, (_, prompt) in reviewer_inputs.items():
+        reviewer = reviewers.get(name)
+        if not isinstance(reviewer, dict):
+            reviewer = {}
+            reviewers[name] = reviewer
+        reviewer["prompt_sha256"] = sha256_text(prompt)
+
+
 def safe_write_nofollow(path: Path, content: str) -> None:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -1518,6 +1698,41 @@ def create_snapshot(
                 archive.extractall(snapshot_dir, filter="data")
         finally:
             archive_path.unlink(missing_ok=True)
+
+        # `git archive` honors export-ignore. Restore every omitted tracked blob
+        # directly from the selected tree without invoking checkout/smudge
+        # filters from repository configuration.
+        tree = run_bytes_command(
+            ["git", "ls-tree", "-rz", "--full-tree", treeish], cwd=repo
+        ).stdout
+        missing_blobs: list[tuple[bytes, str, str]] = []
+        for entry in tree.split(b"\0"):
+            if not entry:
+                continue
+            header, raw_path = entry.split(b"\t", 1)
+            mode, object_type, object_id = header.split(b" ", 2)
+            if object_type != b"blob":
+                continue
+            relative_path = raw_path.decode("utf-8", errors="surrogateescape")
+            target = snapshot_target(snapshot_dir, relative_path)
+            if target.exists() or target.is_symlink():
+                continue
+            missing_blobs.append(
+                (mode, relative_path, object_id.decode("ascii"))
+            )
+        contents = git_blob_contents(
+            repo, [object_id for _, _, object_id in missing_blobs]
+        )
+        for (mode, relative_path, _), content in zip(missing_blobs, contents):
+            target = snapshot_target(snapshot_dir, relative_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if mode == b"120000":
+                os.symlink(
+                    content.decode("utf-8", errors="surrogateescape"), target
+                )
+            else:
+                target.write_bytes(content)
+                target.chmod(0o755 if mode == b"100755" else 0o644)
 
     if scope.kind == "commit":
         return snapshot_dir
@@ -1963,6 +2178,7 @@ def invoke_reviewer(
     repo: Path,
     prompt: str,
     run_dir: Path,
+    input_dir: Path,
     timeout_seconds: int,
     process_registry: ReviewerProcessRegistry | None = None,
 ) -> ReviewResult:
@@ -1973,18 +2189,18 @@ def invoke_reviewer(
     command = reviewer.command
     input_text: str | None = prompt
     if reviewer.name == "claude":
-        command = (*command, "--add-dir", str(run_dir))
+        command = (*command, "--add-dir", str(input_dir))
     elif reviewer.name == "antigravity":
         command = (
             *command,
             "--add-dir",
-            str(run_dir),
+            str(input_dir),
             "--print",
             prompt,
         )
         input_text = None
     else:
-        command = (*command, "--add-dir", str(run_dir), "--prompt", prompt)
+        command = (*command, "--add-dir", str(input_dir), "--prompt", prompt)
         input_text = None
     timed_out = False
     started = dt.datetime.now(dt.timezone.utc)
@@ -2017,8 +2233,9 @@ def invoke_reviewer(
                 process_registry.discard(process)
     except OSError as exc:
         safe_write(report_path, "")
-        safe_write(error_path, f"{type(exc).__name__}: {exc}\n")
-        record_provider_failure(reviewer.name, "launch_error", str(exc))
+        redacted_error = sanitized_failure_text(f"{type(exc).__name__}: {exc}")
+        safe_write(error_path, redacted_error + "\n")
+        record_provider_failure(reviewer.name, "launch_error", redacted_error)
         completed = dt.datetime.now(dt.timezone.utc)
         return ReviewResult(
             reviewer.name,
@@ -2042,7 +2259,9 @@ def invoke_reviewer(
         safe_write(report_path, stdout)
         safe_write(
             error_path,
-            f"Review timed out after {timeout_seconds} seconds.\n{stderr}",
+            sanitized_failure_text(
+                f"Review timed out after {timeout_seconds} seconds.", stderr
+            ) + "\n",
         )
         record_provider_failure(
             reviewer.name,
@@ -2139,7 +2358,7 @@ def invoke_reviewer(
                 json.dumps(payload, indent=2, sort_keys=True) + "\n",
             )
     safe_write(report_path, report)
-    safe_write(error_path, stderr)
+    safe_write(error_path, sanitized_failure_text(stderr))
     completed = dt.datetime.now(dt.timezone.utc)
     effective_returncode = (
         (process.returncode or 0) if not provider_reported_error else 1
@@ -2756,6 +2975,11 @@ def workflow_path(identifier: str) -> Path:
 
 def workflow_ancestry_ids(identifier: str) -> list[str]:
     """Return this workflow and every transitive ancestor, oldest first."""
+    if (
+        _COMMAND_WORKFLOW_ANCESTRY_CACHE is not None
+        and identifier in _COMMAND_WORKFLOW_ANCESTRY_CACHE
+    ):
+        return list(_COMMAND_WORKFLOW_ANCESTRY_CACHE[identifier])
     ordered: list[str] = []
     visiting: set[str] = set()
 
@@ -2779,19 +3003,45 @@ def workflow_ancestry_ids(identifier: str) -> list[str]:
         ordered.append(current)
 
     visit(identifier)
+    if _COMMAND_WORKFLOW_ANCESTRY_CACHE is not None:
+        _COMMAND_WORKFLOW_ANCESTRY_CACHE[identifier] = list(ordered)
     return ordered
 
 
 def workflow_lineage_root(identifier: str) -> str:
+    if (
+        _COMMAND_WORKFLOW_ROOT_CACHE is not None
+        and identifier in _COMMAND_WORKFLOW_ROOT_CACHE
+    ):
+        return _COMMAND_WORKFLOW_ROOT_CACHE[identifier]
     ancestry = workflow_ancestry_ids(identifier)
-    return ancestry[0] if ancestry else identifier
+    root = ancestry[0] if ancestry else identifier
+    if _COMMAND_WORKFLOW_ROOT_CACHE is not None:
+        _COMMAND_WORKFLOW_ROOT_CACHE[identifier] = root
+    return root
 
 
 def workflow_lineage_ids(identifier: str) -> list[str]:
     """Return every workflow connected to the same task-lineage root."""
+    global _COMMAND_LINEAGE_GROUPS_READY
     root = workflow_lineage_root(identifier)
     identifiers = set(workflow_ancestry_ids(identifier))
-    if WORKFLOWS_DIR.exists():
+    if _COMMAND_LINEAGE_GROUPS is not None:
+        if not _COMMAND_LINEAGE_GROUPS_READY and WORKFLOWS_DIR.exists():
+            for path in WORKFLOWS_DIR.glob("*.json"):
+                if path.name.endswith(".final.json"):
+                    continue
+                candidate = path.stem
+                try:
+                    candidate_root = workflow_lineage_root(candidate)
+                except ReviewError:
+                    continue
+                _COMMAND_LINEAGE_GROUPS.setdefault(candidate_root, set()).add(
+                    candidate
+                )
+            _COMMAND_LINEAGE_GROUPS_READY = True
+        identifiers.update(_COMMAND_LINEAGE_GROUPS.get(root, set()))
+    elif WORKFLOWS_DIR.exists():
         for path in WORKFLOWS_DIR.glob("*.json"):
             if path.name.endswith(".final.json"):
                 continue
@@ -2812,6 +3062,12 @@ def workflow_lineage_ids(identifier: str) -> list[str]:
 
 def workflow_lineage_runs(identifier: str) -> list[tuple[Path, dict[str, Any]]]:
     identifiers = set(workflow_lineage_ids(identifier))
+    if _COMMAND_RUNS_BY_WORKFLOW is not None:
+        return [
+            item
+            for workflow_identifier in identifiers
+            for item in _COMMAND_RUNS_BY_WORKFLOW.get(workflow_identifier, [])
+        ]
     return [
         item
         for item in all_run_metadata()
@@ -2839,7 +3095,7 @@ def refresh_evidence_run(run_dir: Path) -> None:
                     workflow_lineage_root(identifier) if identifier else ""
                 ),
             )
-    except (OSError, sqlite3.Error) as exc:
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
         print(
             f"Warning: evidence memory refresh failed for {run_dir}: "
             f"{type(exc).__name__}",
@@ -3064,10 +3320,33 @@ def readiness_status(*, enabled: bool, readiness: ProviderReadiness) -> str:
     return "ready" if readiness.ready else "unready"
 
 
+def provider_usage_reservation_counts(identifier: str) -> dict[str, int]:
+    """Count only reservations whose owning runner process is still alive."""
+    counts = {provider: 0 for provider in PROVIDERS}
+    for lineage_id in workflow_lineage_ids(identifier):
+        path = workflow_path(lineage_id)
+        if not path.exists():
+            continue
+        reservations = read_json(path).get("usage_reservations")
+        if not isinstance(reservations, dict):
+            continue
+        for reservation in reservations.values():
+            if (
+                not isinstance(reservation, dict)
+                or process_is_alive(reservation.get("runner_pid")) is not True
+            ):
+                continue
+            for provider in reservation.get("providers", []):
+                if provider in counts:
+                    counts[provider] += 1
+    return counts
+
+
 def provider_usage_snapshot(
     identifier: str, *, probe_readiness: bool = False
 ) -> dict[str, Any]:
     attempts = workflow_provider_attempts(identifier)
+    active_reservations = provider_usage_reservation_counts(identifier)
     usage_policy = workflow_usage_policy(identifier) or {}
     max_attempts = usage_policy.get("max_attempts_per_provider")
     providers: dict[str, Any] = {}
@@ -3115,9 +3394,18 @@ def provider_usage_snapshot(
             "authentication_mode": readiness.authentication_mode,
             "usage_resource": readiness.usage_resource,
             "attempts": attempts[provider],
+            "active_reservations": active_reservations[provider],
+            "attempts_including_reservations": (
+                attempts[provider] + active_reservations[provider]
+            ),
             "max_attempts": max_attempts,
             "attempts_remaining": (
-                max(0, int(max_attempts) - attempts[provider])
+                max(
+                    0,
+                    int(max_attempts)
+                    - attempts[provider]
+                    - active_reservations[provider],
+                )
                 if isinstance(max_attempts, int)
                 else None
             ),
@@ -3185,6 +3473,7 @@ def _apply_provider_usage_policy(
                 reservations = {}
             if reservation_id:
                 reservations.pop(reservation_id, None)
+            workflow["usage_reservations"] = reservations
             reserved_counts = {provider: 0 for provider in PROVIDERS}
             for lineage_id in lineage_ids:
                 path = workflow_path(lineage_id)
@@ -3194,12 +3483,21 @@ def _apply_provider_usage_policy(
                 values = document.get("usage_reservations")
                 if not isinstance(values, dict):
                     continue
-                for key, value in values.items():
+                stale_keys: list[str] = []
+                for key, value in list(values.items()):
                     if key == reservation_id or not isinstance(value, dict):
+                        continue
+                    if process_is_alive(value.get("runner_pid")) is not True:
+                        stale_keys.append(key)
                         continue
                     for provider in value.get("providers", []):
                         if provider in reserved_counts:
                             reserved_counts[provider] += 1
+                if stale_keys:
+                    for key in stale_keys:
+                        values.pop(key, None)
+                    document["usage_reservations"] = values
+                    safe_write_json(path, document)
             attempted = workflow_provider_attempts(identifier)
             selected: list[Reviewer] = []
             skipped: dict[str, str] = {}
@@ -3445,11 +3743,15 @@ def validate_workflow_phase(
         for _, metadata in workflow_runs(identifier)
         if isinstance(metadata.get("repository"), dict)
         and str(metadata["repository"].get("id")) == repository_id
-        and metadata.get("status") in {"completed", "running"}
+        and metadata.get("status") in {"completed", "preflight", "running"}
     ]
-    if any(metadata.get("status") == "running" for metadata in relevant):
+    if any(
+        metadata.get("status") in {"preflight", "running"}
+        for metadata in relevant
+    ):
         raise ReviewError(
-            "A review is already running for this repository and workflow."
+            "A review is already in preflight or running for this repository "
+            "and workflow."
         )
     completed = [
         metadata for metadata in relevant if metadata.get("status") == "completed"
@@ -3839,6 +4141,8 @@ def workflow_supersede_command(args: argparse.Namespace) -> int:
 
 
 def all_run_metadata() -> list[tuple[Path, dict[str, Any]]]:
+    if _COMMAND_RUN_METADATA_CACHE is not None:
+        return _COMMAND_RUN_METADATA_CACHE
     if not RUNS_DIR.exists():
         return []
     found: list[tuple[Path, dict[str, Any]]] = []
@@ -3851,6 +4155,8 @@ def all_run_metadata() -> list[tuple[Path, dict[str, Any]]]:
 
 
 def workflow_runs(identifier: str) -> list[tuple[Path, dict[str, Any]]]:
+    if _COMMAND_RUNS_BY_WORKFLOW is not None:
+        return list(_COMMAND_RUNS_BY_WORKFLOW.get(identifier, []))
     return [
         item
         for item in all_run_metadata()
@@ -3908,20 +4214,27 @@ def attach_prior_matches(
         matches = prior_by_key.get(key)
         if matches:
             item["prior_matches"] = matches
+
+    items_by_kind: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        kind = str(item.get("kind") or "finding")
+        items_by_kind.setdefault(kind, []).append(item)
+    for kind, kind_items in items_by_kind.items():
         try:
-            memory_matches = search_evidence_memory(
+            memory_matches_by_item = search_evidence_memory_many(
                 evidence_memory_path(),
-                str(item.get("title") or ""),
+                [str(item.get("title") or "") for item in kind_items],
                 repository_id=repository_id,
-                kind=str(item.get("kind") or "finding"),
+                kind=kind,
                 exclude_run_id=current_run_id,
                 limit=5,
                 minimum_similarity=0.5,
             )
-        except (OSError, sqlite3.Error):
-            memory_matches = []
-        if memory_matches:
-            item["memory_matches"] = memory_matches
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            memory_matches_by_item = [[] for _ in kind_items]
+        for item, memory_matches in zip(kind_items, memory_matches_by_item):
+            if memory_matches:
+                item["memory_matches"] = memory_matches
 
 
 def latest_workflow_runs(
@@ -4291,10 +4604,8 @@ def analytics_report(since_days: int) -> dict[str, Any]:
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=since_days)
     runs: list[tuple[Path, dict[str, Any]]] = []
     for run_dir, metadata in all_run_metadata():
-        created_at = metadata.get("created_at")
-        try:
-            created = dt.datetime.fromisoformat(str(created_at))
-        except ValueError:
+        created = normalized_timestamp(metadata.get("created_at"))
+        if created is None:
             continue
         if created >= cutoff:
             runs.append((run_dir, metadata))
@@ -5113,7 +5424,7 @@ def normalized_timestamp(value: Any) -> dt.datetime | None:
     return parsed.astimezone(dt.timezone.utc)
 
 
-def workflow_audit_report(stale_days: int) -> dict[str, Any]:
+def _workflow_audit_report(stale_days: int) -> dict[str, Any]:
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=stale_days)
     run_records = all_run_metadata()
     runs_by_workflow: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
@@ -5285,6 +5596,11 @@ def workflow_audit_report(stale_days: int) -> dict[str, Any]:
         "workflows": entries,
         "mutated": False,
     }
+
+
+def workflow_audit_report(stale_days: int) -> dict[str, Any]:
+    with workflow_query_cache():
+        return _workflow_audit_report(stale_days)
 
 
 def render_workflow_audit_compact(report: dict[str, Any]) -> str:
@@ -6038,6 +6354,11 @@ def continue_command(args: argparse.Namespace) -> int:
 
 
 def gate_command(args: argparse.Namespace) -> int:
+    if not workflow_path(args.workflow_id).exists():
+        raise ReviewError(
+            f"Unknown workflow {args.workflow_id}. Create it with "
+            "`mm-review workflow start`."
+        )
     logs: list[str] = []
     plan = workflow_continue_plan(args.workflow_id, probe_usage=True)
     if args.execute_review:
@@ -6216,6 +6537,7 @@ def render_workflow_status_compact(status: dict[str, Any]) -> str:
                     f"- {provider}: auth={value.get('authentication_mode')}, "
                     f"resource={value.get('usage_resource')}, "
                     f"attempts={value.get('attempts')}, "
+                    f"reserved={value.get('active_reservations', 0)}, "
                     f"remaining={remaining if remaining is not None else 'unknown'}, "
                     f"readiness_status={value.get('readiness_status')}"
                 )
@@ -6816,11 +7138,19 @@ def doctor_command(args: argparse.Namespace) -> int:
                         }
                     )
                     continue
+                provider_root = probe_dir / provider
+                provider_repo = provider_root / "snapshot"
+                provider_input = provider_root / "input"
+                provider_output = provider_root / "output"
+                provider_repo.mkdir(parents=True)
+                provider_input.mkdir()
+                provider_output.mkdir()
                 result = invoke_reviewer(
                     reviewer,
-                    repo=probe_dir,
+                    repo=provider_repo,
                     prompt=prompt,
-                    run_dir=probe_dir,
+                    run_dir=provider_output,
+                    input_dir=provider_input,
                     timeout_seconds=DOCTOR_TIMEOUT_SECONDS,
                 )
                 report = result.report_path.read_text(encoding="utf-8")
@@ -7282,8 +7612,9 @@ def effective_finalization_items(
             and prior_run != run_identifier
             and prior[0].get("decision") == "deferred"
         ]
-        if item.get("decision") != "deferred" and len(matching_deferrals) == 1:
-            effective.pop(matching_deferrals[0])
+        if item.get("decision") != "deferred":
+            for index in reversed(matching_deferrals):
+                effective.pop(index)
         is_current_workflow = (
             not item_workflow or item_workflow == workflow_identifier
         )
@@ -7643,9 +7974,9 @@ def recover_command(args: argparse.Namespace) -> int:
     os.umask(0o077)
     run_dir = resolve_run_dir(args.run)
     metadata = read_json(run_dir / "metadata.json")
-    if metadata.get("status") != "running":
+    if metadata.get("status") not in {"preflight", "running"}:
         raise ReviewError(
-            f"Only a running review can be recovered "
+            f"Only a preflight or running review can be recovered "
             f"(status={metadata.get('status')})."
         )
     alive = process_is_alive(metadata.get("runner_pid"))
@@ -7671,6 +8002,10 @@ def recover_command(args: argparse.Namespace) -> int:
             "message": "Running metadata was recovered after its runner exited.",
         },
     )
+    workflow_identifier = str(metadata.get("workflow_id") or "")
+    run_identifier = str(metadata.get("run_id") or "")
+    if workflow_identifier and run_identifier:
+        release_workflow_budget_reservation(workflow_identifier, run_identifier)
     print(f"Recovered stale review run as failed: {run_dir}")
     return 0
 
@@ -7923,6 +8258,32 @@ def archive_reviewer_artifacts_batch(
         apply_reviewer_artifact_archive_plan(reviewer, plan)
 
 
+def prepare_resumed_reviewer_metadata(
+    names: Sequence[str], reviewers: dict[str, Any]
+) -> None:
+    """Archive current attempt metadata before binding the resumed prompt."""
+    for name in names:
+        previous = reviewers.get(name)
+        if not isinstance(previous, dict):
+            continue
+        attempts = [
+            item
+            for item in previous.get("attempts", [])
+            if isinstance(item, dict) and "exit_code" in item
+        ]
+        if "exit_code" in previous:
+            attempts.append(
+                {key: value for key, value in previous.items() if key != "attempts"}
+            )
+        reviewers[name] = {
+            "model": previous.get("model"),
+            "cli_version": previous.get("cli_version"),
+            "authentication_mode": previous.get("authentication_mode", "unknown"),
+            "usage_resource": previous.get("usage_resource", "unknown"),
+            "attempts": attempts,
+        }
+
+
 def persist_review_results(
     *,
     run_dir: Path,
@@ -7969,6 +8330,11 @@ def persist_review_results(
                 previous.get("usage_resource", "unknown")
                 if isinstance(previous, dict)
                 else "unknown"
+            ),
+            "prompt_sha256": (
+                previous.get("prompt_sha256")
+                if isinstance(previous, dict)
+                else None
             ),
             "started_at": result.started_at,
             "completed_at": result.completed_at,
@@ -8425,14 +8791,15 @@ def resume_review_locked(
             "use `mm-review continue <workflow-id>` to inspect the safe next action."
         )
 
-    snapshot_dir = run_dir / "snapshot"
+    snapshot_workspace = Path(tempfile.mkdtemp(prefix="mm-review-resume-"))
+    snapshot_dir = snapshot_workspace / "snapshot"
     try:
         clear_ephemeral_snapshot(run_dir)
         snapshot_dir = create_snapshot(
             repo,
             scope,
             overlay_paths,
-            run_dir,
+            snapshot_workspace,
         )
         apply_snapshot_exclusions(snapshot_dir, snapshot_exclusions)
         if external_snapshot_symlinks(snapshot_dir):
@@ -8471,6 +8838,7 @@ def resume_review_locked(
         archive_reviewer_artifacts_batch(
             run_dir, failed_names, reviewer_metadata
         )
+        prepare_resumed_reviewer_metadata(failed_names, reviewer_metadata)
         metadata.update(
             {
                 "status": "running",
@@ -8499,7 +8867,33 @@ def resume_review_locked(
         )
         metadata.pop("terminal_error", None)
         safe_write_json(run_dir / "metadata.json", metadata)
-        prompt = (run_dir / "prompt.md").read_text(encoding="utf-8")
+        prompt = build_prompt(
+            repo=snapshot_dir,
+            scope=scope,
+            patch_path=Path("change.patch"),
+            manifest_path=Path("manifest.md"),
+            task=(str(metadata.get("task")) if metadata.get("task") else None),
+            risks=[str(item) for item in metadata.get("risks", [])],
+            review_profile=str(metadata.get("review_profile") or "normal"),
+            phase=str(metadata.get("phase") or "repair"),
+        )
+        safe_write(run_dir / "prompt.md", prompt)
+        metadata["prompt_template_sha256"] = sha256_text(prompt)
+        metadata["prompt_sha256"] = metadata["prompt_template_sha256"]
+        safe_write_json(run_dir / "metadata.json", metadata)
+        reviewer_inputs = stage_reviewer_inputs(
+            snapshot_workspace,
+            run_dir,
+            reviewers,
+            repo=snapshot_dir,
+            scope=scope,
+            task=(str(metadata.get("task")) if metadata.get("task") else None),
+            risks=[str(item) for item in metadata.get("risks", [])],
+            review_profile=str(metadata.get("review_profile") or "normal"),
+            phase=str(metadata.get("phase") or "repair"),
+        )
+        record_reviewer_prompt_hashes(metadata, reviewer_inputs)
+        safe_write_json(run_dir / "metadata.json", metadata)
         process_registry = ReviewerProcessRegistry()
         timeout_seconds = int(policy.get("timeout_minutes") or DEFAULT_TIMEOUT_MINUTES) * 60
         with concurrent.futures.ThreadPoolExecutor(
@@ -8510,8 +8904,9 @@ def resume_review_locked(
                     invoke_reviewer,
                     reviewer,
                     repo=snapshot_dir,
-                    prompt=prompt,
+                    prompt=reviewer_inputs[reviewer.name][1],
                     run_dir=run_dir,
+                    input_dir=reviewer_inputs[reviewer.name][0],
                     timeout_seconds=timeout_seconds,
                     process_registry=process_registry,
                 )
@@ -8569,7 +8964,7 @@ def resume_review_locked(
             f"{diagnostic_path}: {type(exc).__name__}"
         ) from exc
     finally:
-        shutil.rmtree(snapshot_dir, ignore_errors=True)
+        shutil.rmtree(snapshot_workspace, ignore_errors=True)
         release_workflow_budget_reservation(
             str(metadata["workflow_id"]), str(metadata["run_id"])
         )
@@ -8802,67 +9197,80 @@ def run_review_command(args: argparse.Namespace) -> int:
             print(f"- {path}", flush=True)
         if len(excluded_paths) > 20:
             print(f"- ... and {len(excluded_paths) - 20} more", flush=True)
-    existing_rounds = [
-        int(metadata.get("round", 0))
-        for _, metadata in workflow_runs(selected_workflow)
-        if isinstance(metadata.get("repository"), dict)
-        and str(metadata["repository"].get("id")) == str(repository["id"])
-        and metadata.get("status") == "completed"
-    ]
-    round_number = args.round or (max(existing_rounds, default=0) + 1)
-    run_id = f"run-{uuid.uuid4().hex}"
-    run_dir = make_run_dir(repo, str(repository["id"]))
-    patch_path = run_dir / "change.patch"
-    manifest_path = run_dir / "manifest.md"
-    prompt_path = run_dir / "prompt.md"
-    safe_write(patch_path, patch)
-    metadata: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
-        "run_id": run_id,
-        "workflow_id": selected_workflow,
-        "round": round_number,
-        "phase": args.phase,
-        "review_mode": review_mode,
-        "status": "preflight",
-        "created_at": utc_now(),
-        "repository": repository,
-        "scope": dataclasses.asdict(scope),
-        "path_filters": list(path_filters),
-        "paths": paths,
-        "snapshot_overlay_paths": overlay_paths,
-        "snapshot_exclusions": snapshot_exclusions,
-        "excluded_changed_paths": excluded_paths,
-        "risks": sorted(set(args.risk)),
-        "review_profile": args.review_profile,
-        "task": args.task,
-        "supplemental_of": (
-            str(supplemental_parent[0]) if supplemental_parent else None
-        ),
-        "supplemental_parent_run_id": (
-            supplemental_parent[1].get("run_id") if supplemental_parent else None
-        ),
-        "supplemental_parent_workflow_id": (
-            supplemental_parent[1].get("workflow_id")
-            if supplemental_parent
-            else None
-        ),
-        "isolated_snapshot": True,
-        "coverage_contract_required": True,
-        "patch_sha256": sha256_text(patch),
-        "sensitive_override": False,
-        "allowed_sensitive_findings": [],
-        "sensitive_scan_token": args.sensitive_scan_token,
-        "sensitive_approval_mode": (
-            "lineage_reuse"
-            if args.reuse_lineage_sensitive_approvals
-            else "one_shot_token"
-            if args.sensitive_scan_token
-            else "none"
-        ),
-    }
-    safe_write_json(run_dir / "metadata.json", metadata)
+    review_start_lock = WORKFLOWS_DIR / (
+        f"{selected_workflow}.{repository['id']}.review-start"
+    )
+    with exclusive_file_lock(review_start_lock):
+        existing_rounds = [
+            int(metadata.get("round", 0))
+            for _, metadata in workflow_runs(selected_workflow)
+            if isinstance(metadata.get("repository"), dict)
+            and str(metadata["repository"].get("id")) == str(repository["id"])
+            and metadata.get("status") == "completed"
+        ]
+        round_number = args.round or (max(existing_rounds, default=0) + 1)
+        validate_workflow_phase(
+            selected_workflow,
+            str(repository["id"]),
+            phase=args.phase,
+            round_number=round_number,
+        )
+        run_id = f"run-{uuid.uuid4().hex}"
+        run_dir = make_run_dir(repo, str(repository["id"]))
+        patch_path = run_dir / "change.patch"
+        manifest_path = run_dir / "manifest.md"
+        prompt_path = run_dir / "prompt.md"
+        safe_write(patch_path, patch)
+        metadata: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": run_id,
+            "workflow_id": selected_workflow,
+            "round": round_number,
+            "phase": args.phase,
+            "review_mode": review_mode,
+            "status": "preflight",
+            "created_at": utc_now(),
+            "repository": repository,
+            "scope": dataclasses.asdict(scope),
+            "path_filters": list(path_filters),
+            "paths": paths,
+            "snapshot_overlay_paths": overlay_paths,
+            "snapshot_exclusions": snapshot_exclusions,
+            "excluded_changed_paths": excluded_paths,
+            "risks": sorted(set(args.risk)),
+            "review_profile": args.review_profile,
+            "task": args.task,
+            "supplemental_of": (
+                str(supplemental_parent[0]) if supplemental_parent else None
+            ),
+            "supplemental_parent_run_id": (
+                supplemental_parent[1].get("run_id")
+                if supplemental_parent
+                else None
+            ),
+            "supplemental_parent_workflow_id": (
+                supplemental_parent[1].get("workflow_id")
+                if supplemental_parent
+                else None
+            ),
+            "isolated_snapshot": True,
+            "coverage_contract_required": True,
+            "patch_sha256": sha256_text(patch),
+            "sensitive_override": False,
+            "allowed_sensitive_findings": [],
+            "sensitive_scan_token": args.sensitive_scan_token,
+            "sensitive_approval_mode": (
+                "lineage_reuse"
+                if args.reuse_lineage_sensitive_approvals
+                else "one_shot_token"
+                if args.sensitive_scan_token
+                else "none"
+            ),
+        }
+        safe_write_json(run_dir / "metadata.json", metadata)
 
-    snapshot_dir = run_dir / "snapshot"
+    snapshot_workspace = Path(tempfile.mkdtemp(prefix="mm-review-run-"))
+    snapshot_dir = snapshot_workspace / "snapshot"
     scan_token_path: Path | None = None
     scan_token_value: dict[str, Any] | None = None
     try:
@@ -8877,12 +9285,6 @@ def run_review_command(args: argparse.Namespace) -> int:
                     "Supplemental review source is not content-equivalent to the "
                     "finalized parent snapshot. Create a normal successor workflow."
                 )
-        validate_workflow_phase(
-            selected_workflow,
-            str(repository["id"]),
-            phase=args.phase,
-            round_number=round_number,
-        )
         validate_review_contract(
             selected_workflow,
             str(repository["id"]),
@@ -8971,7 +9373,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             repo,
             scope,
             overlay_paths,
-            run_dir,
+            snapshot_workspace,
         )
         apply_snapshot_exclusions(snapshot_dir, snapshot_exclusions)
         snapshot_paths = changed_paths(repo, scope, path_filters)
@@ -9104,8 +9506,8 @@ def run_review_command(args: argparse.Namespace) -> int:
         prompt = build_prompt(
             repo=snapshot_dir,
             scope=scope,
-            patch_path=patch_path,
-            manifest_path=manifest_path,
+            patch_path=Path("change.patch"),
+            manifest_path=Path("manifest.md"),
             task=args.task,
             risks=args.risk,
             review_profile=args.review_profile,
@@ -9126,6 +9528,7 @@ def run_review_command(args: argparse.Namespace) -> int:
                     manifest_path.read_text(encoding="utf-8")
                 ),
                 "prompt_sha256": sha256_text(prompt),
+                "prompt_template_sha256": sha256_text(prompt),
                 "review_policy": {
                     "timeout_minutes": args.timeout_minutes,
                     "review_profile": args.review_profile,
@@ -9199,13 +9602,27 @@ def run_review_command(args: argparse.Namespace) -> int:
         )
         timeout_seconds = args.timeout_minutes * 60
         process_registry = ReviewerProcessRegistry()
+        reviewer_inputs = stage_reviewer_inputs(
+            snapshot_workspace,
+            run_dir,
+            reviewers,
+            repo=snapshot_dir,
+            scope=scope,
+            task=args.task,
+            risks=args.risk,
+            review_profile=args.review_profile,
+            phase=args.phase,
+        )
+        record_reviewer_prompt_hashes(metadata, reviewer_inputs)
+        safe_write_json(run_dir / "metadata.json", metadata)
         if args.sequential or len(reviewers) == 1:
             results = [
                 invoke_reviewer(
                     reviewer,
                     repo=snapshot_dir,
-                    prompt=prompt,
+                    prompt=reviewer_inputs[reviewer.name][1],
                     run_dir=run_dir,
+                    input_dir=reviewer_inputs[reviewer.name][0],
                     timeout_seconds=timeout_seconds,
                     process_registry=process_registry,
                 )
@@ -9220,8 +9637,9 @@ def run_review_command(args: argparse.Namespace) -> int:
                     invoke_reviewer,
                     reviewer,
                     repo=snapshot_dir,
-                    prompt=prompt,
+                    prompt=reviewer_inputs[reviewer.name][1],
                     run_dir=run_dir,
+                    input_dir=reviewer_inputs[reviewer.name][0],
                     timeout_seconds=timeout_seconds,
                     process_registry=process_registry,
                 )
@@ -9350,7 +9768,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             f"{diagnostic_path}: {type(exc).__name__}"
         ) from exc
     finally:
-        shutil.rmtree(snapshot_dir, ignore_errors=True)
+        shutil.rmtree(snapshot_workspace, ignore_errors=True)
         release_workflow_budget_reservation(selected_workflow, run_id)
 
 

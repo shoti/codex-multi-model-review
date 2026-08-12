@@ -499,7 +499,7 @@ Use `python3 .../mm_review.py <command> --help` for all flags.
 |---|---|---|
 | Immutable snapshot | Reviewers do not inspect a changing checkout | The tracked repository tree is passed to every enabled provider CLI |
 | Read-only sessions | Reviewers receive read/search-only tool policies | Provider and CLI implementations remain external dependencies |
-| Independent prompts | Reviewers do not receive one another's findings | All reviewers receive the same task contract and source |
+| Independent prompts | Provider-specific input directories expose only the snapshot, patch, manifest, and prompt—not peer reports, metadata, or Codex triage | All reviewers receive the same task contract and source |
 | Secret screening | Blocks likely credentials, sensitive paths, external symlinks, and common secret patterns across the complete outgoing snapshot | It remains heuristic and is not a substitute for a dedicated repository scanner |
 | Evidence-backed triage | Codex records why every item was accepted, fixed, rejected, deferred, or uncertain | Model agreement is not evidence |
 | Evidence memory | Codex can retrieve similar prior decisions after fresh reports finish | Historical evidence is never passed to reviewers and the JSON artifacts remain authoritative |
@@ -529,6 +529,11 @@ tracked files private. Secret screening now checks every file in that complete
 outgoing snapshot plus deleted patch material, including unchanged tracked
 files. Inspect sensitive repositories before starting an external review.
 
+Each provider receives a separate staged input directory outside the durable
+artifact root. Resumed reviewers cannot read successful peer reports,
+`review-summary.json`, `triage.json`, or `metadata.json`; those remain private
+to Codex and the runner.
+
 Persistent local state is stored under:
 
 - `~/.codex/review-runs/`;
@@ -546,8 +551,10 @@ committed, uploaded, or attached to public issues.
 Provider executables are resolved from `PATH`. Install trusted CLIs from their
 official distribution channels and verify which executable your shell selects.
 
-The built-in secret scan is defense in depth. It is not a substitute for a
-repository secret scanner or deliberate source review.
+The built-in secret scan is defense in depth. It scans complete non-binary
+tracked files and deleted patch lines for its configured patterns, but pattern
+coverage is necessarily heuristic and binary content is not interpreted. It is
+not a substitute for a repository secret scanner or deliberate source review.
 
 ## Provider usage controls
 

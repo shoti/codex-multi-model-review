@@ -460,7 +460,9 @@ adapter.
 
 The runner:
 
-- gives Claude, Antigravity, and Kimi fresh, independent sessions;
+- gives Claude, Antigravity, and Kimi fresh, independent sessions with
+  provider-specific staged inputs that exclude peer reports, metadata, and
+  Codex triage;
 - restricts every reviewer to read/search tools;
 - supports task-path scoping without copying dirty repositories;
 - builds a private immutable repository snapshot so reviewers never inspect the

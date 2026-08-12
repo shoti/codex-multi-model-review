@@ -172,16 +172,20 @@ def upsert_run(
     run_dir: Path,
     *,
     lineage_root: str,
-) -> int:
+) -> int | None:
     """Replace one run's indexed evidence atomically and return its item count."""
     metadata = _read_object(run_dir / "metadata.json")
     triage = _read_object(run_dir / "triage.json")
     if metadata is None or triage is None:
-        return 0
+        return None
     run_id = str(metadata.get("run_id") or run_dir.name)
     workflow_id = str(metadata.get("workflow_id") or "")
     repository = metadata.get("repository")
     repository = repository if isinstance(repository, dict) else {}
+    try:
+        round_number = int(metadata.get("round") or 0)
+    except (TypeError, ValueError):
+        return None
     rows: list[tuple[Any, ...]] = []
     for item in _triage_items(triage):
         item_id = str(item.get("id") or "")
@@ -198,7 +202,7 @@ def upsert_run(
                 str(repository.get("name") or "") or None,
                 str(metadata.get("source_fingerprint") or "") or None,
                 str(metadata.get("phase") or "repair"),
-                int(metadata.get("round") or 0),
+                round_number,
                 str(item.get("kind") or "finding"),
                 str(item.get("reviewer") or "") or None,
                 str(item.get("severity") or "") or None,
@@ -244,11 +248,15 @@ def rebuild(
     temporary.unlink(missing_ok=True)
     indexed_runs = 0
     indexed_items = 0
+    skipped_runs = 0
     try:
         with _open_database(temporary) as connection:
             connection.execute("DELETE FROM evidence")
         for run_dir, lineage_root in runs:
             count = upsert_run(temporary, run_dir, lineage_root=lineage_root)
+            if count is None:
+                skipped_runs += 1
+                continue
             indexed_runs += 1
             indexed_items += count
         temporary.replace(database_path)
@@ -260,43 +268,18 @@ def rebuild(
     return {
         "database": str(database_path),
         "runs": indexed_runs,
+        "skipped_runs": skipped_runs,
         "evidence_items": indexed_items,
     }
 
 
-def search(
-    database_path: Path,
+def _rank_rows(
     query: str,
+    rows: Sequence[sqlite3.Row],
     *,
-    repository_id: str | None = None,
-    kind: str | None = None,
-    exclude_run_id: str | None = None,
-    limit: int = 20,
-    minimum_similarity: float = 0.35,
-    decided_only: bool = True,
+    limit: int,
+    minimum_similarity: float,
 ) -> list[dict[str, Any]]:
-    """Return ranked prior evidence for Codex after independent review."""
-    if not database_path.exists() or not normalized_text(query):
-        return []
-    clauses: list[str] = []
-    parameters: list[Any] = []
-    if repository_id:
-        clauses.append("repository_id = ?")
-        parameters.append(repository_id)
-    if kind:
-        clauses.append("kind = ?")
-        parameters.append(kind)
-    if exclude_run_id:
-        clauses.append("run_id != ?")
-        parameters.append(exclude_run_id)
-    if decided_only:
-        clauses.append("decision IN ('fixed', 'rejected', 'covered', 'deferred')")
-    where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    with _open_database(database_path) as connection:
-        rows = connection.execute(
-            "SELECT * FROM evidence" + where + " ORDER BY created_at DESC",
-            parameters,
-        ).fetchall()
     ranked: list[dict[str, Any]] = []
     for row in rows:
         similarity, matched_fields = evidence_relevance(query, row)
@@ -336,6 +319,63 @@ def search(
         reverse=True,
     )
     return ranked[:limit]
+
+
+def search_many(
+    database_path: Path,
+    queries: Sequence[str],
+    *,
+    repository_id: str | None = None,
+    kind: str | None = None,
+    exclude_run_id: str | None = None,
+    limit: int = 20,
+    minimum_similarity: float = 0.35,
+    decided_only: bool = True,
+) -> list[list[dict[str, Any]]]:
+    """Rank multiple Codex-only evidence queries with one database scan."""
+    if not queries:
+        return []
+    if not database_path.exists():
+        return [[] for _ in queries]
+    clauses: list[str] = []
+    parameters: list[Any] = []
+    if repository_id:
+        clauses.append("repository_id = ?")
+        parameters.append(repository_id)
+    if kind:
+        clauses.append("kind = ?")
+        parameters.append(kind)
+    if exclude_run_id:
+        clauses.append("run_id != ?")
+        parameters.append(exclude_run_id)
+    if decided_only:
+        clauses.append("decision IN ('fixed', 'rejected', 'covered', 'deferred')")
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with _open_database(database_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM evidence" + where + " ORDER BY created_at DESC",
+            parameters,
+        ).fetchall()
+    return [
+        _rank_rows(
+            query,
+            rows,
+            limit=limit,
+            minimum_similarity=minimum_similarity,
+        )
+        if normalized_text(query)
+        else []
+        for query in queries
+    ]
+
+
+def search(
+    database_path: Path,
+    query: str,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Return ranked prior evidence for one Codex query."""
+    return search_many(database_path, [query], **kwargs)[0]
 
 
 def status(database_path: Path) -> dict[str, Any]:

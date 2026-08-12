@@ -110,6 +110,7 @@ class FakeProviderHarness:
                 r"""
                 #!/usr/bin/env python3
                 import fcntl
+                import hashlib
                 import json
                 import os
                 import pathlib
@@ -157,6 +158,24 @@ class FakeProviderHarness:
                     for path in cwd.rglob("*")
                     if path.is_file() or path.is_symlink()
                 )
+                add_dir = None
+                if "--add-dir" in args:
+                    add_dir = pathlib.Path(args[args.index("--add-dir") + 1])
+                granted_files = sorted(
+                    str(path.relative_to(add_dir))
+                    for path in add_dir.rglob("*")
+                    if path.is_file() or path.is_symlink()
+                ) if add_dir else []
+                workspace_files = sorted(
+                    str(path.relative_to(cwd.parent))
+                    for path in cwd.parent.rglob("*")
+                    if path.is_file() or path.is_symlink()
+                )
+                staged_prompt = (
+                    (add_dir / "prompt.md").read_bytes()
+                    if add_dir and (add_dir / "prompt.md").is_file()
+                    else b""
+                )
                 mutation = outcome.get("mutate_relative")
                 if mutation:
                     target = cwd / mutation
@@ -168,7 +187,13 @@ class FakeProviderHarness:
                     "cwd": str(cwd),
                     "args": args,
                     "stdin_bytes": len(prompt.encode()),
+                    "staged_prompt_sha256": hashlib.sha256(
+                        staged_prompt
+                    ).hexdigest(),
                     "snapshot_files": snapshot_files,
+                    "granted_dir": str(add_dir) if add_dir else None,
+                    "granted_files": granted_files,
+                    "workspace_files": workspace_files,
                     "mutate_relative": mutation,
                 }
                 log_path = pathlib.Path(os.environ["MM_FAKE_PROVIDER_LOG"])
@@ -611,7 +636,7 @@ class RunnerUnitTests(unittest.TestCase):
         config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
         config["antigravity"]["enabled"] = False
         config["kimi"]["enabled"] = False
-        seen_repositories: list[tuple[bool, list[Path]]] = []
+        seen_repositories: list[tuple[bool, bool, list[Path], list[Path]]] = []
         seen_budgets: list[float | None] = []
 
         def reviewer_definitions(
@@ -626,10 +651,18 @@ class RunnerUnitTests(unittest.TestCase):
             repo: Path,
             prompt: str,
             run_dir: Path,
+            input_dir: Path,
             timeout_seconds: int,
         ) -> MM.ReviewResult:
             del prompt, timeout_seconds
-            seen_repositories.append((repo == run_dir, list(repo.iterdir())))
+            seen_repositories.append(
+                (
+                    repo == run_dir,
+                    repo == input_dir,
+                    list(repo.iterdir()),
+                    list(input_dir.iterdir()),
+                )
+            )
             report_path = run_dir / f"{reviewer.name}.md"
             error_path = run_dir / f"{reviewer.name}.stderr.log"
             report_path.write_text(
@@ -697,7 +730,7 @@ class RunnerUnitTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(len(seen_repositories), 1)
-        self.assertEqual(seen_repositories[0], (True, []))
+        self.assertEqual(seen_repositories[0], (False, False, [], []))
         self.assertEqual(seen_budgets, [MM.DOCTOR_CLAUDE_BUDGET_USD])
 
     def test_claude_cli_contract_checks_required_flags(self) -> None:
@@ -1036,6 +1069,92 @@ class RunnerUnitTests(unittest.TestCase):
             document["usage_reservations"]["run-1"]["providers"], ["kimi"]
         )
 
+    def test_dead_provider_reservation_is_ignored_and_reclaimed(self) -> None:
+        reviewer = MM.Reviewer("claude", ("claude",), {}, "sonnet", "fake")
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary) / "workflows"
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "all_run_metadata", return_value=[]),
+                mock.patch.object(
+                    MM,
+                    "workflow_provider_attempts",
+                    return_value={provider: 0 for provider in MM.PROVIDERS},
+                ),
+                mock.patch.object(MM, "process_is_alive", return_value=False),
+                mock.patch.object(MM, "active_provider_cooldown", return_value=None),
+                mock.patch.object(
+                    MM,
+                    "load_config",
+                    return_value=json.loads(json.dumps(MM.DEFAULT_CONFIG)),
+                ),
+            ):
+                MM.create_workflow(
+                    "wf-dead-reservation",
+                    usage_based=True,
+                    max_provider_attempts=1,
+                )
+                document = MM.read_json(workflows / "wf-dead-reservation.json")
+                document["usage_reservations"] = {
+                    "orphan": {
+                        "providers": ["claude"],
+                        "runner_pid": 99999999,
+                        "reserved_at": MM.utc_now(),
+                    }
+                }
+                MM.safe_write_json(workflows / "wf-dead-reservation.json", document)
+                usage = MM.provider_usage_snapshot("wf-dead-reservation")
+                selected, _ = MM.apply_workflow_budget(
+                    [reviewer],
+                    "wf-dead-reservation",
+                    reservation_id="replacement",
+                )
+                updated = MM.read_json(workflows / "wf-dead-reservation.json")
+        self.assertEqual(usage["providers"]["claude"]["active_reservations"], 0)
+        self.assertEqual(usage["providers"]["claude"]["attempts_remaining"], 1)
+        self.assertEqual([item.name for item in selected], ["claude"])
+        self.assertNotIn("orphan", updated["usage_reservations"])
+        self.assertIn("replacement", updated["usage_reservations"])
+
+    def test_live_provider_reservation_reduces_reported_headroom(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary) / "workflows"
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "all_run_metadata", return_value=[]),
+                mock.patch.object(
+                    MM,
+                    "workflow_provider_attempts",
+                    return_value={provider: 0 for provider in MM.PROVIDERS},
+                ),
+                mock.patch.object(MM, "process_is_alive", return_value=True),
+                mock.patch.object(MM, "active_provider_cooldown", return_value=None),
+                mock.patch.object(
+                    MM,
+                    "load_config",
+                    return_value=json.loads(json.dumps(MM.DEFAULT_CONFIG)),
+                ),
+            ):
+                MM.create_workflow(
+                    "wf-live-reservation",
+                    usage_based=True,
+                    max_provider_attempts=1,
+                )
+                document = MM.read_json(workflows / "wf-live-reservation.json")
+                document["usage_reservations"] = {
+                    "active": {
+                        "providers": ["claude"],
+                        "runner_pid": 12345,
+                        "reserved_at": MM.utc_now(),
+                    }
+                }
+                MM.safe_write_json(workflows / "wf-live-reservation.json", document)
+                usage = MM.provider_usage_snapshot("wf-live-reservation")
+        claude = usage["providers"]["claude"]
+        self.assertEqual(claude["active_reservations"], 1)
+        self.assertEqual(claude["attempts_including_reservations"], 1)
+        self.assertEqual(claude["attempts_remaining"], 0)
+
     def test_provider_usage_policy_fails_when_every_provider_is_exhausted(self) -> None:
         reviewers = [
             MM.Reviewer("claude", ("claude",), {}, "sonnet", "fake"),
@@ -1344,6 +1463,7 @@ class RunnerUnitTests(unittest.TestCase):
         args = MM.build_parser().parse_args(["gate", "wf-test"])
         output = io.StringIO()
         with (
+            mock.patch.object(MM, "workflow_path", return_value=Path(__file__)),
             mock.patch.object(MM, "workflow_continue_plan", return_value=plan),
             mock.patch.object(MM, "latest_workflow_runs", return_value=[]),
             mock.patch.object(MM, "workflow_finalize_command") as finalize,
@@ -1381,6 +1501,7 @@ class RunnerUnitTests(unittest.TestCase):
             ]
         )
         with (
+            mock.patch.object(MM, "workflow_path", return_value=Path(__file__)),
             mock.patch.object(MM, "workflow_continue_plan", return_value=plan),
             mock.patch.object(MM, "finalize_command") as finalize,
         ):
@@ -1962,6 +2083,122 @@ class RunnerUnitTests(unittest.TestCase):
             self.assertEqual(len(findings), 1)
             self.assertEqual(findings[0].path, "src/secrets.env")
 
+    def test_snapshot_includes_tracked_export_ignored_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            workspace = root / "workspace"
+            repo.mkdir()
+            workspace.mkdir()
+            initialize_repo(repo)
+            smudge_marker = root / "smudge-ran"
+            run(
+                [
+                    "git",
+                    "config",
+                    "filter.audit.smudge",
+                    f"touch {smudge_marker}; cat",
+                ],
+                cwd=repo,
+            )
+            run(["git", "config", "filter.audit.clean", "cat"], cwd=repo)
+            (repo / ".gitattributes").write_text(
+                "src/helper.py export-ignore filter=audit\n"
+                "src/helper_two.py export-ignore filter=audit\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "helper.py").write_text(
+                "HELPER = 1\n", encoding="utf-8"
+            )
+            (repo / "src" / "helper_two.py").write_text(
+                "HELPER_TWO = 2\n", encoding="utf-8"
+            )
+            run(
+                [
+                    "git",
+                    "add",
+                    ".gitattributes",
+                    "src/helper.py",
+                    "src/helper_two.py",
+                ],
+                cwd=repo,
+            )
+            run(["git", "commit", "-qm", "add export ignored helper"], cwd=repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            scope = MM.Scope("uncommitted", None, "working tree changes")
+            paths = MM.changed_paths(repo, scope, ())
+            overlay_paths = MM.snapshot_overlay_paths(repo, scope, paths, ())
+
+            with mock.patch.object(
+                MM, "run_bytes_command", wraps=MM.run_bytes_command
+            ) as bytes_command:
+                snapshot = MM.create_snapshot(
+                    repo, scope, overlay_paths, workspace
+                )
+
+            self.assertTrue((snapshot / "src" / "helper.py").is_file())
+            self.assertEqual(
+                (snapshot / "src" / "helper.py").read_text(encoding="utf-8"),
+                "HELPER = 1\n",
+            )
+            self.assertEqual(
+                (snapshot / "src" / "helper_two.py").read_text(
+                    encoding="utf-8"
+                ),
+                "HELPER_TWO = 2\n",
+            )
+            batch_calls = [
+                call
+                for call in bytes_command.call_args_list
+                if call.args and call.args[0] == ["git", "cat-file", "--batch"]
+            ]
+            self.assertEqual(len(batch_calls), 1)
+            self.assertFalse(smudge_marker.exists())
+
+    def test_provider_prompt_preserves_task_text_that_matches_artifact_labels(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            workspace = root / "workspace"
+            run_dir.mkdir()
+            workspace.mkdir()
+            MM.safe_write(run_dir / "change.patch", "patch")
+            MM.safe_write(run_dir / "manifest.md", "manifest")
+            reviewer = MM.Reviewer(
+                "claude", ("claude",), {}, "test", "fake-claude"
+            )
+            task = (
+                "Preserve these exact task words: Patch artifact: change.patch; "
+                "Manifest artifact: manifest.md"
+            )
+
+            inputs = MM.stage_reviewer_inputs(
+                workspace,
+                run_dir,
+                [reviewer],
+                repo=workspace / "snapshot",
+                scope=MM.Scope("uncommitted", None, "changes"),
+                task=task,
+                risks=[],
+                review_profile="normal",
+                phase="repair",
+            )
+
+            input_dir, prompt = inputs["claude"]
+            self.assertIn(task, prompt)
+            self.assertIn(
+                f"Patch artifact: {input_dir / 'change.patch'}", prompt
+            )
+            self.assertIn(
+                f"Manifest artifact: {input_dir / 'manifest.md'}", prompt
+            )
+            self.assertEqual(prompt.count("Patch artifact:"), 2)
+            self.assertEqual(prompt.count("Manifest artifact:"), 2)
+
     def test_workflow_status_exposes_active_run(self) -> None:
         active = (
             Path("/private/tmp/running-review"),
@@ -2276,7 +2513,7 @@ None.
             },
         )
 
-    def test_ambiguous_lineage_deferrals_are_not_silently_resolved(self) -> None:
+    def test_later_resolution_clears_all_matching_lineage_deferrals(self) -> None:
         effective = MM.effective_finalization_items(
             [
                 (
@@ -2315,11 +2552,7 @@ None.
 
         self.assertEqual(
             [(item[2]["run_id"], item[0]["decision"]) for item in effective],
-            [
-                ("run-ancestor-one", "deferred"),
-                ("run-ancestor-two", "deferred"),
-                ("run-current", "rejected"),
-            ],
+            [("run-current", "rejected")],
         )
 
     def test_legacy_final_triage_freshness_uses_singular_digest(self) -> None:
@@ -2458,6 +2691,7 @@ None.
                 repo=repo,
                 prompt="Review this change.",
                 run_dir=run_dir,
+                input_dir=run_dir,
                 timeout_seconds=10,
             )
 
@@ -2516,6 +2750,7 @@ None.
                 repo=repo,
                 prompt="Review this change.",
                 run_dir=run_dir,
+                input_dir=run_dir,
                 timeout_seconds=10,
             )
 
@@ -2550,6 +2785,7 @@ None.
                     repo=root,
                     prompt="test",
                     run_dir=root,
+                    input_dir=root,
                     timeout_seconds=10,
                 )
         terminate.assert_called_once_with(fake_process)
@@ -2593,6 +2829,143 @@ None.
             self.assertEqual(
                 metadata["failure"]["type"], "stale_runner_recovered"
             )
+
+    def test_recover_releases_orphaned_provider_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflows = root / "workflows"
+            run_dir = root / "runs" / "run-stale"
+            workflows.mkdir()
+            run_dir.mkdir(parents=True)
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "run_id": "run-stale",
+                    "workflow_id": "wf-stale",
+                    "status": "preflight",
+                    "created_at": MM.utc_now(),
+                    "runner_pid": 999999,
+                },
+            )
+            MM.safe_write_json(
+                workflows / "wf-stale.json",
+                {
+                    "workflow_id": "wf-stale",
+                    "usage_reservations": {
+                        "run-stale": {
+                            "providers": ["claude"],
+                            "runner_pid": 999999,
+                        }
+                    },
+                },
+            )
+            args = MM.build_parser().parse_args(
+                ["recover", "--run", str(run_dir)]
+            )
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "process_is_alive", return_value=False),
+            ):
+                self.assertEqual(MM.recover_command(args), 0)
+            workflow = MM.read_json(workflows / "wf-stale.json")
+            self.assertEqual(workflow["usage_reservations"], {})
+
+    def test_concurrent_review_start_rejects_existing_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            workflows = root / "workflows"
+            runs = root / "runs"
+            repo.mkdir()
+            workflows.mkdir()
+            runs.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            with mock.patch.object(MM, "WORKFLOWS_DIR", workflows):
+                MM.create_workflow("wf-concurrent", usage_based=True)
+            args = MM.build_parser().parse_args(
+                [
+                    "run",
+                    "--repo",
+                    str(repo),
+                    "--workflow-id",
+                    "wf-concurrent",
+                    "--uncommitted",
+                    "--task",
+                    "review concurrency",
+                    "--with-claude",
+                    "--without-antigravity",
+                    "--without-kimi",
+                    "--sequential",
+                ]
+            )
+            snapshot_entered = threading.Event()
+            allow_snapshot_failure = threading.Event()
+            first_errors: list[BaseException] = []
+
+            def block_snapshot(*_args: object, **_kwargs: object) -> Path:
+                snapshot_entered.set()
+                self.assertTrue(allow_snapshot_failure.wait(timeout=10))
+                raise MM.ReviewError("synthetic snapshot stop")
+
+            def first_run() -> None:
+                try:
+                    MM.run_review_command(args)
+                except BaseException as exc:  # captured for the test thread
+                    first_errors.append(exc)
+
+            reviewer = MM.Reviewer(
+                "claude", ("claude",), {}, "test", "fake-claude"
+            )
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                mock.patch.object(MM, "RUNS_DIR", runs),
+                mock.patch.object(
+                    MM,
+                    "reviewer_definitions",
+                    return_value=[reviewer],
+                ),
+                mock.patch.object(MM, "reviewer_budget_estimates", return_value={}),
+                mock.patch.object(
+                    MM,
+                    "apply_workflow_budget",
+                    return_value=([reviewer], None),
+                ),
+                mock.patch.object(MM, "create_snapshot", side_effect=block_snapshot),
+            ):
+                thread = threading.Thread(target=first_run)
+                thread.start()
+                self.assertTrue(snapshot_entered.wait(timeout=10))
+                with self.assertRaisesRegex(
+                    MM.ReviewError, "already in preflight or running"
+                ):
+                    MM.run_review_command(args)
+                allow_snapshot_failure.set()
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+
+            self.assertEqual(len(first_errors), 1)
+            self.assertIsInstance(first_errors[0], MM.ReviewError)
+            metadata_paths = list(runs.rglob("metadata.json"))
+            self.assertEqual(len(metadata_paths), 1)
+            self.assertEqual(
+                MM.read_json(metadata_paths[0])["status"], "preflight_blocked"
+            )
+
+    def test_gate_reports_unknown_workflow_actionably(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workflows = Path(temporary)
+            args = MM.build_parser().parse_args(["gate", "wf-missing"])
+            with (
+                mock.patch.object(MM, "WORKFLOWS_DIR", workflows),
+                self.assertRaisesRegex(
+                    MM.ReviewError,
+                    "Unknown workflow wf-missing.*workflow start",
+                ),
+            ):
+                MM.gate_command(args)
 
     def test_antigravity_readiness_requires_authenticated_models(self) -> None:
         with (
@@ -3012,6 +3385,40 @@ None.
             self.assertNotIn(secret, rendered)
             self.assertEqual(len(findings[0].identifier), 12)
 
+    def test_provider_failure_redaction_covers_all_scanner_secret_shapes(self) -> None:
+        raw_values = [
+            "AKIAIOSFODNN7EXAMPLE",
+            "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+            "xoxb-" + "123456789012-" + "abcdefghijklmnop",
+            "sk-abcdefghijklmnopqrstuvwxyz123456",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            'password = "synthetic-sensitive-value-123456"',
+        ]
+        redacted = MM.sanitized_failure_text(*raw_values)
+        for value in raw_values:
+            self.assertNotIn(value, redacted)
+        self.assertIn("[REDACTED:", redacted)
+
+    def test_secret_scan_covers_large_files_and_deleted_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            large = repo / "large.txt"
+            large.write_text(
+                "a" * (2 * 1024 * 1024 + 32)
+                + "\nAKIAIOSFODNN7EXAMPLE\n",
+                encoding="utf-8",
+            )
+            findings = MM.sensitive_content_findings(
+                repo,
+                ["large.txt"],
+                '---- apiKey = "deleted-sensitive-value-123456"\n',
+            )
+        by_path: dict[str, list[MM.SensitiveFinding]] = {}
+        for finding in findings:
+            by_path.setdefault(finding.path, []).append(finding)
+        self.assertEqual(len(by_path["large.txt"]), 1)
+        self.assertEqual(len(by_path["change.patch"]), 1)
+
     def test_report_parser_distinguishes_pass_with_findings(self) -> None:
         report = """# Verdict
 PASS_WITH_FINDINGS
@@ -3039,6 +3446,32 @@ None.
         self.assertEqual(len(parsed["test_gaps"]), 1)
         self.assertEqual(parsed["test_gaps"][0]["id"], "claude-test-001")
         self.assertEqual(parsed["test_gaps"][0]["severity"], "low")
+
+    def test_legacy_observation_records_vacated_finding_identifier(self) -> None:
+        report = structured_report(
+            verdict="PASS_WITH_FINDINGS",
+            findings=(
+                "## [low] Formatting preference\n"
+                "- Location: src/feature.py:1\n"
+                "- Trigger: reading the file\n"
+                "- Evidence: naming is subjective\n"
+                "- Impact: none\n"
+                "- Smallest fix: none\n"
+                "- Confidence: medium\n\n"
+                "## [medium] Retry can duplicate work\n"
+                "- Location: src/feature.py:2\n"
+                "- Trigger: retry after persistence\n"
+                "- Evidence: no idempotency key\n"
+                "- Impact: duplicate job\n"
+                "- Smallest fix: persist a stable key\n"
+                "- Confidence: high"
+            ),
+        )
+        parsed = MM.parse_review_report("claude", report)
+        self.assertEqual([item["id"] for item in parsed["findings"]], ["claude-002"])
+        self.assertEqual(
+            parsed["observations"][0]["promoted_from"], "claude-001"
+        )
 
     def test_review_prompt_disallows_empty_pass_with_findings(self) -> None:
         prompt = MM.build_prompt(
@@ -3589,6 +4022,7 @@ None.
                 repo=root,
                 prompt="Review.",
                 run_dir=root,
+                input_dir=root,
                 timeout_seconds=10,
             )
             report = result.report_path.read_text(encoding="utf-8")
@@ -3625,6 +4059,7 @@ None.
                     repo=root,
                     prompt="Review.",
                     run_dir=root,
+                    input_dir=root,
                     timeout_seconds=10,
                 )
         self.assertEqual(result.returncode, 1)
@@ -4525,6 +4960,7 @@ None.
             repo.mkdir()
             now = MM.utc_now()
             MM.safe_write(run_dir / "change.patch", "")
+            MM.safe_write(run_dir / "manifest.md", "manifest")
             MM.safe_write(run_dir / "prompt.md", "review")
             MM.safe_write_json(
                 run_dir / "metadata.json",
@@ -5113,6 +5549,25 @@ None.
             },
         )
 
+    def test_analytics_accepts_timezone_naive_legacy_timestamp(self) -> None:
+        runs = [
+            (
+                Path("/tmp/legacy-naive"),
+                {
+                    "created_at": MM.utc_now().replace("+00:00", ""),
+                    "status": "preflight_blocked",
+                    "workflow_id": "wf-legacy-naive",
+                },
+            )
+        ]
+        with (
+            mock.patch.object(MM, "all_run_metadata", return_value=runs),
+            mock.patch.object(MM, "workflow_path", return_value=Path("/missing")),
+            mock.patch.object(MM, "WORKFLOWS_DIR", Path("/missing")),
+        ):
+            report = MM.analytics_report(7)
+        self.assertEqual(report["run_statuses"]["preflight_blocked"], 1)
+
     def test_preflight_blocks_are_not_counted_as_failed_reviews(self) -> None:
         run_dir = Path("/tmp/preflight-block")
         metadata = {
@@ -5561,6 +6016,113 @@ None.
             self.assertEqual(null_results, [])
             self.assertEqual(database.stat().st_mode & 0o777, 0o600)
             self.assertEqual(compacted["evidence_items"], 1)
+
+    def test_evidence_memory_rebuild_reports_skipped_malformed_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            valid = root / "valid"
+            malformed = root / "malformed"
+            valid.mkdir()
+            malformed.mkdir()
+            database = root / "evidence.sqlite3"
+            MM.safe_write_json(
+                valid / "metadata.json",
+                {
+                    "run_id": "run-valid",
+                    "workflow_id": "wf-valid",
+                    "round": 1,
+                },
+            )
+            MM.safe_write_json(valid / "triage.json", {"findings": []})
+            MM.safe_write_json(
+                malformed / "metadata.json",
+                {
+                    "run_id": "run-malformed",
+                    "workflow_id": "wf-malformed",
+                    "round": "not-a-number",
+                },
+            )
+            MM.safe_write_json(malformed / "triage.json", {"findings": []})
+
+            rebuilt = EM.rebuild(
+                database,
+                [(valid, "wf-valid"), (malformed, "wf-malformed")],
+            )
+
+            self.assertEqual(rebuilt["runs"], 1)
+            self.assertEqual(rebuilt["skipped_runs"], 1)
+            self.assertIsNone(
+                EM.upsert_run(database, malformed, lineage_root="wf-malformed")
+            )
+
+    def test_evidence_memory_search_many_uses_one_database_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            database = root / "evidence.sqlite3"
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {
+                    "run_id": "run-one",
+                    "workflow_id": "wf-one",
+                    "round": 1,
+                    "repository": {"id": "repo-one"},
+                },
+            )
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {
+                    "findings": [
+                        {
+                            "id": "claude-001",
+                            "title": "Retry duplicates a queued job",
+                            "decision": "fixed",
+                        }
+                    ]
+                },
+            )
+            self.assertEqual(
+                EM.upsert_run(database, run_dir, lineage_root="wf-one"), 1
+            )
+            original_open = EM._open_database
+            with mock.patch.object(
+                EM, "_open_database", wraps=original_open
+            ) as open_database:
+                results = EM.search_many(
+                    database,
+                    ["retry duplicate", "queued job"],
+                    repository_id="repo-one",
+                    minimum_similarity=0.0,
+                )
+            self.assertEqual(open_database.call_count, 1)
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(result for result in results))
+
+    def test_workflow_query_cache_reads_run_metadata_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runs = Path(temporary) / "runs"
+            run_dir = runs / "repo" / "run-one"
+            run_dir.mkdir(parents=True)
+            MM.safe_write_json(
+                run_dir / "metadata.json",
+                {"run_id": "run-one", "workflow_id": "wf-one"},
+            )
+            original_read_json = MM.read_json
+            with (
+                mock.patch.object(MM, "RUNS_DIR", runs),
+                mock.patch.object(
+                    MM, "read_json", wraps=original_read_json
+                ) as read_json,
+                MM.workflow_query_cache(),
+            ):
+                self.assertEqual(MM.all_run_metadata(), MM.all_run_metadata())
+            metadata_reads = [
+                call
+                for call in read_json.call_args_list
+                if call.args and Path(call.args[0]).name == "metadata.json"
+            ]
+            self.assertEqual(len(metadata_reads), 1)
 
     def test_analytics_reports_lineage_outcomes_and_run_finals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -7137,6 +7699,47 @@ class RunnerEndToEndTests(unittest.TestCase):
             self.assertEqual(
                 [item["provider"] for item in provider_calls].count("kimi"), 2
             )
+            resumed_kimi_call = [
+                item for item in provider_calls if item["provider"] == "kimi"
+            ][-1]
+            initial_claude_call = next(
+                item for item in provider_calls if item["provider"] == "claude"
+            )
+            initial_kimi_call = [
+                item for item in provider_calls if item["provider"] == "kimi"
+            ][0]
+            self.assertEqual(
+                resumed["reviewers"]["claude"]["prompt_sha256"],
+                initial_claude_call["staged_prompt_sha256"],
+            )
+            self.assertEqual(
+                resumed["reviewers"]["kimi"]["prompt_sha256"],
+                resumed_kimi_call["staged_prompt_sha256"],
+            )
+            self.assertEqual(
+                resumed["reviewers"]["kimi"]["attempts"][0]["prompt_sha256"],
+                initial_kimi_call["staged_prompt_sha256"],
+            )
+            self.assertEqual(
+                resumed["prompt_template_sha256"], resumed["prompt_sha256"]
+            )
+            self.assertEqual(
+                resumed_kimi_call["granted_files"],
+                ["change.patch", "manifest.md", "prompt.md"],
+            )
+            self.assertFalse(
+                {
+                    "claude.md",
+                    "review-summary.json",
+                    "triage.json",
+                    "metadata.json",
+                }
+                & {Path(path).name for path in resumed_kimi_call["workspace_files"]}
+            )
+            self.assertNotEqual(
+                Path(str(resumed_kimi_call["granted_dir"])).parent,
+                partial_dir,
+            )
             partial_status = json.loads(
                 harness.cli(
                     repo, "workflow", "status", partial_workflow, check=False
@@ -7493,6 +8096,7 @@ class RunnerEndToEndTests(unittest.TestCase):
                     repo=repo,
                     prompt="synthetic timeout",
                     run_dir=timeout_dir,
+                    input_dir=timeout_dir,
                     timeout_seconds=1,
                 )
             self.assertTrue(timeout_result.timed_out)
@@ -10249,4 +10853,4 @@ class RunnerEndToEndTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(buffer=True)

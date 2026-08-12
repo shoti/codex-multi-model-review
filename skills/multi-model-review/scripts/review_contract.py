@@ -396,6 +396,7 @@ def parse_review_report(
                     f"{len(explicit_observations) + index:03d}"
                 ),
                 "kind": "observation",
+                "promoted_from": item.get("id"),
             }
             for index, item in enumerate(legacy_observations, start=1)
         ],
