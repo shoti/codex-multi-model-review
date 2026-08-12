@@ -81,6 +81,8 @@ flowchart TD
 - Git.
 - A current Codex CLI with `codex plugin` support.
 - At least one installed and authenticated reviewer CLI.
+- GitHub CLI (`gh`), authenticated, only when Codex should create or update a
+  pull request.
 
 The runner has no third-party Python dependencies.
 It fails immediately with an actionable version error before creating a
@@ -176,6 +178,9 @@ The normal Codex-driven flow is:
    A local source gate and a deployment-bound gate are reported separately.
 10. When the user authorizes commit and push, provide concise, paste-ready PR
     copy focused on the problem, evidence or root cause, and resulting behavior.
+11. Write that copy to GitHub only when the user separately authorizes creating
+    or updating the PR. Verify the account, repository, branches, existing body,
+    and post-write result with GitHub CLI; no other PR mutations are implied.
 
 If the confirmation reviewer reports incomplete coverage, finalization stops.
 Run another independent review or inspect every disclosed path and limitation,
@@ -652,6 +657,12 @@ providers.
   `Production evidence` and `Fix`; ordinary fixes use `Summary` and `Fix`; new
   features use `Summary` and `What changed`. Routine test and file inventories
   are intentionally omitted unless they materially affect the merge decision.
+- GitHub CLI may create or update the PR body only with explicit authority for
+  that action. The workflow verifies account/repository/branch targeting,
+  protects material existing descriptions from silent overwrite, uses a
+  private body file, reads the result back, and never treats PR-description
+  authority as permission for reviewers, labels, comments, merges, or other
+  GitHub changes.
 
 ## Contributing and security
 

@@ -1,6 +1,6 @@
 ---
 name: multi-model-review
-description: Run a gated code-review loop in which Codex remains the implementer and final verifier while Claude Code, Antigravity CLI using Gemini models, and optional Kimi Code independently review a Git working tree, branch, or commit with read-only tools. Use after non-trivial implementation work, before merge or deployment, when the user requests Claude/Antigravity/Gemini/Kimi/external/second-opinion/final review, or when findings from another coding agent need to be verified and fixed.
+description: Run a gated code-review loop in which Codex remains the implementer and final verifier while Claude Code, Antigravity CLI using Gemini models, and optional Kimi Code independently review a Git working tree, branch, or commit with read-only tools. Use after non-trivial implementation work, before merge or deployment, when the user requests Claude/Antigravity/Gemini/Kimi/external/second-opinion/final review, when findings from another coding agent need verification and fixes, or for an explicitly authorized post-review commit, push, or GitHub pull-request handoff.
 ---
 
 # Multi-Model Review
@@ -395,6 +395,34 @@ problem, why it happened, and the resulting behavior. Omit routine test-pass
 lists, changed-file inventories, review workflow metadata, and low-level
 implementation detail. Mention compatibility, rollout, migration, or known
 limitations only when they materially affect the merge decision.
+
+GitHub PR writes require separate, explicit authority and an authenticated
+GitHub CLI. `commit and push` alone never authorizes creating or editing a PR.
+When the user explicitly asks to open/create a PR or update its description:
+
+1. Run `gh auth status --hostname github.com` without printing or retrieving the
+   token. Verify the authenticated account, repository owner/name, remote,
+   current branch, pushed HEAD, and intended base branch. Stop and ask if any of
+   them are ambiguous or mismatched.
+2. Use `gh pr view --json number,url,state,title,body,baseRefName,headRefName`
+   first. If the user authorized only an update and no open PR exists, stop;
+   never silently create one. If an existing body contains material human
+   content rather than only the repository's blank template, show the proposed
+   replacement and obtain explicit approval before overwriting it.
+3. Create with explicit `--base`, `--head`, `--title`, and `--body-file`, or
+   update the current branch's open PR with `gh pr edit --body-file`. Put the
+   generated description in a private temporary file, never in shell-expanded
+   command text, and remove the file after the command.
+4. Do not add reviewers, assignees, labels, milestones, projects, auto-merge,
+   merge actions, approvals, comments, or any other PR mutation unless the user
+   explicitly authorizes that exact action. Do not request extra GitHub scopes
+   merely to complete the PR description.
+5. Read the PR back with `gh pr view` and verify the URL, base/head branches,
+   title, and exact body. Report any mismatch or partial failure.
+
+If GitHub CLI is missing, unauthenticated, or lacks access, stop with the exact
+readiness problem. Still provide paste-ready PR copy, but never claim the
+description was assigned on GitHub.
 
 Do not commit, push, open a PR, deploy, or change production state unless the
 user separately authorizes it.

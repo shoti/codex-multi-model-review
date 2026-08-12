@@ -32,6 +32,10 @@ All notable user-visible changes are documented here. This project follows
 - Produce concise, evidence-aware GitHub PR descriptions after an explicitly
   authorized commit and push, with separate shapes for production-evidenced
   fixes, ordinary fixes, and new features.
+- Add a least-authority GitHub CLI handoff for explicitly authorized PR creation
+  or description updates, including target verification, existing-body
+  protection, private body files, post-write verification, and strict exclusion
+  of unrelated PR mutations or extra scopes.
 - Add provenance-bound `--exclude-snapshot-path` support for exact unchanged
   tracked sensitive files, with pinned contracts, freshness/resume validation,
   manifest disclosure, and mandatory Codex coverage compensation.
