@@ -32,8 +32,12 @@ The adapter runs a fresh non-interactive session with:
 ```text
 agy --agent codex-multi-model-review-read-only-v1 \
   --mode plan --sandbox --output-format json \
-  --add-dir <private-run-directory> --print <review-prompt>
+  --add-dir <provider-specific-input-directory> --print <review-prompt>
 ```
+
+The added directory contains only the staged patch, manifest, and prompt. The
+private artifact directory containing peer reports, metadata, and Codex triage
+is never granted to the reviewer.
 
 Install the bundled custom agent once:
 

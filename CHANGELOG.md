@@ -5,6 +5,28 @@ All notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+### Fixed
+
+- Isolate every provider in a per-attempt input directory so resumed reviewers
+  cannot read peer reports, Codex triage, workflow summaries, or run metadata.
+- Restore tracked `export-ignore` files to immutable snapshots from raw Git
+  blobs without invoking repository-configured checkout filters.
+- Clear all matching ancestor deferrals when a later lineage decision resolves
+  the item, normalize legacy analytics timestamps, and make missing-workflow
+  gate errors actionable.
+- Reclaim dead provider-attempt reservations, expose live reservations in
+  status/headroom, release them during stale-run recovery, and serialize review
+  creation so concurrent preflights cannot duplicate a round.
+- Redact configured secret shapes from persisted provider failures and stderr,
+  scan complete non-binary files plus deleted YAML separator lines, and keep
+  exact sensitive-approval identities stable.
+- Cache workflow-audit metadata and lineage indexes for one report, batch
+  evidence-memory searches, report malformed rebuild inputs as skipped, and
+  preserve the original finding ID when a legacy finding becomes an
+  observation.
+- Compile every runtime module in CI and buffer unittest output so failures are
+  not buried in successful command diagnostics.
+
 ### Added
 
 - Add provenance-bound `--exclude-snapshot-path` support for exact unchanged
