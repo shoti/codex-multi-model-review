@@ -1282,6 +1282,179 @@ class RunnerUnitTests(unittest.TestCase):
         self.assertFalse(plan["actions"][0]["automatable"])
         self.assertIn("mm-review run", plan["actions"][0]["command"])
 
+    def test_clean_review_guidance_matches_each_lifecycle_phase(self) -> None:
+        clean = {
+            "claude": {
+                "findings": [],
+                "test_gaps": [],
+                "observations": [],
+            }
+        }
+        self.assertIn(
+            "mandatory confirmation",
+            MM.review_next_guidance(clean, "repair"),
+        )
+        self.assertIn(
+            "finalize and verify this confirmation",
+            MM.review_next_guidance(clean, "confirmation"),
+        )
+        self.assertIn(
+            "finalize and verify this supplemental evidence",
+            MM.review_next_guidance(clean, "supplemental"),
+        )
+
+    def test_review_guidance_names_only_present_triage_kinds(self) -> None:
+        observations = {
+            "claude": {
+                "findings": [],
+                "test_gaps": [],
+                "observations": [{"title": "Generated cache"}],
+            }
+        }
+        guidance = MM.review_next_guidance(observations, "repair")
+        self.assertIn("acknowledge every observation", guidance)
+        self.assertNotIn("finding", guidance)
+        self.assertNotIn("test gap", guidance)
+
+    def test_review_guidance_uses_valid_dispositions_for_actionable_items(
+        self,
+    ) -> None:
+        findings = {
+            "claude": {
+                "findings": [{"title": "Bug"}],
+                "test_gaps": [],
+                "observations": [],
+            }
+        }
+        test_gaps = {
+            "claude": {
+                "findings": [],
+                "test_gaps": [{"title": "Missing test"}],
+                "observations": [],
+            }
+        }
+        mixed = {
+            "claude": {
+                "findings": [{"title": "Bug"}],
+                "test_gaps": [{"title": "Missing test"}],
+                "observations": [{"title": "Generated cache"}],
+            }
+        }
+        self.assertIn(
+            "decide every finding with",
+            MM.review_next_guidance(findings, "repair"),
+        )
+        self.assertNotIn(
+            "acknowledge",
+            MM.review_next_guidance(findings, "repair"),
+        )
+        self.assertIn(
+            "decide every test gap with",
+            MM.review_next_guidance(test_gaps, "repair"),
+        )
+        self.assertNotIn(
+            "acknowledge",
+            MM.review_next_guidance(test_gaps, "repair"),
+        )
+        self.assertIn(
+            "decide every finding and every test gap and acknowledge every observation",
+            MM.review_next_guidance(mixed, "repair"),
+        )
+
+    def test_confirmation_guidance_surfaces_incomplete_coverage_compensation(
+        self,
+    ) -> None:
+        incomplete = {
+            "claude": {
+                "findings": [],
+                "test_gaps": [],
+                "observations": [],
+                "coverage": {"complete": False},
+            }
+        }
+        guidance = MM.review_next_guidance(incomplete, "confirmation")
+        self.assertIn("another independent review", guidance)
+        self.assertIn("`--coverage-verification` before finalization", guidance)
+        self.assertIn("finalize and verify this confirmation", guidance)
+
+    def test_confirmation_triage_guidance_retains_finalization_and_coverage(
+        self,
+    ) -> None:
+        incomplete = {
+            "claude": {
+                "findings": [{"title": "Bug"}],
+                "test_gaps": [],
+                "observations": [],
+                "coverage": {"complete": False},
+            }
+        }
+        guidance = MM.review_next_guidance(incomplete, "confirmation")
+        self.assertIn("decide every finding", guidance)
+        self.assertIn("`--coverage-verification` before finalization", guidance)
+        self.assertIn("If source must change, use a linked successor", guidance)
+        self.assertIn("finalize and verify this confirmation", guidance)
+
+    def test_supplemental_guidance_surfaces_snapshot_exclusion_compensation(
+        self,
+    ) -> None:
+        complete = {
+            "claude": {
+                "findings": [],
+                "test_gaps": [],
+                "observations": [],
+                "coverage": {"complete": True},
+            }
+        }
+        guidance = MM.review_next_guidance(
+            complete,
+            "supplemental",
+            has_snapshot_exclusions=True,
+        )
+        self.assertIn("uncovered or excluded area", guidance)
+        self.assertIn("`--coverage-verification` before finalization", guidance)
+        self.assertIn("finalize and verify this supplemental evidence", guidance)
+
+    def test_supplemental_triage_guidance_retains_non_authoritative_warning(
+        self,
+    ) -> None:
+        observations = {
+            "claude": {
+                "findings": [],
+                "test_gaps": [],
+                "observations": [{"title": "Generated cache"}],
+                "coverage": {"complete": True},
+            }
+        }
+        guidance = MM.review_next_guidance(observations, "supplemental")
+        self.assertIn("acknowledge every observation", guidance)
+        self.assertIn("finalize and verify this supplemental evidence", guidance)
+        self.assertIn("does not replace the parent gate", guidance)
+
+    def test_completed_review_guidance_reads_persisted_phase_and_exclusions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            MM.safe_write_json(
+                run_dir / "review-summary.json",
+                {
+                    "reviews": {
+                        "claude": {
+                            "findings": [],
+                            "test_gaps": [],
+                            "observations": [],
+                            "coverage": {"complete": True},
+                        }
+                    }
+                },
+            )
+            guidance = MM.completed_review_next_guidance(
+                run_dir,
+                {"phase": "supplemental", "snapshot_exclusions": ["fixture.txt"]},
+            )
+        self.assertIn("`--coverage-verification` before finalization", guidance)
+        self.assertIn("finalize and verify this supplemental evidence", guidance)
+
     def test_continue_and_gate_surface_real_partial_run(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -9394,6 +9567,29 @@ class RunnerEndToEndTests(unittest.TestCase):
             for item in attested_status["repositories"]:
                 self.assertNotIn("deployed", item)
                 self.assertNotIn("remote_branch_equal", item)
+
+            feature_path = repos[0] / "src" / "feature.py"
+            original_feature = feature_path.read_text(encoding="utf-8")
+            feature_path.write_text("VALUE = 99\n", encoding="utf-8")
+            unclosed_stale = json.loads(
+                harness.cli(
+                    repos[0], "workflow", "status", workflow, check=False
+                ).stdout
+            )
+            self.assertEqual(unclosed_stale["state"], "blocked")
+            unclosed_continue = json.loads(
+                harness.cli(
+                    repos[0], "continue", workflow, "--format", "json", check=False
+                ).stdout
+            )
+            self.assertEqual(unclosed_continue["next"], "NEEDS_SUCCESSOR")
+            self.assertEqual(unclosed_continue["actions"][0]["type"], "successor")
+            feature_path.write_text(original_feature, encoding="utf-8")
+            restored_unclosed = json.loads(
+                harness.cli(repos[0], "workflow", "status", workflow).stdout
+            )
+            self.assertEqual(restored_unclosed["state"], "ready_to_finalize")
+
             harness.cli(repos[0], "workflow", "finalize", workflow)
             completed = json.loads(
                 harness.cli(repos[0], "workflow", "status", workflow).stdout
@@ -9407,6 +9603,37 @@ class RunnerEndToEndTests(unittest.TestCase):
                 for item in completed_audit["workflows"]
             }
             self.assertEqual(completed_states[workflow], "completed")
+            triage_path = repo_one_final / "triage.json"
+            original_triage = triage_path.read_text(encoding="utf-8")
+            triage_path.write_text(original_triage + "\n", encoding="utf-8")
+            triage_stale = json.loads(
+                harness.cli(
+                    repos[0], "workflow", "status", workflow, check=False
+                ).stdout
+            )
+            self.assertEqual(triage_stale["state"], "completed_stale")
+            triage_stale_repo = next(
+                item
+                for item in triage_stale["repositories"]
+                if item["run_dir"] == str(repo_one_final)
+            )
+            self.assertNotEqual(triage_stale_repo["freshness_mode"], "stale")
+            triage_continue = json.loads(
+                harness.cli(
+                    repos[0], "continue", workflow, "--format", "json", check=False
+                ).stdout
+            )
+            self.assertEqual(triage_continue["next"], "NEEDS_SUCCESSOR")
+            self.assertIn(
+                "authoritative final became stale",
+                triage_continue["actions"][0]["command"],
+            )
+            self.assertNotIn("source changed", triage_continue["actions"][0]["command"])
+            triage_path.write_text(original_triage, encoding="utf-8")
+            restored = json.loads(
+                harness.cli(repos[0], "workflow", "status", workflow).stdout
+            )
+            self.assertEqual(restored["state"], "completed")
             for repo in repos:
                 run(["git", "push", "-q", "origin", "main"], cwd=repo)
                 local_head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
@@ -9446,6 +9673,22 @@ class RunnerEndToEndTests(unittest.TestCase):
                 for item in stale_audit["workflows"]
             }
             self.assertEqual(stale_states[workflow], "completed_stale")
+            stale_continue = json.loads(
+                harness.cli(
+                    repos[0], "continue", workflow, "--format", "json", check=False
+                ).stdout
+            )
+            self.assertEqual(stale_continue["next"], "NEEDS_SUCCESSOR")
+            self.assertEqual(stale_continue["actions"][0]["type"], "successor")
+            self.assertFalse(stale_continue["actions"][0]["automatable"])
+            self.assertIn(
+                f"workflow supersede {workflow}",
+                stale_continue["actions"][0]["command"],
+            )
+            self.assertIn(
+                "authoritative final became stale",
+                stale_continue["actions"][0]["command"],
+            )
 
             successor = harness.cli(
                 repos[0],
@@ -9606,6 +9849,17 @@ class RunnerEndToEndTests(unittest.TestCase):
                 ).stdout
             )
             self.assertEqual(blocked_status["state"], "blocked")
+            blocked_continue = json.loads(
+                harness.cli(
+                    repos[0],
+                    "continue",
+                    blocked_workflow,
+                    "--format",
+                    "json",
+                    check=False,
+                ).stdout
+            )
+            self.assertEqual(blocked_continue["next"], "BLOCKED")
             final_audit = json.loads(
                 harness.cli(repos[0], "workflow", "audit", "--format", "json").stdout
             )
@@ -10697,6 +10951,7 @@ class RunnerEndToEndTests(unittest.TestCase):
                 env=environment,
             )
             self.assertIn("resumed and completed", resumed.stdout)
+            self.assertIn("mandatory confirmation", resumed.stdout)
             completed = json.loads(metadata_path.read_text(encoding="utf-8"))
             self.assertEqual(completed["status"], "completed")
             self.assertEqual(completed["reviewers"]["kimi"]["exit_code"], 0)

@@ -631,9 +631,12 @@ providers.
   ceiling still applies.
 - **Provider attempt allowance exhausted:** wait for quota reset, enable another
   provider, or intentionally supersede with a matching revised usage policy.
-- **Stale final gate or changed confirmation contract:** use
-  `mm-review workflow supersede <workflow-id> --reason "<why>"`, then review
-  under the reported successor workflow.
+- **Stale final gate:** `mm-review continue <workflow-id>` reports
+  `NEEDS_SUCCESSOR` with the exact non-automatic `workflow supersede` command;
+  run it intentionally, then review under the reported successor workflow.
+- **Changed confirmation contract:** invoke `mm-review workflow supersede
+  <workflow-id> --reason "<why>"` directly, then review under the reported
+  successor workflow.
 - **Review contract drift:** use `--reuse-contract` for confirmation. Explicitly
   supersede only when scope, paths, risks, profile, or task truly changed.
 - **Sensitive material blocked:** remove it from scope, or run
