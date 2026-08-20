@@ -7,6 +7,10 @@ All notable user-visible changes are documented here. This project follows
 
 ### Fixed
 
+- Convert private artifact-store permission failures into actionable errors and
+  support `MM_REVIEW_RUNS_DIR` / `MM_REVIEW_CONFIG_DIR` for hosts whose Codex
+  sandbox cannot write the default state locations.
+
 - Block repair before provider invocation when the remaining attempt allowance
   cannot reach mandatory confirmation, or when a last-chance Claude call is
   below a medium/high-confidence historical stop recommendation. Preserve the
@@ -35,6 +39,23 @@ All notable user-visible changes are documented here. This project follows
   not buried in successful command diagnostics.
 
 ### Added
+
+- Add an opt-in Codex reviewer adapter that runs an ephemeral, globally
+  user-config-isolated, approval-free, schema-constrained `codex exec` session
+  against the same
+  private immutable snapshot. Require Codex CLI 0.138.0 or newer and use a
+  custom permission profile that denies host reads, writes, and reviewer
+  command network access while granting read access only to the snapshot and
+  staged inputs. Restrict the child process to a minimal non-secret
+  environment, disable shell, unified exec, command network, browser,
+  connector, and delegation surfaces, and expose an embedded root-validating
+  read/search MCP server as a direct-only namespace. Stage ChatGPT credentials
+  in an ephemeral private `CODEX_HOME`, and reject API-key or keyring-backed
+  authentication.
+- Allow an explicit `resume --replace-failed-claude-with-codex` substitution
+  after typed Claude quota, authentication, or budget-stop failures while
+  preserving the failed attempt, source fingerprint, and honest same-provider-
+  family coverage metadata.
 
 - Record the exact plugin name/version, bundle root, runner path, and runner
   SHA-256 in diagnostics, status output, and every run artifact.

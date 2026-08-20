@@ -82,6 +82,21 @@ def structured_report(
     )
 
 
+def structured_payload() -> dict[str, object]:
+    return {
+        "verdict": "PASS_CLEAN",
+        "findings": [],
+        "test_gaps": [],
+        "observations": [],
+        "coverage": {
+            "complete": True,
+            "unreviewed_changed_paths": [],
+            "limitations": [],
+        },
+        "notes": [],
+    }
+
+
 class FakeProviderHarness:
     """Real subprocess harness whose only provider binaries are local shims."""
 
@@ -98,12 +113,17 @@ class FakeProviderHarness:
                 {
                     "_sequence": 0,
                     "claude": [],
+                    "codex": [],
                     "agy": [],
                     "kimi": [],
                 }
             ),
             encoding="utf-8",
         )
+        (self.root / "auth.json").write_text(
+            '{"auth_mode":"synthetic-chatgpt"}\n', encoding="utf-8"
+        )
+        (self.root / "auth.json").chmod(0o600)
         shim = self.bin_dir / "provider-shim"
         shim.write_text(
             textwrap.dedent(
@@ -120,10 +140,22 @@ class FakeProviderHarness:
                 provider = pathlib.Path(sys.argv[0]).name
                 args = sys.argv[1:]
                 if args == ["--version"]:
-                    print(f"fake-{provider} campaign-1.0")
+                    if provider == "codex":
+                        print("codex-cli 0.148.0")
+                    else:
+                        print(f"fake-{provider} campaign-1.0")
                     raise SystemExit(0)
                 if provider == "claude" and args == ["--help"]:
                     print("--effort --max-budget-usd --json-schema --permission-mode --tools --safe-mode --no-session-persistence")
+                    raise SystemExit(0)
+                if provider == "codex" and args == ["--help"]:
+                    print("--ask-for-approval")
+                    raise SystemExit(0)
+                if provider == "codex" and args == ["exec", "--help"]:
+                    print("--config --disable --ephemeral --ignore-rules --ignore-user-config --json --output-schema --profile --skip-git-repo-check --strict-config")
+                    raise SystemExit(0)
+                if provider == "codex" and args == ["login", "status"]:
+                    print("Logged in using ChatGPT")
                     raise SystemExit(0)
                 if provider == "claude" and args == ["auth", "status"]:
                     print(json.dumps({"loggedIn": True, "authMethod": "oauth", "subscription": "synthetic"}))
@@ -135,8 +167,14 @@ class FakeProviderHarness:
                     print(json.dumps({"models": {"k3-256k": {}}}))
                     raise SystemExit(0)
 
-                prompt = sys.stdin.read() if provider == "claude" else ""
-                state_path = pathlib.Path(os.environ["MM_FAKE_PROVIDER_STATE"])
+                prompt = sys.stdin.read() if provider in {"claude", "codex"} else ""
+                fake_root = pathlib.Path(os.environ.get("CODEX_HOME", "."))
+                fake_campaign_root = pathlib.Path(os.environ["HOME"]).parent
+                state_path = (
+                    fake_campaign_root / "provider-state.json"
+                    if provider == "codex"
+                    else pathlib.Path(os.environ["MM_FAKE_PROVIDER_STATE"])
+                )
                 with state_path.open("r+", encoding="utf-8") as state_file:
                     fcntl.flock(state_file, fcntl.LOCK_EX)
                     state = json.load(state_file)
@@ -195,8 +233,29 @@ class FakeProviderHarness:
                     "granted_files": granted_files,
                     "workspace_files": workspace_files,
                     "mutate_relative": mutation,
+                    "sentinel_secret_present": (
+                        "MM_REVIEW_SENTINEL_SECRET" in os.environ
+                    ),
+                    "codex_home": str(fake_root) if provider == "codex" else None,
+                    "codex_auth_present": (
+                        (fake_root / "auth.json").is_file()
+                        if provider == "codex"
+                        else None
+                    ),
+                    "codex_profile": (
+                        (fake_root / "review-files.config.toml").read_text(
+                            encoding="utf-8"
+                        )
+                        if provider == "codex"
+                        and (fake_root / "review-files.config.toml").is_file()
+                        else None
+                    ),
                 }
-                log_path = pathlib.Path(os.environ["MM_FAKE_PROVIDER_LOG"])
+                log_path = (
+                    fake_campaign_root / "provider-invocations.jsonl"
+                    if provider == "codex"
+                    else pathlib.Path(os.environ["MM_FAKE_PROVIDER_LOG"])
+                )
                 with log_path.open("a", encoding="utf-8") as log_file:
                     fcntl.flock(log_file, fcntl.LOCK_EX)
                     log_file.write(json.dumps(record, sort_keys=True) + "\n")
@@ -227,6 +286,29 @@ class FakeProviderHarness:
                         "total_cost_usd": float(outcome.get("cost", 0.01)),
                         "num_turns": 1,
                     }))
+                elif provider == "codex":
+                    structured = outcome.get("structured")
+                    if structured is None:
+                        structured = json.loads(report)
+                    print(json.dumps({
+                        "type": "thread.started",
+                        "thread_id": "00000000-0000-0000-0000-000000000001",
+                    }))
+                    print(json.dumps({
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": json.dumps(structured),
+                        },
+                    }))
+                    print(json.dumps({
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": int(outcome.get("input_tokens", 10)),
+                            "cached_input_tokens": int(outcome.get("cached_input_tokens", 0)),
+                            "output_tokens": int(outcome.get("output_tokens", 20)),
+                        },
+                    }))
                 elif provider == "agy":
                     print(json.dumps({
                         "status": "SUCCESS",
@@ -242,7 +324,7 @@ class FakeProviderHarness:
             encoding="utf-8",
         )
         shim.chmod(0o755)
-        for provider in ("claude", "agy", "kimi"):
+        for provider in ("claude", "codex", "agy", "kimi"):
             shutil.copy2(shim, self.bin_dir / provider)
             (self.bin_dir / provider).chmod(0o755)
         agent_path = (
@@ -259,6 +341,7 @@ class FakeProviderHarness:
         self.environment.update(
             {
                 "HOME": str(self.home),
+                "CODEX_HOME": str(self.root),
                 "PATH": f"{self.bin_dir}:{self.environment['PATH']}",
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "MM_FAKE_PROVIDER_STATE": str(self.state_path),
@@ -268,7 +351,7 @@ class FakeProviderHarness:
         self.base = [sys.executable, str(SCRIPT_PATH)]
 
     def assert_fake_resolution(self) -> None:
-        for provider in ("claude", "agy", "kimi"):
+        for provider in ("claude", "codex", "agy", "kimi"):
             resolved = shutil.which(provider, path=self.environment["PATH"])
             if Path(resolved or "").resolve() != (self.bin_dir / provider).resolve():
                 raise AssertionError(
@@ -438,6 +521,494 @@ class RunnerUnitTests(unittest.TestCase):
             with self.assertRaisesRegex(MM.ReviewError, "positive finite"):
                 MM.reviewer_definitions(invalid_args, config)
 
+    def test_codex_review_is_ephemeral_schema_constrained_and_workspace_only(self) -> None:
+        args = MM.build_parser().parse_args(
+            [
+                "run",
+                "--without-claude",
+                "--with-codex",
+                "--without-antigravity",
+                "--without-kimi",
+                "--codex-model",
+                "gpt-review-test",
+            ]
+        )
+        config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
+        with (
+            mock.patch.object(MM, "version_of", return_value="test"),
+            mock.patch.object(MM.shutil, "which", return_value="/fake/codex"),
+            mock.patch.object(
+                MM,
+                "provider_readiness",
+                return_value=MM.ProviderReadiness(True, "ready"),
+            ),
+        ):
+            reviewer = MM.reviewer_definitions(args, config)[0]
+
+        self.assertEqual(reviewer.name, "codex")
+        self.assertIn("--ask-for-approval", reviewer.command)
+        self.assertIn("never", reviewer.command)
+        self.assertIn("--ephemeral", reviewer.command)
+        self.assertNotIn("--ignore-user-config", reviewer.command)
+        self.assertIn("--ignore-rules", reviewer.command)
+        self.assertIn("--strict-config", reviewer.command)
+        self.assertIn(
+            'shell_environment_policy.inherit="none"',
+            reviewer.command,
+        )
+        self.assertIn("agents.enabled=false", reviewer.command)
+        self.assertIn("tools.web_search=false", reviewer.command)
+        self.assertIn("--skip-git-repo-check", reviewer.command)
+        self.assertNotIn("--sandbox", reviewer.command)
+        profile_index = reviewer.command.index("--profile")
+        self.assertEqual(
+            reviewer.command[profile_index + 1], MM.CODEX_REVIEW_PROFILE_NAME
+        )
+        disabled = {
+            reviewer.command[index + 1]
+            for index, value in enumerate(reviewer.command[:-1])
+            if value == "--disable"
+        }
+        self.assertTrue(
+            {
+                "apps",
+                "browser_use",
+                "computer_use",
+                "in_app_browser",
+                "memories",
+                "shell_tool",
+                "unified_exec",
+                "view_image",
+                "workspace_dependencies",
+            }.issubset(disabled)
+        )
+        model_index = reviewer.command.index("--model")
+        self.assertEqual(reviewer.command[model_index + 1], "gpt-review-test")
+
+    def test_codex_process_environment_excludes_parent_secrets(self) -> None:
+        reviewer = MM.Reviewer(
+            "codex",
+            ("codex",),
+            {},
+            "default",
+            "test",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PATH": "/test/bin",
+                "HOME": "/test/home",
+                "MM_REVIEW_SENTINEL_SECRET": "do-not-inherit",
+            },
+            clear=True,
+        ):
+            environment = MM.reviewer_process_environment(reviewer)
+
+        self.assertEqual(environment["PATH"], "/test/bin")
+        self.assertEqual(environment["HOME"], "/test/home")
+        self.assertNotIn("MM_REVIEW_SENTINEL_SECRET", environment)
+
+    def test_codex_review_profile_denies_host_and_allows_only_roots(self) -> None:
+        roots = (Path("/private/review/snapshot"), Path("/private/review/input"))
+        profile = MM.codex_review_profile(
+            workspace_roots=roots,
+            credential_store="file",
+        )
+
+        self.assertIn('cli_auth_credentials_store = "file"', profile)
+        self.assertIn('":root" = "deny"', profile)
+        self.assertIn('":tmpdir" = "deny"', profile)
+        self.assertIn('":slash_tmp" = "deny"', profile)
+        self.assertIn('set = { PATH = "" }', profile)
+        self.assertIn('"/private/review/snapshot" = true', profile)
+        self.assertIn('"/private/review/input" = true', profile)
+        self.assertIn('"." = "read"', profile)
+        self.assertIn("enabled = false", profile)
+        self.assertIn(f"[mcp_servers.{MM.CODEX_REVIEW_MCP_SERVER_NAME}]", profile)
+        self.assertIn("[features.code_mode]", profile)
+        self.assertIn(
+            'direct_only_tool_namespaces = ["mcp__review_files"]', profile
+        )
+        self.assertIn('"_review-fs-mcp"', profile)
+        self.assertIn('required = true', profile)
+        self.assertIn('enabled_tools = ["list_directory", "read_file", "search"]', profile)
+
+    def test_isolated_codex_home_stages_auth_privately_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_home = root / "source-codex-home"
+            source_home.mkdir()
+            source_auth = source_home / "auth.json"
+            source_auth.write_text('{"synthetic":"credential"}\n', encoding="utf-8")
+            source_auth.chmod(0o600)
+            review_root = root / "review-root"
+            review_root.mkdir()
+
+            with mock.patch.dict(
+                os.environ, {"CODEX_HOME": str(source_home)}, clear=False
+            ):
+                with MM.isolated_codex_home(
+                    workspace_roots=(review_root,)
+                ) as isolated_home:
+                    staged_home = isolated_home
+                    staged_auth = staged_home / "auth.json"
+                    profile_path = (
+                        staged_home
+                        / f"{MM.CODEX_REVIEW_PROFILE_NAME}.config.toml"
+                    )
+                    self.assertNotEqual(staged_home, source_home)
+                    self.assertEqual(staged_auth.read_bytes(), source_auth.read_bytes())
+                    self.assertEqual(staged_auth.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(profile_path.stat().st_mode & 0o777, 0o600)
+                    profile = profile_path.read_text(encoding="utf-8")
+                    self.assertIn('cli_auth_credentials_store = "file"', profile)
+                    self.assertIn(
+                        f'{json.dumps(str(review_root.resolve()))} = true',
+                        profile,
+                    )
+
+            self.assertFalse(staged_home.exists())
+
+    def test_isolated_codex_home_rejects_non_file_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_home = root / "source-codex-home"
+            source_home.mkdir()
+            review_root = root / "review-root"
+            review_root.mkdir()
+
+            with (
+                mock.patch.dict(
+                    os.environ, {"CODEX_HOME": str(source_home)}, clear=False
+                ),
+                self.assertRaisesRegex(
+                    MM.ReviewError, "requires file-backed ChatGPT credentials"
+                ),
+            ):
+                with MM.isolated_codex_home(workspace_roots=(review_root,)):
+                    self.fail("missing file-backed auth should not be accepted")
+
+    def test_codex_readiness_rejects_keyring_only_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            codex_home = Path(temporary)
+            with (
+                mock.patch.dict(
+                    os.environ, {"CODEX_HOME": str(codex_home)}, clear=False
+                ),
+                mock.patch.object(MM.shutil, "which", return_value="/fake/codex"),
+                mock.patch.object(MM, "active_provider_cooldown", return_value=None),
+                mock.patch.object(MM, "provider_health", return_value={}),
+                mock.patch.object(
+                    MM,
+                    "codex_cli_contract",
+                    return_value=(True, "workspace-only contract"),
+                ),
+                mock.patch.object(
+                    MM,
+                    "codex_authentication_mode",
+                    return_value=(
+                        "subscription",
+                        "Codex ChatGPT authentication",
+                        True,
+                    ),
+                ),
+            ):
+                readiness = MM.provider_readiness("codex", "default")
+
+        self.assertFalse(readiness.ready)
+        self.assertIn("file-backed auth.json", readiness.detail)
+
+    def test_codex_readiness_rejects_unrecognized_authentication(self) -> None:
+        with (
+            mock.patch.object(MM.shutil, "which", return_value="/fake/codex"),
+            mock.patch.object(MM, "active_provider_cooldown", return_value=None),
+            mock.patch.object(MM, "provider_health", return_value={}),
+            mock.patch.object(
+                MM,
+                "codex_cli_contract",
+                return_value=(True, "workspace-only contract"),
+            ),
+            mock.patch.object(
+                MM,
+                "codex_authentication_mode",
+                return_value=("unknown", "authenticated", True),
+            ),
+        ):
+            readiness = MM.provider_readiness("codex", "default")
+
+        self.assertFalse(readiness.ready)
+        self.assertIn("confirmed ChatGPT authentication", readiness.detail)
+
+    def test_review_files_mcp_enforces_roots_and_searches_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            source = snapshot / "feature.py"
+            source.write_text(
+                "FIRST = 1\nNEEDLE = 'found'\nLAST = 3\n",
+                encoding="utf-8",
+            )
+            outside = root / "outside.txt"
+            outside.write_text("private\n", encoding="utf-8")
+            (snapshot / "outside-link").symlink_to(outside)
+            roots = (snapshot.resolve(),)
+
+            rendered = MM.review_mcp_read_file(
+                {"path": "feature.py", "start_line": 2, "end_line": 2},
+                roots,
+            )
+            matches = MM.review_mcp_search(
+                {"query": "NEEDLE", "path": "."},
+                roots,
+            )
+            listing = MM.review_mcp_list_directory({}, roots)
+
+            self.assertIn("2: NEEDLE = 'found'", rendered)
+            self.assertIn("snapshot/feature.py:2", matches)
+            self.assertIn("blocked-symlink\tsnapshot/outside-link", listing)
+            with self.assertRaisesRegex(MM.ReviewError, "outside"):
+                MM.review_mcp_read_file({"path": str(outside)}, roots)
+            with self.assertRaisesRegex(MM.ReviewError, "outside"):
+                MM.review_mcp_read_file({"path": "outside-link"}, roots)
+
+    def test_review_files_mcp_stdio_protocol_lists_and_calls_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "visible.txt").write_text("verified text\n", encoding="utf-8")
+            requests = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": "2025-06-18"},
+                },
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "read_file",
+                        "arguments": {"path": "visible.txt"},
+                    },
+                },
+            ]
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "_review-fs-mcp",
+                    "--root",
+                    str(root),
+                ],
+                cwd=root,
+                input="\n".join(json.dumps(item) for item in requests) + "\n",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        responses = [json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertEqual(responses[0]["result"]["protocolVersion"], "2025-06-18")
+        self.assertEqual(
+            {tool["name"] for tool in responses[1]["result"]["tools"]},
+            set(MM.CODEX_REVIEW_MCP_TOOLS),
+        )
+        self.assertIn(
+            "verified text",
+            responses[2]["result"]["content"][0]["text"],
+        )
+
+    def test_codex_api_key_authentication_is_rejected(self) -> None:
+        args = MM.build_parser().parse_args(
+            [
+                "run",
+                "--without-claude",
+                "--with-codex",
+                "--without-antigravity",
+                "--without-kimi",
+            ]
+        )
+        config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
+        with (
+            mock.patch.object(MM, "version_of", return_value="test"),
+            mock.patch.object(MM.shutil, "which", return_value="/fake/codex"),
+            mock.patch.object(
+                MM,
+                "provider_readiness",
+                return_value=MM.ProviderReadiness(
+                    True,
+                    "API key",
+                    authentication_mode="api_billed",
+                    usage_resource="api_tokens",
+                ),
+            ),
+            self.assertRaisesRegex(
+                MM.ReviewError,
+                "requires ChatGPT subscription authentication",
+            ),
+        ):
+            MM.reviewer_definitions(args, config)
+
+    def test_codex_jsonl_parser_renders_schema_and_usage(self) -> None:
+        payload = structured_payload()
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "test"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": json.dumps(payload),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 12,
+                            "cached_input_tokens": 3,
+                            "output_tokens": 4,
+                        },
+                    }
+                ),
+            ]
+        )
+        report, usage, failed, detail, structured, malformed = (
+            MM.parse_codex_jsonl(stdout)
+        )
+
+        self.assertIn("# Verdict\nPASS_CLEAN", report)
+        self.assertEqual(usage["usage"]["input_tokens"], 12)
+        self.assertEqual(
+            MM.normalized_usage_tokens(usage),
+            {
+                "input_tokens": 9,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 3,
+                "output_tokens": 4,
+                "total_input_tokens": 12,
+                "total_tokens": 16,
+            },
+        )
+        self.assertFalse(failed)
+        self.assertIsNone(detail)
+        self.assertEqual(structured, payload)
+        self.assertFalse(malformed)
+
+    def test_private_state_permission_error_is_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runs_dir = Path(temporary) / "review-runs"
+            target = runs_dir / "workflows" / "workflow.json"
+            with (
+                mock.patch.object(MM, "RUNS_DIR", runs_dir),
+                mock.patch.object(
+                    MM.tempfile,
+                    "mkstemp",
+                    side_effect=PermissionError(1, "Operation not permitted"),
+                ),
+                self.assertRaisesRegex(
+                    MM.ReviewError,
+                    "MM_REVIEW_RUNS_DIR.*approve access",
+                ),
+            ):
+                MM.safe_write_json(target, {"ok": True})
+
+    def test_config_state_permission_error_names_config_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_dir = Path(temporary) / "config"
+            target = config_dir / "provider-health.json"
+            with (
+                mock.patch.object(MM, "CONFIG_DIR", config_dir),
+                mock.patch.object(
+                    MM.tempfile,
+                    "mkstemp",
+                    side_effect=PermissionError(1, "Operation not permitted"),
+                ),
+                self.assertRaisesRegex(
+                    MM.ReviewError,
+                    "MM_REVIEW_CONFIG_DIR.*approve access",
+                ),
+            ):
+                MM.safe_write_json(target, {"ok": True})
+
+    def test_text_artifact_permission_error_is_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runs_dir = Path(temporary) / "review-runs"
+            target = runs_dir / "run" / "prompt.md"
+            with (
+                mock.patch.object(MM, "RUNS_DIR", runs_dir),
+                mock.patch.object(
+                    Path,
+                    "write_text",
+                    side_effect=PermissionError(1, "Operation not permitted"),
+                ),
+                self.assertRaisesRegex(
+                    MM.ReviewError,
+                    "MM_REVIEW_RUNS_DIR.*approve access",
+                ),
+            ):
+                MM.safe_write(target, "review prompt")
+
+    def test_json_cleanup_does_not_mask_actionable_write_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runs_dir = Path(temporary) / "review-runs"
+            target = runs_dir / "workflows" / "workflow.json"
+            with (
+                mock.patch.object(MM, "RUNS_DIR", runs_dir),
+                mock.patch.object(
+                    Path,
+                    "replace",
+                    side_effect=PermissionError(1, "replace denied"),
+                ),
+                mock.patch.object(
+                    Path,
+                    "unlink",
+                    side_effect=PermissionError(1, "cleanup denied"),
+                ),
+                self.assertRaisesRegex(
+                    MM.ReviewError,
+                    "replace denied.*MM_REVIEW_RUNS_DIR",
+                ),
+            ):
+                MM.safe_write_json(target, {"ok": True})
+
+    def test_relative_state_directory_overrides_are_rejected(self) -> None:
+        for variable in ("MM_REVIEW_RUNS_DIR", "MM_REVIEW_CONFIG_DIR"):
+            with self.subTest(variable=variable), mock.patch.dict(
+                os.environ,
+                {variable: "relative/review-state"},
+                clear=False,
+            ), self.assertRaisesRegex(
+                MM.ReviewError,
+                rf"{variable} must be an absolute path",
+            ):
+                MM.state_dir_from_environment(variable, Path("/unused"))
+
+    def test_pending_substitution_target_remains_resumable(self) -> None:
+        reviewers = {
+            "claude": {
+                "exit_code": 1,
+                "failure_category": "quota",
+                "substituted_by": "codex",
+            },
+            "codex": {
+                "model": "default",
+                "authentication_mode": "subscription",
+                "usage_resource": "included_plan_allowance",
+                "attempts": [],
+            },
+        }
+
+        self.assertEqual(
+            MM.resumable_failed_reviewer_names(reviewers),
+            ["codex"],
+        )
+
     def test_budget_exhaustion_retry_requires_a_material_policy_change(self) -> None:
         self.assertFalse(
             MM.materially_changes_claude_retry(
@@ -521,6 +1092,58 @@ class RunnerUnitTests(unittest.TestCase):
             )
         write_config.assert_not_called()
 
+    def test_codex_cli_contract_requires_permission_profile_release(self) -> None:
+        required_exec_flags = (
+            "--config --disable --ephemeral --ignore-rules "
+            "--json --output-schema --profile "
+            "--skip-git-repo-check --strict-config"
+        )
+        old_version = subprocess.CompletedProcess(
+            ["codex", "--version"], 0, "codex-cli 0.137.0\n", ""
+        )
+        global_help = subprocess.CompletedProcess(
+            ["codex", "--help"], 0, "--ask-for-approval\n", ""
+        )
+        exec_help = subprocess.CompletedProcess(
+            ["codex", "exec", "--help"], 0, required_exec_flags, ""
+        )
+        with mock.patch.object(
+            MM.subprocess,
+            "run",
+            side_effect=[old_version, global_help, exec_help],
+        ):
+            ready, detail = MM.codex_cli_contract()
+
+        self.assertFalse(ready)
+        self.assertIn("0.138.0 or newer", detail)
+
+    def test_codex_cli_contract_accepts_workspace_profile_release(self) -> None:
+        current_version = subprocess.CompletedProcess(
+            ["codex", "--version"], 0, "codex-cli 0.148.0\n", ""
+        )
+        global_help = subprocess.CompletedProcess(
+            ["codex", "--help"], 0, "--ask-for-approval\n", ""
+        )
+        exec_help = subprocess.CompletedProcess(
+            ["codex", "exec", "--help"],
+            0,
+            (
+                "--config --disable --ephemeral --ignore-rules "
+                "--json --output-schema --profile "
+                "--skip-git-repo-check --strict-config"
+            ),
+            "",
+        )
+        with mock.patch.object(
+            MM.subprocess,
+            "run",
+            side_effect=[current_version, global_help, exec_help],
+        ):
+            ready, detail = MM.codex_cli_contract()
+
+        self.assertTrue(ready)
+        self.assertIn("workspace-only", detail)
+
     def test_doctor_live_reports_unready_provider_without_crashing(self) -> None:
         config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
         config["antigravity"]["enabled"] = False
@@ -568,6 +1191,49 @@ class RunnerUnitTests(unittest.TestCase):
         )
         self.assertFalse(live["ok"])
         self.assertEqual(live["failure_category"], "not_ready")
+
+    def test_plain_doctor_does_not_probe_disabled_codex_cli(self) -> None:
+        config = json.loads(json.dumps(MM.DEFAULT_CONFIG))
+        config["codex"]["enabled"] = False
+        output = io.StringIO()
+        with (
+            mock.patch.object(MM, "load_config", return_value=config),
+            mock.patch.object(
+                MM,
+                "plugin_install_parity",
+                return_value=(True, "cache matches"),
+            ),
+            mock.patch.object(
+                MM,
+                "private_storage_permissions",
+                return_value=(True, "private"),
+            ),
+            mock.patch.object(
+                MM,
+                "claude_cli_contract",
+                return_value=(True, "flags verified"),
+            ),
+            mock.patch.object(
+                MM,
+                "provider_readiness",
+                return_value=MM.ProviderReadiness(True, "ready"),
+            ),
+            mock.patch.object(MM, "codex_cli_contract") as codex_contract,
+            redirect_stdout(output),
+        ):
+            exit_code = MM.doctor_command(
+                MM.build_parser().parse_args(["doctor"])
+            )
+
+        self.assertEqual(exit_code, 0)
+        codex_contract.assert_not_called()
+        check = next(
+            item
+            for item in json.loads(output.getvalue())["checks"]
+            if item["name"] == "codex_cli_contract"
+        )
+        self.assertIsNone(check["ok"])
+        self.assertIn("not probed", check["detail"])
 
     def test_plugin_parity_accepts_non_personal_marketplace_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3703,6 +4369,20 @@ None.
             "N-times or N-by-M external-I/O amplification", collapsed_prompt
         )
 
+        codex_prompt = MM.build_prompt(
+            repo=Path("/private/review-snapshot"),
+            scope=MM.Scope("uncommitted", None, "uncommitted changes"),
+            patch_path=Path("/private/change.patch"),
+            manifest_path=Path("/private/manifest.md"),
+            task="Review the public release.",
+            risks=["security"],
+            review_profile="security",
+            phase="confirmation",
+            provider="codex",
+        )
+        self.assertIn("read only the private snapshot", codex_prompt)
+        self.assertIn("Keychain/keyring services", codex_prompt)
+
         structured_gap = MM.parse_review_report(
             "kimi",
             """# Verdict
@@ -5956,6 +6636,7 @@ None.
             (run_dir / "change.patch").write_text("patch", encoding="utf-8")
             (run_dir / "claude.md").write_text("report", encoding="utf-8")
             (run_dir / "claude.raw.json").write_text("{}", encoding="utf-8")
+            (run_dir / "codex.raw.jsonl").write_text("{}", encoding="utf-8")
             metadata = {
                 "created_at": MM.utc_now(),
                 "status": "completed",
@@ -6029,7 +6710,7 @@ None.
                 "manifest_bytes": 1,
                 "patch_bytes": 5,
                 "reviewer_report_bytes": 6,
-                "raw_response_bytes": 2,
+                "raw_response_bytes": 4,
             },
         )
         self.assertEqual(
@@ -7936,6 +8617,114 @@ None.
 
 
 class RunnerEndToEndTests(unittest.TestCase):
+    def test_failed_claude_can_be_replaced_by_codex_on_same_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "codex-fallback-repo"
+            repo.mkdir()
+            initialize_repo(repo)
+            (repo / "src" / "feature.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            harness = FakeProviderHarness(root)
+            harness.environment["MM_REVIEW_SENTINEL_SECRET"] = (
+                "synthetic-do-not-inherit"
+            )
+            workflow = harness.cli(
+                repo,
+                "workflow",
+                "start",
+                "--review-mode",
+                "balanced",
+                "--max-provider-attempts",
+                "6",
+            ).stdout.strip()
+            harness.queue(
+                "claude",
+                {
+                    "kind": "failure",
+                    "stderr": "usage limit reached; resets in 4 hours",
+                    "exit_code": 1,
+                },
+            )
+            failed = harness.cli(
+                repo,
+                "run",
+                "--uncommitted",
+                "--workflow-id",
+                workflow,
+                "--phase",
+                "repair",
+                "--path",
+                "src/feature.py",
+                "--task",
+                "Verify Codex fallback preserves the immutable review contract.",
+                "--with-claude",
+                "--without-codex",
+                "--without-antigravity",
+                "--without-kimi",
+                check=False,
+                provider_backed=True,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            run_dir = harness.run_directories()[0]
+            before = MM.read_json(run_dir / "metadata.json")
+            self.assertEqual(before["reviewers"]["claude"]["failure_category"], "quota")
+
+            harness.queue("codex", {"structured": structured_payload()})
+            resumed = harness.cli(
+                repo,
+                "resume",
+                "--run",
+                str(run_dir),
+                "--replace-failed-claude-with-codex",
+                provider_backed=True,
+            )
+
+            self.assertEqual(resumed.returncode, 0)
+            after = MM.read_json(run_dir / "metadata.json")
+            self.assertEqual(after["status"], "completed")
+            self.assertEqual(
+                after["reviewers"]["claude"]["substituted_by"], "codex"
+            )
+            self.assertEqual(after["reviewers"]["codex"]["exit_code"], 0)
+            self.assertEqual(
+                after["reviewers"]["codex"]["authentication_mode"],
+                "subscription",
+            )
+            self.assertEqual(
+                after["reviewers"]["codex"]["usage_resource"],
+                "included_plan_allowance",
+            )
+            self.assertEqual(
+                after["provider_substitutions"][0]["reason"], "quota"
+            )
+            self.assertEqual(
+                after["review_snapshot_fingerprint"],
+                before["review_snapshot_fingerprint"],
+            )
+            summary = MM.read_json(run_dir / "review-summary.json")
+            self.assertEqual(set(summary["reviews"]), {"codex"})
+            invocations = harness.invocations()
+            self.assertEqual(
+                [item["provider"] for item in invocations], ["claude", "codex"]
+            )
+            codex_args = invocations[1]["args"]
+            self.assertIn("--output-schema", codex_args)
+            self.assertIn("--ephemeral", codex_args)
+            self.assertNotIn("--sandbox", codex_args)
+            profile_index = codex_args.index("--profile")
+            self.assertEqual(
+                codex_args[profile_index + 1], MM.CODEX_REVIEW_PROFILE_NAME
+            )
+            self.assertNotEqual(
+                invocations[1]["codex_home"], str(harness.root)
+            )
+            self.assertIn(
+                '":root" = "deny"', str(invocations[1]["codex_profile"])
+            )
+            self.assertFalse(invocations[1]["sentinel_secret_present"])
+
     def test_last_chance_budget_guard_blocks_without_consuming_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
