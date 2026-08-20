@@ -7,6 +7,15 @@ All notable user-visible changes are documented here. This project follows
 
 ### Fixed
 
+- Support repositories whose `HEAD` has an empty tree but whose review scope
+  contains untracked implementation files, instead of failing while opening
+  Git's header-only archive.
+- Stop Codex reviewer attempts after repeated persistent DNS-resolution
+  failures and record a typed `network` failure, avoiding the full review
+  timeout when transport is already unavailable.
+- Require a linked successor when confirmation or supplemental source changes
+  before Codex finalization, rather than recommending a final verdict against
+  a stale snapshot.
 - Convert private artifact-store permission failures into actionable errors and
   support `MM_REVIEW_RUNS_DIR` / `MM_REVIEW_CONFIG_DIR` for hosts whose Codex
   sandbox cannot write the default state locations.

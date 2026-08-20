@@ -26,6 +26,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import traceback
 import uuid
 from typing import Any, Iterable, Sequence
@@ -272,6 +273,14 @@ MAX_TASK_CHARS = 16_000
 MAX_NOTE_CHARS = 8_000
 GIT_TIMEOUT_SECONDS = 300
 REVIEWER_TERMINATION_GRACE_SECONDS = 5
+CODEX_NETWORK_FAILURE_THRESHOLD = 6
+CODEX_NETWORK_FAILURE_QUIET_SECONDS = 2.0
+CODEX_NETWORK_FAILURE_MARKERS = (
+    "failed to lookup address information",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "nodename nor servname provided",
+)
 VALID_RISKS = {
     "auth",
     "backfill",
@@ -764,6 +773,8 @@ def classify_provider_failure(
         )
     ):
         return "authentication"
+    if any(marker in combined for marker in CODEX_NETWORK_FAILURE_MARKERS):
+        return "network"
     direct_model_error = re.search(
         r"\b(?:model not found|unknown model|invalid model)\b", combined
     )
@@ -1782,29 +1793,33 @@ def create_snapshot(
     treeish = scope.value if scope.kind == "commit" else "HEAD"
 
     if treeish and (scope.kind == "commit" or has_head(repo)):
-        try:
-            run_command(
-                [
-                    "git",
-                    "archive",
-                    "--format=tar",
-                    "-o",
-                    str(archive_path),
-                    treeish,
-                ],
-                cwd=repo,
-            )
-            with tarfile.open(archive_path) as archive:
-                archive.extractall(snapshot_dir, filter="data")
-        finally:
-            archive_path.unlink(missing_ok=True)
+        tree = run_bytes_command(
+            ["git", "ls-tree", "-rz", "--full-tree", treeish], cwd=repo
+        ).stdout
+        # Python's tarfile rejects the header-only archive produced for an
+        # empty Git tree. There is nothing to extract in that case, but an
+        # uncommitted scope can still have task-relevant overlay files.
+        if tree:
+            try:
+                run_command(
+                    [
+                        "git",
+                        "archive",
+                        "--format=tar",
+                        "-o",
+                        str(archive_path),
+                        treeish,
+                    ],
+                    cwd=repo,
+                )
+                with tarfile.open(archive_path) as archive:
+                    archive.extractall(snapshot_dir, filter="data")
+            finally:
+                archive_path.unlink(missing_ok=True)
 
         # `git archive` honors export-ignore. Restore every omitted tracked blob
         # directly from the selected tree without invoking checkout/smudge
         # filters from repository configuration.
-        tree = run_bytes_command(
-            ["git", "ls-tree", "-rz", "--full-tree", treeish], cwd=repo
-        ).stdout
         missing_blobs: list[tuple[bytes, str, str]] = []
         for entry in tree.split(b"\0"):
             if not entry:
@@ -2376,6 +2391,125 @@ def terminate_process_group(
         return process.communicate()
 
 
+def communicate_with_codex_network_watch(
+    process: subprocess.Popen[str],
+    *,
+    input_text: str | None,
+    timeout_seconds: int,
+) -> tuple[str, str, bool, str | None]:
+    """Collect Codex output while failing fast on persistent DNS failures."""
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    network_failure_count = 0
+    last_network_failure_at = 0.0
+    state_lock = threading.Lock()
+
+    def read_stream(
+        stream: Any,
+        chunks: list[str],
+        *,
+        observe_network: bool,
+    ) -> None:
+        nonlocal network_failure_count, last_network_failure_at
+        try:
+            for line in iter(stream.readline, ""):
+                chunks.append(line)
+                if not observe_network:
+                    continue
+                lowered = line.lower()
+                if any(marker in lowered for marker in CODEX_NETWORK_FAILURE_MARKERS):
+                    with state_lock:
+                        network_failure_count += 1
+                        last_network_failure_at = time.monotonic()
+        finally:
+            stream.close()
+
+    readers = [
+        threading.Thread(
+            target=read_stream,
+            args=(process.stdout, stdout_chunks),
+            kwargs={"observe_network": False},
+            daemon=True,
+        ),
+        threading.Thread(
+            target=read_stream,
+            args=(process.stderr, stderr_chunks),
+            kwargs={"observe_network": True},
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    def write_input() -> None:
+        if process.stdin is None:
+            return
+        try:
+            if input_text is not None:
+                process.stdin.write(input_text)
+                process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+
+    writer = threading.Thread(target=write_input, daemon=True)
+    writer.start()
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    forced_failure_category: str | None = None
+
+    def stop_process() -> None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=REVIEWER_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+    try:
+        while process.poll() is None:
+            now = time.monotonic()
+            with state_lock:
+                persistent_network_failure = (
+                    network_failure_count >= CODEX_NETWORK_FAILURE_THRESHOLD
+                    and now - last_network_failure_at
+                    >= CODEX_NETWORK_FAILURE_QUIET_SECONDS
+                )
+            if persistent_network_failure:
+                forced_failure_category = "network"
+                stop_process()
+                break
+            if now >= deadline:
+                timed_out = True
+                stop_process()
+                break
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        stop_process()
+        raise
+    finally:
+        writer.join(timeout=REVIEWER_TERMINATION_GRACE_SECONDS)
+        for reader in readers:
+            reader.join(timeout=REVIEWER_TERMINATION_GRACE_SECONDS)
+
+    return (
+        "".join(stdout_chunks),
+        "".join(stderr_chunks),
+        timed_out,
+        forced_failure_category,
+    )
+
+
 def parse_codex_jsonl(
     stdout: str,
 ) -> tuple[str, dict[str, Any] | None, bool, str | None, dict[str, Any] | None, bool]:
@@ -2936,6 +3070,7 @@ def invoke_reviewer(
         command = (*command, "--add-dir", str(input_dir), "--prompt", prompt)
         input_text = None
     timed_out = False
+    forced_failure_category: str | None = None
     started = dt.datetime.now(dt.timezone.utc)
     try:
         codex_home_context = (
@@ -2967,14 +3102,27 @@ def invoke_reviewer(
                 process_registry.add(process)
             try:
                 try:
-                    stdout, stderr = process.communicate(
-                        input=input_text, timeout=timeout_seconds
-                    )
+                    if reviewer.name == "codex":
+                        (
+                            stdout,
+                            stderr,
+                            timed_out,
+                            forced_failure_category,
+                        ) = communicate_with_codex_network_watch(
+                            process,
+                            input_text=input_text,
+                            timeout_seconds=timeout_seconds,
+                        )
+                    else:
+                        stdout, stderr = process.communicate(
+                            input=input_text, timeout=timeout_seconds
+                        )
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     stdout, stderr = terminate_process_group(process)
                 except KeyboardInterrupt:
-                    terminate_process_group(process)
+                    if reviewer.name != "codex":
+                        terminate_process_group(process)
                     raise
             finally:
                 if process_registry:
@@ -3129,9 +3277,11 @@ def invoke_reviewer(
     effective_returncode = (
         (process.returncode or 0) if not provider_reported_error else 1
     )
+    if forced_failure_category is not None:
+        effective_returncode = 1
     if malformed_provider_response:
         effective_returncode = 1
-    failure_category = classify_provider_failure(
+    failure_category = forced_failure_category or classify_provider_failure(
         returncode=effective_returncode,
         timed_out=False,
         stdout=stdout,
@@ -6989,6 +7139,48 @@ def workflow_continue_plan(
         plan["next"] = "RUNNING"
         return plan
     latest_runs = latest_workflow_attempts(identifier)
+    stale_unfinalized_gates = [
+        (run_dir, metadata)
+        for run_dir, metadata in latest_runs
+        if metadata.get("status") == "completed"
+        and metadata.get("phase") in {"confirmation", "supplemental"}
+        and not (run_dir / "final.json").exists()
+        and not (run_dir / "supplemental.json").exists()
+        and not run_triage_issues(run_dir, metadata)
+        and _current_run_source_changed(run_dir, metadata)
+    ]
+    if stale_unfinalized_gates:
+        plan["next"] = "NEEDS_SUCCESSOR"
+        plan["actions"].append(
+            {
+                "type": "successor",
+                "automatable": False,
+                "reason": (
+                    "The completed confirmation or supplemental snapshot changed "
+                    "before Codex finalization. Preserve that evidence and create "
+                    "a linked successor for a fresh review and confirmation."
+                ),
+                "repositories": [
+                    (
+                        metadata.get("repository", {}).get("name")
+                        if isinstance(metadata.get("repository"), dict)
+                        else str(run_dir)
+                    )
+                    for run_dir, metadata in stale_unfinalized_gates
+                ],
+                "command": shlex.join(
+                    [
+                        "mm-review",
+                        "workflow",
+                        "supersede",
+                        identifier,
+                        "--reason",
+                        "completed review source changed before finalization",
+                    ]
+                ),
+            }
+        )
+        return plan
     missing_repositories = [
         item
         for item in status.get("repositories", [])

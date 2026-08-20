@@ -1948,6 +1948,40 @@ class RunnerUnitTests(unittest.TestCase):
         self.assertFalse(plan["actions"][0]["automatable"])
         self.assertIn("mm-review run", plan["actions"][0]["command"])
 
+    def test_continue_requires_successor_when_confirmation_changes_before_final(
+        self,
+    ) -> None:
+        run_dir = Path("/private/reviews/confirmation")
+        metadata = {
+            "status": "completed",
+            "phase": "confirmation",
+            "repository": {"id": "repo-1", "name": "fixture"},
+        }
+        status = {
+            "state": "active",
+            "deployment_ready": False,
+            "repositories": [],
+            "active_runs": [],
+        }
+        with (
+            mock.patch.object(MM, "workflow_status", return_value=(status, False)),
+            mock.patch.object(MM, "provider_usage_snapshot", return_value={}),
+            mock.patch.object(
+                MM, "latest_workflow_attempts", return_value=[(run_dir, metadata)]
+            ),
+            mock.patch.object(MM, "run_triage_issues", return_value=[]),
+            mock.patch.object(MM, "_current_run_source_changed", return_value=True),
+        ):
+            plan = MM.workflow_continue_plan("wf-stale-confirmation")
+
+        self.assertEqual(plan["next"], "NEEDS_SUCCESSOR")
+        self.assertEqual(plan["actions"][0]["type"], "successor")
+        self.assertFalse(plan["actions"][0]["automatable"])
+        self.assertIn(
+            "completed review source changed before finalization",
+            plan["actions"][0]["command"],
+        )
+
     def test_clean_review_guidance_matches_each_lifecycle_phase(self) -> None:
         clean = {
             "claude": {
@@ -2947,6 +2981,35 @@ class RunnerUnitTests(unittest.TestCase):
             self.assertEqual(len(findings), 1)
             self.assertEqual(findings[0].path, "src/secrets.env")
 
+    def test_snapshot_supports_empty_head_with_untracked_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            workspace = root / "workspace"
+            repo.mkdir()
+            workspace.mkdir()
+            run(["git", "init", "-q", "-b", "main"], cwd=repo)
+            run(["git", "config", "user.email", "tests@example.invalid"], cwd=repo)
+            run(["git", "config", "user.name", "Tests"], cwd=repo)
+            run(["git", "commit", "--allow-empty", "-qm", "empty root"], cwd=repo)
+            (repo / "feature.py").write_text("VALUE = 1\n", encoding="utf-8")
+            scope = MM.Scope("uncommitted", None, "working tree changes")
+            paths = MM.changed_paths(repo, scope, ())
+
+            snapshot = MM.create_snapshot(
+                repo,
+                scope,
+                MM.snapshot_overlay_paths(repo, scope, paths, ()),
+                workspace,
+            )
+
+            self.assertEqual(paths, ["feature.py"])
+            self.assertEqual(
+                (snapshot / "feature.py").read_text(encoding="utf-8"),
+                "VALUE = 1\n",
+            )
+            self.assertFalse((workspace / "snapshot.tar").exists())
+
     def test_snapshot_includes_tracked_export_ignored_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -3620,6 +3683,114 @@ None.
 
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.failure_category, "empty_response")
+
+    def test_codex_repeated_dns_failure_stops_before_review_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_codex = root / "codex"
+            fake_codex.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import sys
+                    import time
+
+                    for attempt in range(6):
+                        print(
+                            "failed to connect to websocket: failed to lookup "
+                            "address information: nodename nor servname provided",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    time.sleep(30)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            reviewer = MM.Reviewer(
+                "codex", (str(fake_codex),), {}, "default", "fake-codex"
+            )
+            started = MM.time.monotonic()
+            with (
+                mock.patch.object(
+                    MM,
+                    "isolated_codex_home",
+                    return_value=MM.nullcontext(root),
+                ),
+                mock.patch.object(
+                    MM,
+                    "isolated_codex_process_environment",
+                    return_value=os.environ.copy(),
+                ),
+                mock.patch.object(MM, "record_provider_failure") as record,
+            ):
+                result = MM.invoke_reviewer(
+                    reviewer,
+                    repo=root,
+                    prompt="Review.",
+                    run_dir=root,
+                    input_dir=root,
+                    timeout_seconds=10,
+                )
+            elapsed = MM.time.monotonic() - started
+
+        self.assertLess(elapsed, 6)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.failure_category, "network")
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args[:2], ("codex", "network"))
+
+    def test_codex_silent_process_still_honors_review_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_codex = root / "codex"
+            fake_codex.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import time
+
+                    time.sleep(30)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            reviewer = MM.Reviewer(
+                "codex", (str(fake_codex),), {}, "default", "fake-codex"
+            )
+            started = MM.time.monotonic()
+            with (
+                mock.patch.object(
+                    MM,
+                    "isolated_codex_home",
+                    return_value=MM.nullcontext(root),
+                ),
+                mock.patch.object(
+                    MM,
+                    "isolated_codex_process_environment",
+                    return_value=os.environ.copy(),
+                ),
+                mock.patch.object(MM, "record_provider_failure") as record,
+            ):
+                result = MM.invoke_reviewer(
+                    reviewer,
+                    repo=root,
+                    prompt="Review.",
+                    run_dir=root,
+                    input_dir=root,
+                    timeout_seconds=1,
+                )
+            elapsed = MM.time.monotonic() - started
+
+        self.assertLess(elapsed, 6)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(result.failure_category, "timeout")
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args[:2], ("codex", "timeout"))
 
     def test_keyboard_interrupt_terminates_reviewer_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
