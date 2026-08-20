@@ -1,6 +1,6 @@
 {
   "name": "multi-model-review",
-  "version": "0.1.0+codex.20260820144122",
+  "version": "0.1.0+codex.20260820160117",
   "description": "Run resumable task-scoped reviews with Claude-to-Codex fallback, provider-allowance controls, mandatory confirmation, and fresh final gates.",
   "author": {
     "name": "Shoti",
