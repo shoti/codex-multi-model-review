@@ -3742,6 +3742,195 @@ None.
         record.assert_called_once()
         self.assertEqual(record.call_args.args[:2], ("codex", "network"))
 
+    def test_codex_dns_failure_without_newlines_stops_before_review_timeout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_codex = root / "codex"
+            fake_codex.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import sys
+                    import time
+
+                    message = (
+                        "failed to connect to websocket: failed to lookup "
+                        "address information: nodename nor servname provided"
+                    )
+                    for attempt in range(6):
+                        sys.stderr.write(message)
+                        sys.stderr.flush()
+                    time.sleep(30)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            reviewer = MM.Reviewer(
+                "codex", (str(fake_codex),), {}, "default", "fake-codex"
+            )
+            started = MM.time.monotonic()
+            with (
+                mock.patch.object(
+                    MM,
+                    "isolated_codex_home",
+                    return_value=MM.nullcontext(root),
+                ),
+                mock.patch.object(
+                    MM,
+                    "isolated_codex_process_environment",
+                    return_value=os.environ.copy(),
+                ),
+                mock.patch.object(MM, "record_provider_failure") as record,
+            ):
+                result = MM.invoke_reviewer(
+                    reviewer,
+                    repo=root,
+                    prompt="Review.",
+                    run_dir=root,
+                    input_dir=root,
+                    timeout_seconds=3,
+                )
+            elapsed = MM.time.monotonic() - started
+
+        self.assertLess(elapsed, 3)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.failure_category, "network")
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args[:2], ("codex", "network"))
+
+    def test_codex_dns_watch_replaces_invalid_bytes_and_still_fails_fast(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_codex = root / "codex"
+            fake_codex.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import sys
+                    import time
+
+                    message = (
+                        b"failed to connect to websocket: failed to lookup "
+                        b"address information: nodename nor servname provided"
+                    )
+                    sys.stderr.buffer.write(b"invalid: \\xff " + message * 6)
+                    sys.stderr.buffer.flush()
+                    time.sleep(30)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            reviewer = MM.Reviewer(
+                "codex", (str(fake_codex),), {}, "default", "fake-codex"
+            )
+            with (
+                mock.patch.object(
+                    MM,
+                    "isolated_codex_home",
+                    return_value=MM.nullcontext(root),
+                ),
+                mock.patch.object(
+                    MM,
+                    "isolated_codex_process_environment",
+                    return_value=os.environ.copy(),
+                ),
+                mock.patch.object(MM, "record_provider_failure"),
+            ):
+                result = MM.invoke_reviewer(
+                    reviewer,
+                    repo=root,
+                    prompt="Review.",
+                    run_dir=root,
+                    input_dir=root,
+                    timeout_seconds=3,
+                )
+
+            error_text = result.error_path.read_text(encoding="utf-8")
+
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.failure_category, "network")
+        self.assertIn("invalid: \ufffd", error_text)
+
+    def test_codex_network_watch_preserves_split_utf8_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_codex = root / "codex"
+            fake_codex.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import sys
+                    import time
+
+                    sys.stdout.buffer.write(b"prefix-\\xe2")
+                    sys.stdout.buffer.flush()
+                    time.sleep(0.2)
+                    sys.stdout.buffer.write(b"\\x82\\xac-suffix\\n")
+                    sys.stdout.buffer.flush()
+                    sys.stderr.write("distinctive stderr\\n")
+                    sys.stderr.flush()
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            process = subprocess.Popen(
+                [str(fake_codex)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            stdout, stderr, timed_out, category = (
+                MM.communicate_with_codex_network_watch(
+                    process,
+                    input_text=None,
+                    timeout_seconds=3,
+                )
+            )
+
+        self.assertEqual(stdout, "prefix-\u20ac-suffix\n")
+        self.assertEqual(stderr, "distinctive stderr\n")
+        self.assertFalse(timed_out)
+        self.assertIsNone(category)
+
+    def test_codex_network_watch_interrupt_terminates_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_codex = root / "codex"
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            process = subprocess.Popen(
+                [str(fake_codex)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            monotonic = mock.Mock(side_effect=[0.0, KeyboardInterrupt()])
+            fake_time = mock.Mock(monotonic=monotonic)
+            with (
+                mock.patch.object(MM, "time", fake_time),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                MM.communicate_with_codex_network_watch(
+                    process,
+                    input_text=None,
+                    timeout_seconds=3,
+                )
+
+        self.assertIsNotNone(process.returncode)
+
     def test_codex_silent_process_still_honors_review_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

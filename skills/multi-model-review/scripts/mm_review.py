@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import concurrent.futures
 from contextlib import contextmanager, nullcontext, redirect_stdout
 import dataclasses
@@ -2411,16 +2412,49 @@ def communicate_with_codex_network_watch(
         observe_network: bool,
     ) -> None:
         nonlocal network_failure_count, last_network_failure_at
+        decoder = codecs.getincrementaldecoder(stream.encoding or "utf-8")(
+            errors="replace"
+        )
+        observed = ""
+        complete_failure_count = 0
+
+        def observe(text: str, *, final: bool = False) -> None:
+            nonlocal observed, complete_failure_count
+            nonlocal network_failure_count, last_network_failure_at
+            if not observe_network:
+                return
+            observed += text.lower()
+            lines = observed.splitlines(keepends=True)
+            if not final and lines and not lines[-1].endswith(("\n", "\r")):
+                observed = lines.pop()
+            else:
+                observed = ""
+            complete_failure_count += sum(
+                any(marker in line for marker in CODEX_NETWORK_FAILURE_MARKERS)
+                for line in lines
+            )
+            unterminated_failure_count = max(
+                (
+                    observed.count(marker)
+                    for marker in CODEX_NETWORK_FAILURE_MARKERS
+                ),
+                default=0,
+            )
+            detected = complete_failure_count + unterminated_failure_count
+            with state_lock:
+                if detected > network_failure_count:
+                    network_failure_count = detected
+                    last_network_failure_at = time.monotonic()
+
         try:
-            for line in iter(stream.readline, ""):
-                chunks.append(line)
-                if not observe_network:
-                    continue
-                lowered = line.lower()
-                if any(marker in lowered for marker in CODEX_NETWORK_FAILURE_MARKERS):
-                    with state_lock:
-                        network_failure_count += 1
-                        last_network_failure_at = time.monotonic()
+            while raw := os.read(stream.fileno(), 4096):
+                text = decoder.decode(raw)
+                chunks.append(text)
+                observe(text)
+            trailing = decoder.decode(b"", final=True)
+            if trailing:
+                chunks.append(trailing)
+            observe(trailing, final=True)
         finally:
             stream.close()
 

@@ -11,8 +11,10 @@ All notable user-visible changes are documented here. This project follows
   contains untracked implementation files, instead of failing while opening
   Git's header-only archive.
 - Stop Codex reviewer attempts after repeated persistent DNS-resolution
-  failures and record a typed `network` failure, avoiding the full review
-  timeout when transport is already unavailable.
+  failures, including stderr fragments without newline terminators, and record
+  a typed `network` failure instead of waiting for the full review timeout.
+  Replace malformed provider bytes during raw pipe decoding so a reader thread
+  cannot fail silently and truncate review evidence or disable the watchdog.
 - Require a linked successor when confirmation or supplemental source changes
   before Codex finalization, rather than recommending a final verdict against
   a stale snapshot.
