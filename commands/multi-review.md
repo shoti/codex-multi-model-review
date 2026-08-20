@@ -1,6 +1,6 @@
 ---
-description: Run independent Claude, Antigravity, and optional Kimi reviews, record verified finding decisions, rerun after fixes, and produce a freshness-checked final gate.
-argument-hint: "[uncommitted | branch <base> | commit <sha>] [with-antigravity | without-antigravity] [with-kimi | without-kimi] [paths ...]"
+description: Run fresh Claude, Codex fallback, Antigravity, and optional Kimi reviews, record verified finding decisions, rerun after fixes, and produce a freshness-checked final gate.
+argument-hint: "[uncommitted | branch <base> | commit <sha>] [with-codex | without-codex] [with-antigravity | without-antigravity] [with-kimi | without-kimi] [paths ...]"
 ---
 
 # Multi-Model Review
@@ -18,11 +18,15 @@ repository. Do not stop after collecting reviewer reports.
    - `branch <base>`: the feature branch relative to `<base>`, plus current
      working-tree changes;
    - `commit <sha>`: one committed change.
-4. Honor `with-antigravity`, `without-antigravity`, `with-kimi`, or
-   `without-kimi` as one-run overrides. Otherwise use the saved reviewer
+4. Honor `with-codex`, `without-codex`, `with-antigravity`,
+   `without-antigravity`, `with-kimi`, or `without-kimi` as one-run overrides.
+   Otherwise use the saved reviewer
    configuration. The old Gemini names remain accepted as compatibility aliases.
    - Claude is the capped default. Enable Antigravity only after confirming
      quota/readiness for a review where the additional model is useful.
+   - Use Codex when Claude allowance is unavailable. It receives a fresh,
+     ephemeral, read-only session and private snapshot, but is same-provider-
+     family evidence rather than an independent external-model opinion.
    - When Kimi is available, it can replace Antigravity or join both reviewers
      for unusually high-risk work.
    - State explicitly which reviewers actually ran.
@@ -60,8 +64,9 @@ State repositories, path filters, scope, risk profiles, and enabled reviewers.
 Create one workflow ID for the task with a deliberate per-provider attempt
 ceiling. Successful and failed attempts follow every linked successor;
 supersession never resets task usage.
-Claude, Antigravity, and Kimi receive fresh independent read-only sessions when
-enabled. Codex remains implementer, finding verifier, and final gate.
+Claude, Codex, Antigravity, and Kimi receive fresh read-only sessions when
+enabled. Codex remains implementer, finding verifier, and final gate; its
+reviewer subprocess must be disclosed as same-provider-family coverage.
 Run the bundled runner with Python 3.12 or newer; verify the interpreter rather
 than assuming the macOS `/usr/bin/python3` is supported.
 
@@ -88,6 +93,13 @@ than assuming the macOS `/usr/bin/python3` is supported.
    a larger one-resume `--claude-max-budget-usd` and/or lower
    `--claude-effort` without reducing the existing stop; do not repeat a
    weaker cap blindly.
+   For a typed Claude quota, authentication, or budget-stop failure, an explicit
+   `resume --replace-failed-claude-with-codex` may substitute a fresh Codex
+   review against the same immutable snapshot without discarding the Claude
+   attempt. The fallback requires Codex CLI 0.138.0 or newer and confines
+   inspection to a root-validating read-only MCP server over the snapshot and
+   staged inputs; shell, exec, command network, and interactive tool surfaces
+   stay disabled, and the review MCP namespace remains direct-only.
    The USD denomination is Claude CLI's native stop and an API-price equivalent,
    not proof of subscription billing.
 3. Independently trace every finding, test gap, and structured observation

@@ -49,6 +49,7 @@ def tokens_from_mapping(value: dict[str, Any]) -> dict[str, int]:
             "cache_read_input_tokens",
             "cacheReadInputTokens",
             "cache_read_tokens",
+            "cached_input_tokens",
         ),
         "output_tokens": ("output_tokens", "outputTokens"),
     }
@@ -58,6 +59,24 @@ def tokens_from_mapping(value: dict[str, Any]) -> dict[str, int]:
             if key in value:
                 result[field] = numeric_token(value.get(key))
                 break
+    if (
+        "cached_input_tokens" in value
+        and not any(
+            key in value
+            for key in (
+                "cache_read_input_tokens",
+                "cacheReadInputTokens",
+                "cache_read_tokens",
+            )
+        )
+    ):
+        # Codex reports cached_input_tokens as a subset of input_tokens.
+        # Store the uncached remainder separately so aggregate totals do not
+        # count the cache hit twice.
+        result["input_tokens"] = max(
+            0,
+            result["input_tokens"] - result["cache_read_input_tokens"],
+        )
     result["total_input_tokens"] = sum(
         result[field]
         for field in (
@@ -116,7 +135,9 @@ def run_artifact_bytes(run_dir: Path) -> dict[str, int]:
         if path.name not in {"prompt.md", "manifest.md"}
     )
     result["raw_response_bytes"] = sum(
-        path_size(path) for path in run_dir.glob("*.raw.json")
+        path_size(path)
+        for pattern in ("*.raw.json", "*.raw.jsonl")
+        for path in run_dir.glob(pattern)
     )
     return result
 

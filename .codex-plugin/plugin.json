@@ -1,7 +1,7 @@
 {
   "name": "multi-model-review",
-  "version": "0.1.0+codex.20260812164058",
-  "description": "Run resumable task-scoped reviews with provider-allowance controls, locked Codex triage, mandatory confirmation, and fresh final gates.",
+  "version": "0.1.0+codex.20260820144122",
+  "description": "Run resumable task-scoped reviews with Claude-to-Codex fallback, provider-allowance controls, mandatory confirmation, and fresh final gates.",
   "author": {
     "name": "Shoti",
     "url": "https://github.com/shoti"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Multi-Model Review",
     "shortDescription": "Auditable multi-model review",
-    "longDescription": "Codex implements and verifies. Structured Claude, optional Antigravity, and optional Kimi inspect immutable repository snapshots in read-only sessions. Workflows use provider-allowance and readiness controls, preserve and resume partial results, pin task scope, record typed failures and evidence-backed triage, require confirmation, verify commit-aware freshness, and support commit-and-push GitHub PR handoffs.",
+    "longDescription": "Codex implements and verifies. Structured Claude, an optional workspace-isolated fresh-session Codex fallback, optional Antigravity, and optional Kimi inspect immutable repository snapshots in read-only sessions. Workflows use provider-allowance and readiness controls, preserve and resume partial results, pin task scope, record typed failures and evidence-backed triage, require confirmation, verify commit-aware freshness, and support commit-and-push GitHub PR handoffs.",
     "developerName": "Shoti",
     "category": "Developer Tools",
     "capabilities": [
@@ -33,6 +33,7 @@
     "defaultPrompt": [
       "Review my task-scoped changes with provider-allowance controls, decide every finding and test gap, then complete a mandatory confirmation gate.",
       "Run an independent Claude review with locked triage and verify the resulting commit.",
+      "When Claude allowance is unavailable, use a fresh workspace-isolated Codex reviewer against the private snapshot and report that same-provider-family limitation.",
       "Do a usage-audited multi-repository final review before merge."
     ]
   }

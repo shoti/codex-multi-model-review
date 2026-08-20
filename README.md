@@ -6,13 +6,17 @@
 
 Auditable, bounded multi-model code reviews for Codex.
 
-Codex remains the implementer and final verifier. External coding CLIs inspect
-an immutable repository snapshot in fresh, read-only sessions. Their findings
+Codex remains the implementer and final verifier. Reviewer CLIs inspect an
+immutable repository snapshot in fresh, read-only sessions. Their findings
 become evidence-backed decisions, not automatic edits, and the final gate
-becomes invalid when the reviewed source changes.
+becomes invalid when the reviewed source changes. A fresh Codex subprocess can
+replace Claude when its allowance is unavailable; that review is isolated but
+is explicitly reported as same-provider-family evidence. Its process receives
+only a minimal non-secret environment, shell and exec tools are disabled, and
+API-key authentication is rejected; use ChatGPT login.
 
-Claude Code is enabled by default. Antigravity and Kimi Code are optional and
-disabled until explicitly enabled.
+Claude Code is enabled by default. Codex review fallback, Antigravity, and Kimi
+Code are optional and disabled until explicitly enabled.
 
 > This is an independent community project. It is not affiliated with or
 > endorsed by OpenAI, Anthropic, Google, Moonshot AI, or their affiliates.
@@ -35,7 +39,8 @@ Codex Multi-Model Review turns that conversation into a durable workflow:
   observations are persisted;
 - reviewers disclose incomplete coverage and unreviewed changed paths in a
   structured contract that cannot disappear into free-form notes;
-- Claude output is schema-constrained and partial provider failures are resumable;
+- Claude and Codex output is schema-constrained and partial provider failures
+  are resumable;
 - provider attempts, quota cooldowns, authentication mode, and token telemetry
   are tracked across the whole successor lineage;
 - a private rebuildable evidence index helps Codex compare prior verified outcomes
@@ -48,8 +53,9 @@ flowchart TD
     B[Task contract<br/>scope · paths · risks · intent]
     C[Private immutable snapshot<br/>secret scan · fingerprint]
     D1[Claude Code CLI<br/>fresh read-only session]
-    D2[Antigravity CLI<br/>optional fresh read-only session]
-    D3[Kimi Code CLI<br/>optional experimental session]
+    D2[Codex CLI<br/>optional same-provider fallback]
+    D3[Antigravity CLI<br/>optional fresh read-only session]
+    D4[Kimi Code CLI<br/>optional experimental session]
     E[Parsed findings<br/>and test gaps]
     F[Codex evidence-backed triage]
     G[Repair and focused tests]
@@ -62,9 +68,11 @@ flowchart TD
     C --> D1
     C -. optional .-> D2
     C -. optional .-> D3
+    C -. optional .-> D4
     D1 --> E
     D2 --> E
     D3 --> E
+    D4 --> E
     E --> F
     J -. retrieved after fresh reports .-> F
     F --> J
@@ -79,8 +87,13 @@ flowchart TD
 - macOS or Linux. Native Windows is not currently supported.
 - Python 3.12 or newer.
 - Git.
-- A current Codex CLI with `codex plugin` support.
+- A current Codex CLI with `codex plugin` support. The optional Codex reviewer
+  requires Codex CLI 0.138.0 or newer for workspace-only permission profiles.
 - At least one installed and authenticated reviewer CLI.
+- The optional Codex reviewer currently requires file-backed ChatGPT CLI
+  credentials (`cli_auth_credentials_store = "file"`). It rejects API-key and
+  keyring-backed auth because those paths cannot provide the same verified
+  process isolation.
 - GitHub CLI (`gh`), authenticated, only when Codex should create or update a
   pull request.
 
@@ -91,6 +104,7 @@ workflow or invoking a provider when the interpreter is older than Python 3.12.
 | Reviewer | Default | Executable | Notes |
 |---|---:|---|---|
 | Claude Code | Enabled | `claude` | `sonnet`, medium effort, and a $1.25 maximum per review by default |
+| Codex | Disabled | `codex` | Ephemeral, schema-constrained, workspace-only fallback; same provider family as the controller |
 | Antigravity | Disabled | `agy` | Requires authenticated model access and the bundled hard read-only agent |
 | Kimi Code | Disabled | `kimi` | Experimental adapter; validates that the configured model alias is available |
 
@@ -198,7 +212,7 @@ Review mode is pinned with the workflow:
 | `balanced` | Ordinary features and bug fixes; the default | Up to two medium-effort repairs, then confirmation |
 | `deep` | Auth, money, trading, data writes, migrations, email, security, or broad cross-component changes | Up to three medium-effort repairs, then confirmation |
 
-Every mode retains the immutable snapshot, full triage, mandatory independent
+Every mode retains the immutable snapshot, full triage, mandatory fresh
 confirmation, freshness verification, and commit attestation controls. Use
 `deep` whenever a risk label applies; speed should come from avoiding redundant
 rounds, not weakening a high-impact review.
@@ -244,6 +258,21 @@ Resume history is append-only: earlier attempt metadata and provider artifacts
 remain available, and every attempt counts toward the workflow's per-provider
 ceiling. Claude native-stop exhaustion requires an explicit one-resume effort
 or stop override instead of silently repeating the same capped attempt.
+For a typed Claude quota, authentication, or budget-stop failure, the operator
+may explicitly use `resume --replace-failed-claude-with-codex`. The runner
+preserves the Claude failure, recreates and verifies the same immutable
+snapshot, and records the substitution before accepting a schema-constrained
+Codex report. Codex receives a temporary private `CODEX_HOME`; its ChatGPT
+credential is available to the CLI process while the reviewer cannot use a
+shell, exec, command network, browser, connector, or delegation surface. The
+only inspection interface is an embedded read-only MCP server
+whose `read_file`, `list_directory`, and literal `search` tools resolve and
+validate every path against the immutable snapshot and staged-input roots.
+Host files and credential-manager processes are therefore unreachable rather
+than merely hidden from `PATH`. A temporary `CODEX_HOME` makes global user
+config unavailable while loading only the generated review profile, and the
+temporary home is removed after the attempt. Coverage remains clearly labeled as
+same-provider-family.
 Before confirmation, `continue` warns when fewer than three attempts remain for
 an enabled provider. Use `workflow raise-provider-attempt-limit --to <count>
 --reason <reason>` for an explicit increase; the audit record is append-only and
@@ -350,6 +379,16 @@ keeping the source unchanged:
 python3 "$RUNNER" resume --run <partial-run-directory> \
   --claude-max-budget-usd 2 --claude-effort medium
 ```
+
+Or explicitly substitute Codex after a typed Claude availability failure:
+
+```bash
+python3 "$RUNNER" resume --run <partial-run-directory> \
+  --replace-failed-claude-with-codex
+```
+
+For a new round where Claude is already known to be unavailable, use
+`--without-claude --with-codex`.
 
 Ask the runner for the next lifecycle action without invoking a provider:
 
@@ -514,7 +553,7 @@ Use `python3 .../mm_review.py <command> --help` for all flags.
 | Control | What it provides | Boundary |
 |---|---|---|
 | Immutable snapshot | Reviewers do not inspect a changing checkout | The tracked repository tree is passed to every enabled provider CLI |
-| Read-only sessions | Reviewers receive read/search-only tool policies | Provider and CLI implementations remain external dependencies |
+| Read-only sessions | Reviewers receive read/search-only tool policies; Codex additionally uses a root-denying permission profile, approvals disabled, an isolated temporary config home, direct-only review MCP tools, and ephemeral persistence | Provider and CLI implementations remain dependencies |
 | Independent prompts | Provider-specific input directories expose only the snapshot, patch, manifest, and prompt—not peer reports, metadata, or Codex triage | All reviewers receive the same task contract and source |
 | Secret screening | Blocks likely credentials, sensitive paths, external symlinks, and common secret patterns across the complete outgoing snapshot | It remains heuristic and is not a substitute for a dedicated repository scanner |
 | Evidence-backed triage | Codex records why every item was accepted, fixed, rejected, deferred, or uncertain | Model agreement is not evidence |
@@ -559,6 +598,12 @@ Persistent local state is stored under:
 - `~/.config/multi-model-review/config.json`;
 - `~/.config/multi-model-review/provider-health.json`.
 
+When a host Codex sandbox cannot write the default artifact store, set
+`MM_REVIEW_RUNS_DIR` to one absolute private writable directory for the entire
+workflow. `MM_REVIEW_CONFIG_DIR` similarly relocates persistent configuration.
+Do not alternate stores within one lineage. Permission failures are reported as
+actionable errors instead of raw Python tracebacks.
+
 Artifacts can contain patches, repository paths and origin, task prompts,
 reviewer responses, raw provider output, usage metadata, and triage evidence.
 They are created with private permissions on supported systems, but must not be
@@ -588,6 +633,11 @@ The default ceiling is six attempts per provider per lineage. Exhausting one
 provider does not manufacture more quota or convert another provider's usage
 into dollars: a ready enabled reviewer may continue independently, while a
 workflow with no available reviewer reports `WAIT_FOR_PROVIDER`.
+
+Codex review uses the authenticated Codex CLI allowance and records observable
+authentication mode and provider-reported token usage. It does not claim
+cross-provider independence: the subprocess is fresh and artifact-isolated,
+but it belongs to the same provider family as the controlling Codex session.
 
 Claude's non-interactive CLI still requires a USD-denominated `--max-budget-usd`
 stop. The plugin retains it as a per-call emergency brake and stores
@@ -619,6 +669,8 @@ providers.
   start a new thread.
 - **Provider CLI missing:** install the provider's official CLI and authenticate
   it, then rerun `doctor`.
+- **Codex permission-profile contract missing:** upgrade Codex CLI to 0.138.0 or
+  newer; the fallback refuses older clients instead of using broad host reads.
 - **Antigravity agent missing or changed:** run
   `mm-review install-antigravity-agent`.
 - **Quota cooldown:** wait for the reported reset or disable that provider.
@@ -628,7 +680,12 @@ providers.
   `mm-review resume --run <run-directory>`; only failed reviewers run again.
 - **Claude native stop exhausted:** resume only with an explicit
   `--claude-max-budget-usd` and/or lower `--claude-effort`; the provider-attempt
-  ceiling still applies.
+  ceiling still applies. For a typed quota, authentication, or budget-stop
+  failure, explicitly use `--replace-failed-claude-with-codex` when same-provider-
+  family coverage is acceptable.
+- **Artifact-store permission denied:** set `MM_REVIEW_RUNS_DIR` to an absolute
+  private writable directory for the complete workflow, or approve access to
+  the configured store.
 - **Provider attempt allowance exhausted:** wait for quota reset, enable another
   provider, or intentionally supersede with a matching revised usage policy.
 - **Stale final gate:** `mm-review continue <workflow-id>` reports
@@ -660,6 +717,8 @@ providers.
 - Windows is not supported natively because the runner uses POSIX file locks,
   permissions, signals, and process groups.
 - Source is sent to every enabled reviewer provider.
+- Codex fallback is a fresh second review, not independent external-model
+  diversity.
 - Kimi support relies on an experimental CLI and may change.
 - A later scoped edit requires a new workflow after confirmation.
 - Commits, pushes, merges, deployments, migrations, backfills, messages, and

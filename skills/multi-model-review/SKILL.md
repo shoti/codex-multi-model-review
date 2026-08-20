@@ -1,13 +1,17 @@
 ---
 name: multi-model-review
-description: Run a gated code-review loop in which Codex remains the implementer and final verifier while Claude Code, Antigravity CLI using Gemini models, and optional Kimi Code independently review a Git working tree, branch, or commit with read-only tools. Use after non-trivial implementation work, before merge or deployment, when the user requests Claude/Antigravity/Gemini/Kimi/external/second-opinion/final review, when findings from another coding agent need verification and fixes, or for an explicitly authorized post-review commit, push, or GitHub pull-request handoff.
+description: Run a gated code-review loop in which Codex remains the implementer and final verifier while Claude Code, a fresh Codex subprocess fallback, Antigravity CLI using Gemini models, and optional Kimi Code review a Git working tree, branch, or commit with read-only tools. Use after non-trivial implementation work, before merge or deployment, when the user requests Claude/Codex/Antigravity/Gemini/Kimi/external/second-opinion/final review, when findings from another coding agent need verification and fixes, or for an explicitly authorized post-review commit, push, or GitHub pull-request handoff.
 ---
 
 # Multi-Model Review
 
 Keep reviewer output advisory. Codex owns the implementation, verifies every
-finding, and makes the final decision. External reviewers are always fresh,
-independent, and read-only.
+finding, and makes the final decision. Reviewer sessions are always fresh and
+read-only. The Codex reviewer is isolated from the controller conversation and
+artifacts, but it is same-provider-family evidence, not an independent
+external-model opinion. It requires ChatGPT authentication, receives a minimal
+non-secret process environment, and exposes no shell or exec tool; never
+forward API-key authentication to it.
 
 The runner requires Python 3.12 or newer. Resolve and verify the interpreter
 before the first command; on macOS, `/usr/bin/python3` may still be Python 3.9.
@@ -15,9 +19,9 @@ An unsupported interpreter is rejected before workflow or provider activity.
 
 Invoke the workflow with `/multi-model-review:multi-review`, or mention
 `$multi-model-review` in a prompt. The slash command accepts `uncommitted`,
-`branch <base>`, or `commit <sha>`, plus `with-antigravity`,
-`without-antigravity`, `with-kimi`, or `without-kimi`. The former Gemini option
-names remain accepted as compatibility aliases.
+`branch <base>`, or `commit <sha>`, plus `with-codex`, `without-codex`,
+`with-antigravity`, `without-antigravity`, `with-kimi`, or `without-kimi`. The
+former Gemini option names remain accepted as compatibility aliases.
 
 ## Run a gated workflow
 
@@ -197,6 +201,19 @@ Resume the unchanged snapshot with an explicit one-attempt override:
 mm-review resume --run <partial-run-dir> \
   --claude-max-budget-usd 2 --claude-effort medium
 ```
+
+When Claude instead has a typed quota, authentication, or budget-stop failure,
+the user may explicitly replace only that failed attempt with a fresh Codex
+session against the same fingerprint-bound snapshot:
+
+```bash
+mm-review resume --run <partial-run-dir> \
+  --replace-failed-claude-with-codex
+```
+
+The run preserves Claude's failed attempt and records the substitution. Report
+the successful Codex review as fresh-session, same-provider-family coverage;
+never describe it as an independent external-model review.
 
 The provider-attempt ceiling still applies. A linked successor inherits every
 ancestor's successful and failed provider attempts, so supersession cannot reset
@@ -442,7 +459,7 @@ user authorizes the applicable handoff as described above.
 
 ## Control reviewers
 
-Claude is enabled by default. Antigravity and Kimi remain disabled until
+Claude is enabled by default. Codex, Antigravity, and Kimi remain disabled until
 explicitly enabled, which avoids accidental allowance consumption or quota
 retries. Use the
 bundled runner so the plugin remains self-contained:
@@ -456,6 +473,8 @@ python3 <skill-dir>/scripts/mm_review.py set-effort medium
 python3 <skill-dir>/scripts/mm_review.py set-claude-usage-limit 1.25
 python3 <skill-dir>/scripts/mm_review.py set-provider-attempt-limit 6
 python3 <skill-dir>/scripts/mm_review.py set-provider-use-policy explicit
+python3 <skill-dir>/scripts/mm_review.py enable codex
+python3 <skill-dir>/scripts/mm_review.py disable codex
 python3 <skill-dir>/scripts/mm_review.py continue <workflow-id>
 python3 <skill-dir>/scripts/mm_review.py gate <workflow-id>
 python3 <skill-dir>/scripts/mm_review.py analytics --since-days 30 --format compact
@@ -482,8 +501,22 @@ flags for one review so temporary provider-native tuning does not leak into
 later tasks. `set-budget` and `set-workflow-budget` remain compatibility aliases
 for legacy configurations; new workflows do not use a cumulative dollar gate.
 
-Use `--with-antigravity`, `--without-antigravity`, `--with-kimi`, or
-`--without-kimi` for one-run overrides. Antigravity model `auto` delegates
+Use `--with-codex`, `--without-codex`, `--with-antigravity`,
+`--without-antigravity`, `--with-kimi`, or `--without-kimi` for one-run
+overrides. The Codex adapter runs `codex exec` ephemerally with global user
+config isolated behind a temporary `CODEX_HOME`, approval requests disabled,
+and the same structured report schema.
+It requires Codex CLI 0.138.0 or newer, stages ChatGPT authentication in a
+temporary private `CODEX_HOME`, and uses a custom permission profile that lets
+only an embedded MCP server inspect the immutable snapshot and staged inputs.
+Shell, unified exec, writes, command network access, browser, connector, and
+delegation surfaces are disabled. The MCP namespace is direct-only and exposes
+only root-validating `read_file`, `list_directory`, and literal `search` tools, so
+host files and credential-manager processes are unreachable. The adapter
+currently requires file-backed ChatGPT CLI credentials and rejects API-key or
+keyring-backed
+authentication because their isolation is not equivalently verified.
+Antigravity model `auto` delegates
 model routing to the installed CLI and avoids pinning the workflow to a
 short-lived Gemini model name. Use `--antigravity-model <model>` or
 `set-model antigravity <model>` only when the task requires an explicit model.
@@ -492,7 +525,9 @@ The runner rejects explicit models that `agy models` does not report.
 until the provider is explicitly enabled again. Disabled providers are not
 probed by `status` or plain `doctor`.
 
-For the current default, use capped Claude reviews. Enable Antigravity for a
+For the current default, use capped Claude reviews. Use Codex when Claude is
+unavailable and explicitly disclose that it is not cross-provider evidence.
+Enable Antigravity for a
 specific high-value independent review only after readiness and quota are
 confirmed. When Kimi access becomes available, it can replace Antigravity or
 join both reviewers for unusually high-risk work.
@@ -508,6 +543,9 @@ Inspect the reported runtime plugin version, root, runner path, and SHA-256.
 Artifacts persist the same identity. During local plugin development, invoke
 the intended source runner directly; a cached runner can prove parity only for
 the bundle it belongs to, not that a separate source checkout is newer.
+If the host Codex sandbox cannot write the default `~/.codex/review-runs`
+artifact store, set `MM_REVIEW_RUNS_DIR` to an absolute private writable
+directory for the complete workflow; do not alternate stores within a lineage.
 Interrupted reviews terminate their child process groups and are marked failed.
 If a crash leaves running metadata whose recorded PID is no longer alive, use
 `recover`; it refuses to overwrite a live process. Status calls `agy models`, so
@@ -530,9 +568,9 @@ adapter.
 
 The runner:
 
-- gives Claude, Antigravity, and Kimi fresh, independent sessions with
+- gives Claude, Codex, Antigravity, and Kimi fresh sessions with
   provider-specific staged inputs that exclude peer reports, metadata, and
-  Codex triage;
+  Codex triage; Codex remains explicitly classified as same-provider-family;
 - restricts every reviewer to read/search tools;
 - supports task-path scoping without copying dirty repositories;
 - builds a private immutable repository snapshot so reviewers never inspect the
@@ -551,8 +589,8 @@ The runner:
 - blocks new/final rounds when earlier completed rounds are incompletely triaged;
 - pins an adaptive fast, balanced, or deep repair limit followed by a mandatory confirmation;
 - pins each repository's scope, paths, risks, profile, and task across rounds;
-- requires Claude's JSON-schema output contract and safely normalizes
-  contradictory verdicts;
+- requires schema-constrained Claude and Codex output contracts and safely
+  normalizes contradictory verdicts;
 - requires structured reviewer coverage, persists notes and uncovered changed
   paths, and blocks finalization until incomplete confirmation coverage is
   independently rerun or explicitly compensated by Codex evidence;
@@ -565,6 +603,9 @@ The runner:
 - preserves valid reports when another provider fails and resumes only the
   failed reviewers against the same immutable source under a full-transaction
   run lock;
+- permits an explicit Claude-to-Codex substitution only for typed quota,
+  authentication, or budget-stop failures while preserving the failed Claude
+  attempt and immutable source fingerprint;
 - records typed provider failures without replacing them with generic terminal
   exceptions;
 - classifies Claude native-stop exhaustion separately, rejects an unchanged
