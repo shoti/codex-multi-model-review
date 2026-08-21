@@ -76,8 +76,9 @@ than assuming the macOS `/usr/bin/python3` is supported.
    --max-provider-attempts <count>`, then run
    `--phase repair` in each affected
    repository with the same workflow ID, explicit `--path` filters, task
-   intent, risks, review profile, and any provider override. Round numbering is
-   automatic.
+   intent, risks, review profile, any stable `--criterion ID=TEXT` or
+   `--critical-invariant ID=TEXT` claims, and any provider override. Round
+   numbering is automatic.
    If secret screening reports intentional test material, inspect it using
    `mm-review scan` with the same scope and paths, then use its one-shot token.
    The scan covers and fingerprints the complete outgoing repository snapshot,
@@ -106,6 +107,10 @@ than assuming the macOS `/usr/bin/python3` is supported.
    against the actual code path.
    Record every result with `mm-review decide` or one atomic
    `mm-review decide-batch`; model agreement alone is not evidence.
+   For every pinned claim, treat reviewer criterion coverage as advisory and
+   attach Codex's concrete source-bound evidence with `mm-review assure`.
+   Critical invariants must be verified. A deferred non-critical criterion
+   remains visible and limits the final gate to `PASS_WITH_FINDINGS`.
 4. Fix only accepted findings, keeping changes surgical.
 5. Run relevant tests and behavior-level checks. For DB writes, migrations,
    backfills, and external APIs, verify exact operation shape and postconditions.
@@ -128,8 +133,10 @@ than assuming the macOS `/usr/bin/python3` is supported.
    inherited repository needs a fresh successor final before workflow closure.
    Evidence satisfies the gate for the exact reviewed fingerprint and must be
    refreshed after later source changes.
-   Keep scope, path filters, risks, review profile, and task text identical
-   within one workflow.
+   Keep scope, path filters, risks, review profile, task text, and exact claim
+   IDs/text identical within one workflow. Claim drift requires an explicit
+   linked successor; legacy artifacts remain unassured rather than receiving
+   synthesized coverage.
    Check `continue` for confirmation recovery-headroom warnings. If needed,
    explicitly increase the ceiling with `workflow raise-provider-attempt-limit
    --to <count> --reason <reason>`; never hide the change or lower the ceiling.
@@ -175,6 +182,8 @@ Report:
   from workflow status;
 - accepted and fixed findings;
 - rejected, uncertain, covered, or deferred items with evidence;
+- criterion-level reviewer coverage plus Codex-owned assurance evidence and any
+  deferred or unverified claims;
 - verification commands and results;
 - the final freshness-checked gate status;
 - remaining risks or test gaps.

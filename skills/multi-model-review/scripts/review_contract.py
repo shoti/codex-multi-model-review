@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Sequence
 
 
 CLAUDE_REVIEW_SCHEMA: dict[str, Any] = {
@@ -16,6 +16,7 @@ CLAUDE_REVIEW_SCHEMA: dict[str, Any] = {
         "test_gaps",
         "observations",
         "coverage",
+        "criteria_coverage",
         "notes",
     ],
     "properties": {
@@ -118,6 +119,27 @@ CLAUDE_REVIEW_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+        "criteria_coverage": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["claim_id", "status", "evidence"],
+                "properties": {
+                    "claim_id": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "verified",
+                            "partially_verified",
+                            "not_verified",
+                            "not_applicable",
+                        ],
+                    },
+                    "evidence": {"type": "string"},
+                },
+            },
+        },
         "notes": {"type": "array", "items": {"type": "string"}},
     },
 }
@@ -181,6 +203,14 @@ def render_structured_review(payload: dict[str, Any]) -> str:
             "",
         ]
     )
+    if "criteria_coverage" in payload:
+        lines.extend(
+            [
+                "# Criteria coverage",
+                json.dumps(payload.get("criteria_coverage") or [], sort_keys=True),
+                "",
+            ]
+        )
     lines.extend(["# Notes"])
     notes = payload.get("notes") or []
     if not notes:
@@ -257,6 +287,79 @@ def parse_notes(report: str) -> list[str]:
         for line in section.splitlines()
         if line.startswith("- ") and line[2:].strip()
     ]
+
+
+def parse_criteria_coverage(
+    report: str, expected_claim_ids: Sequence[str]
+) -> dict[str, Any]:
+    expected = list(expected_claim_ids)
+    section = markdown_section(report, "Criteria coverage")
+    if not expected and not section:
+        return {"items": [], "contract_valid": True, "contract_issues": []}
+    issues: list[str] = []
+    try:
+        value = json.loads(section) if section else None
+    except json.JSONDecodeError:
+        value = None
+    if not isinstance(value, list):
+        return {
+            "items": [],
+            "contract_valid": False,
+            "contract_issues": [
+                "Criteria coverage must be a JSON array when claims are pinned."
+            ],
+        }
+    statuses = {
+        "verified",
+        "partially_verified",
+        "not_verified",
+        "not_applicable",
+    }
+    items: list[dict[str, str]] = []
+    identifiers: list[str] = []
+    for raw in value:
+        if not isinstance(raw, dict) or set(raw) != {
+            "claim_id",
+            "status",
+            "evidence",
+        }:
+            issues.append("Each criterion coverage item must use the exact schema.")
+            continue
+        claim_id = raw.get("claim_id")
+        status = raw.get("status")
+        evidence = raw.get("evidence")
+        if not isinstance(claim_id, str) or not claim_id.strip():
+            issues.append("Criterion coverage claim_id must be non-empty.")
+            continue
+        if status not in statuses:
+            issues.append(f"Criterion {claim_id} has an invalid coverage status.")
+        if not isinstance(evidence, str) or not evidence.strip():
+            issues.append(f"Criterion {claim_id} has no reviewer coverage evidence.")
+        identifiers.append(claim_id)
+        items.append(
+            {
+                "claim_id": claim_id,
+                "status": str(status),
+                "evidence": evidence.strip() if isinstance(evidence, str) else "",
+            }
+        )
+    duplicates = sorted(
+        identifier
+        for identifier in set(identifiers)
+        if identifiers.count(identifier) > 1
+    )
+    if duplicates:
+        issues.append("Duplicate criterion coverage IDs: " + ", ".join(duplicates))
+    if sorted(identifiers) != sorted(expected):
+        issues.append(
+            "Criterion coverage IDs must exactly match the pinned claims; "
+            f"expected {sorted(expected)}, received {sorted(identifiers)}."
+        )
+    return {
+        "items": items,
+        "contract_valid": not issues,
+        "contract_issues": issues,
+    }
 
 
 def markdown_section(report: str, heading: str) -> str:
@@ -343,7 +446,11 @@ def parse_bullet_test_gaps(
 
 
 def parse_review_report(
-    reviewer: str, report: str, *, risk_profiled: bool = False
+    reviewer: str,
+    report: str,
+    *,
+    risk_profiled: bool = False,
+    expected_claim_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     verdict_match = re.search(
         r"(?im)^#\s+Verdict\s*\n+\s*"
@@ -460,6 +567,9 @@ def parse_review_report(
         "invalid_observation_severities": invalid_observation_severities,
         "observations": observations,
         "coverage": parse_coverage(report),
+        "criteria_coverage": parse_criteria_coverage(
+            report, expected_claim_ids
+        ),
         "notes": parse_notes(report),
     }
 
@@ -470,6 +580,11 @@ def parsed_report_is_invalid(
     coverage = parsed.get("coverage")
     if require_coverage and (
         not isinstance(coverage, dict) or not coverage.get("contract_valid")
+    ):
+        return True
+    criteria_coverage = parsed.get("criteria_coverage")
+    if not isinstance(criteria_coverage, dict) or not criteria_coverage.get(
+        "contract_valid"
     ):
         return True
     if (

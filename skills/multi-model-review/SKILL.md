@@ -76,6 +76,8 @@ mm-review run --uncommitted \
   --workflow-id <workflow-id> --phase repair \
   --path src/feature --path test/feature \
   --risk db-write --review-profile data-change \
+  --criterion 'RESULT-1=The requested behavior is preserved' \
+  --critical-invariant 'SAFETY-1=The protected side effect fails closed' \
   --task "<intent and acceptance criteria>"
 ```
 
@@ -164,6 +166,26 @@ mm-review decide-batch --run <run-dir> \
   --item '{"finding":"claude-001","decision":"rejected","evidence":"..."}' \
   --item '{"finding":"claude-test-001","decision":"covered","evidence":"..."}'
 ```
+
+When the repair contract pins claims, every reviewer must separately declare
+criterion-level coverage. Treat that declaration as advisory: Codex must attach
+its own concrete repository, test, artifact, or safe runtime evidence to each
+claim on the final fresh run:
+
+```bash
+mm-review assure --run <run-dir> --claim RESULT-1 \
+  --status verified --evidence-kind test \
+  --evidence "tests/feature_test.py::test_result passes"
+```
+
+Claim IDs and exact text are pinned with the rest of the review contract.
+Adding, changing, or dropping one requires an explicit linked successor;
+`--reuse-contract` preserves them across repair, confirmation, and successor
+lineage. Critical invariants cannot be deferred. A deliberately deferred
+non-critical criterion requires concrete evidence plus a rationale and limits
+the gate to `PASS_WITH_FINDINGS`. Reviewer agreement and numeric confidence are
+never evidence. Legacy workflows remain readable as unassured; do not
+retroactively synthesize claim coverage.
 
 5. Fix only accepted findings/gaps. Before consuming another provider attempt,
    run the repository formatter, lint/static checks, and the complete relevant
@@ -325,8 +347,10 @@ superseded task-lineage ancestors carry forward until a later matching decision
 resolves them. Verification hashes the complete triage set and fails closed if
 any recorded decision changes after finalization. It refuses stale source,
 pending findings/test gaps, accepted unresolved test gaps, risk-profiled runs
-without verification, and accepted/uncertain blocker or high confirmation
-findings.
+without verification, incomplete claim assurance, and accepted/uncertain
+blocker or high confirmation findings. It writes fingerprint-bound
+`assurance.json` and `assurance.md`; changing source or assurance decisions
+invalidates the final hash.
 If finalized confirmation later becomes stale because scoped source changes,
 `continue` reports `NEEDS_SUCCESSOR` and prints the exact non-automatic
 successor command. A completed confirmation intentionally closes its workflow:
@@ -594,6 +618,10 @@ The runner:
 - requires structured reviewer coverage, persists notes and uncovered changed
   paths, and blocks finalization until incomplete confirmation coverage is
   independently rerun or explicitly compensated by Codex evidence;
+- pins explicit acceptance criteria and critical invariants, requires exact
+  reviewer criterion coverage plus concrete Codex-owned evidence, and folds the
+  assurance result conservatively into finalization without fabricating legacy
+  coverage;
 - caps provider attempts cumulatively across the successor lineage with atomic
   per-run reservations, including concurrent repositories, and skips an
   exhausted provider when another enabled reviewer is ready;

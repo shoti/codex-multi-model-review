@@ -141,6 +141,15 @@ def _connect(database_path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _connect_read_only(database_path: Path) -> sqlite3.Connection:
+    """Open an existing evidence index without schema or permission writes."""
+    uri = database_path.resolve().as_uri() + "?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    return connection
+
+
 @contextmanager
 def _open_database(database_path: Path) -> Iterator[sqlite3.Connection]:
     """Yield a transactional connection and always release its file handle."""
@@ -148,6 +157,18 @@ def _open_database(database_path: Path) -> Iterator[sqlite3.Connection]:
     try:
         with connection:
             yield connection
+    finally:
+        connection.close()
+
+
+@contextmanager
+def _open_database_read_only(
+    database_path: Path,
+) -> Iterator[sqlite3.Connection]:
+    """Yield a read-only connection and always release its file handle."""
+    connection = _connect_read_only(database_path)
+    try:
+        yield connection
     finally:
         connection.close()
 
@@ -351,7 +372,7 @@ def search_many(
     if decided_only:
         clauses.append("decision IN ('fixed', 'rejected', 'covered', 'deferred')")
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    with _open_database(database_path) as connection:
+    with _open_database_read_only(database_path) as connection:
         rows = connection.execute(
             "SELECT * FROM evidence" + where + " ORDER BY created_at DESC",
             parameters,
@@ -385,7 +406,7 @@ def status(database_path: Path) -> dict[str, Any]:
             "exists": False,
             "evidence_items": 0,
         }
-    with _open_database(database_path) as connection:
+    with _open_database_read_only(database_path) as connection:
         evidence_items = int(
             connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
         )

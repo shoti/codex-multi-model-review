@@ -180,7 +180,8 @@ The normal Codex-driven flow is:
 1. Finish the implementation and focused local checks.
 2. Start one workflow for the user task with a deliberate review mode and a
    per-provider attempt ceiling.
-3. Run a repair review against explicit scope, paths, risks, and intent.
+3. Run a repair review against explicit scope, paths, risks, intent, and any
+   stable acceptance criteria or critical invariants.
 4. Verify and disposition every finding and test gap.
 5. Fix accepted items. A `fixed` or `covered` decision requires verification
    and task-scoped bytes that differ from the reviewed snapshot. Then run
@@ -189,11 +190,14 @@ The normal Codex-driven flow is:
 6. Repeat only when necessary, within the selected repair-round limit.
 7. Run one mandatory confirmation with no further source changes planned,
    reusing the pinned repair contract.
-8. Finalize and verify the freshness-checked repository gate, then finalize the
+8. Attach concrete Codex-owned evidence to every pinned claim. Critical
+   invariants must be verified; a deliberately deferred non-critical criterion
+   remains visible and limits the result to `PASS_WITH_FINDINGS`.
+9. Finalize and verify the freshness-checked repository gate, then finalize the
    workflow so its state becomes explicitly `completed`.
-9. If authorized later, attest the unchanged reviewed snapshot to its commit.
+10. If authorized later, attest the unchanged reviewed snapshot to its commit.
    A local source gate and a deployment-bound gate are reported separately.
-10. When the user authorizes commit and push, generate concise PR copy focused
+11. When the user authorizes commit and push, generate concise PR copy focused
     on the problem, evidence or root cause, and resulting behavior, then create
     the branch's PR with that description or update its open PR. Verify the
     account, repository, branches, existing body, and post-write result with
@@ -351,6 +355,8 @@ python3 "$RUNNER" run \
   --risk auth \
   --risk security \
   --review-profile security \
+  --criterion 'SESSION-1=Expired sessions are rejected' \
+  --critical-invariant 'SESSION-2=Valid sessions remain authorized' \
   --task "Reject expired sessions without changing valid-session behavior"
 ```
 
@@ -364,6 +370,27 @@ python3 "$RUNNER" decide \
   --evidence "The reported path is unreachable after validation." \
   --verification "Focused session test passes."
 ```
+
+Reviewer criterion declarations are advisory coverage, not proof. After Codex
+independently inspects repository, test, artifact, or safe runtime evidence,
+attach it to each pinned claim:
+
+```bash
+python3 "$RUNNER" assure \
+  --run <run-directory> \
+  --claim SESSION-1 \
+  --status verified \
+  --evidence-kind test \
+  --evidence "tests/session/test_expiry.py::test_expired_session passes"
+```
+
+Claims use stable `ID=TEXT` values and are part of the pinned review contract.
+Adding, changing, or dropping one after a completed review requires an explicit
+successor. `--reuse-contract` preserves the exact claim set across repair,
+confirmation, and successor lineage. `assurance.json` and `assurance.md` record
+the source-bound machine and human views; later source changes invalidate the
+evidence. Existing workflows without a claim contract remain readable and are
+labeled `legacy_unassured` rather than receiving fabricated coverage.
 
 If the run is partial, retry only its failed reviewers without changing the
 source:
@@ -537,6 +564,7 @@ evidence for future retrieval tuning without influencing reviewers.
 | `run` | Execute a repair, confirmation, or exact-content supplemental round |
 | `resume` | Retry only failed reviewers from an unchanged partial run |
 | `decide` / `decide-batch` | Persist evidence-backed triage and optional memory-candidate assessments |
+| `assure` | Attach fingerprint-bound Codex evidence to one pinned acceptance criterion or critical invariant |
 | `finalize` | Produce a final gate, requiring Codex evidence for incomplete confirmation coverage |
 | `verify` | Confirm that the gate still matches current source |
 | `attest-commit` | Bind unchanged reviewed content or a clean reviewed `--base` branch to the checked-out commit |
@@ -557,6 +585,7 @@ Use `python3 .../mm_review.py <command> --help` for all flags.
 | Independent prompts | Provider-specific input directories expose only the snapshot, patch, manifest, and prompt—not peer reports, metadata, or Codex triage | All reviewers receive the same task contract and source |
 | Secret screening | Blocks likely credentials, sensitive paths, external symlinks, and common secret patterns across the complete outgoing snapshot | It remains heuristic and is not a substitute for a dedicated repository scanner |
 | Evidence-backed triage | Codex records why every item was accepted, fixed, rejected, deferred, or uncertain | Model agreement is not evidence |
+| Claim-to-evidence assurance | Stable criteria and critical invariants map to concrete Codex-owned evidence and freshness | Reviewer `verified` declarations remain advisory coverage, and no numeric confidence is produced |
 | Evidence memory | Codex can retrieve similar prior decisions after fresh reports finish | Historical evidence is never passed to reviewers and the JSON artifacts remain authoritative |
 | Freshness checks | Scoped source changes invalidate the final gate | A finalized confirmation is intentionally closed |
 | Approval boundary | Review results never authorize external actions | The user retains authority over commits, merges, deployments, migrations, and production changes |
@@ -605,7 +634,10 @@ Do not alternate stores within one lineage. Permission failures are reported as
 actionable errors instead of raw Python tracebacks.
 
 Artifacts can contain patches, repository paths and origin, task prompts,
-reviewer responses, raw provider output, usage metadata, and triage evidence.
+reviewer responses, raw provider output, usage metadata, triage evidence, and
+claim-to-evidence assurance records. Assurance records reject credential-like
+evidence and retain only necessary reviewer coverage references, not raw
+provider prose.
 They are created with private permissions on supported systems, but must not be
 committed, uploaded, or attached to public issues.
 

@@ -2,7 +2,7 @@
   "duration_ms": 1250,
   "is_error": false,
   "num_turns": 2,
-  "result": "# Verdict\nPASS_CLEAN\n\n# Findings\nNone.\n\n# Test gaps\nNone.\n\n# Coverage\n- Complete: yes\n- Unreviewed changed paths: []\n- Limitations: []\n\n# Notes\nNone.\n",
+  "result": "# Verdict\nPASS_CLEAN\n\n# Findings\nNone.\n\n# Test gaps\nNone.\n\n# Observations\nNone.\n\n# Coverage\n- Complete: yes\n- Unreviewed changed paths: []\n- Limitations: []\n\n# Criteria coverage\n[]\n\n# Notes\nNone.\n",
   "total_cost_usd": 0.02,
   "usage": {
     "input_tokens": 120,
