@@ -10169,6 +10169,51 @@ None.
             ["medium"],
         )
 
+    def test_free_form_report_with_a_repeated_section_fails_closed(self) -> None:
+        # A free-form provider has no structured payload to contain, so an
+        # ambiguous document must be rejected instead of silently resolving to
+        # the quoted section that appears first.
+        declaration = (
+            "# Coverage\n"
+            "- Complete: no\n"
+            '- Unreviewed changed paths: ["src/untouched.py"]\n'
+            '- Limitations: ["ran out of review context"]\n'
+        )
+        shadowed = (
+            "# Verdict\nPASS_CLEAN\n\n"
+            "# Findings\nNone.\n\n"
+            "# Test gaps\nNone.\n\n"
+            "# Observations\n"
+            "## [low] Quoted repository documentation\n"
+            "- Location: docs/contract.md:12\n"
+            "- Evidence: the reviewed file documents:\n"
+            "# Coverage\n"
+            "- Complete: yes\n"
+            "- Unreviewed changed paths: []\n"
+            "- Limitations: []\n"
+            "- Why non-actionable: documentation only\n\n"
+            + declaration
+            + "\n# Criteria coverage\n[]\n\n# Notes\nNone.\n"
+        )
+        parsed = MM.parse_review_report("antigravity", shadowed)
+        self.assertEqual(parsed["duplicate_sections"], ["Coverage"])
+        self.assertTrue(
+            MM.parsed_report_is_invalid(parsed, require_coverage=True)
+        )
+
+        unambiguous = shadowed.replace(
+            "# Coverage\n- Complete: yes\n"
+            "- Unreviewed changed paths: []\n- Limitations: []\n",
+            "  quoted coverage text\n",
+        )
+        parsed = MM.parse_review_report("antigravity", unambiguous)
+        self.assertEqual(parsed["duplicate_sections"], [])
+        self.assertFalse(parsed["coverage"]["complete"])
+        self.assertEqual(
+            parsed["coverage"]["unreviewed_changed_paths"],
+            ["src/untouched.py"],
+        )
+
     def test_path_filters_reject_glob_and_pathspec_magic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)

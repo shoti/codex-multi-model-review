@@ -282,6 +282,35 @@ def structured_render_is_faithful(payload: dict[str, Any], report: str) -> bool:
 
 
 SEVERITIES = ("blocker", "high", "medium", "low")
+REPORT_SECTIONS = (
+    "Verdict",
+    "Findings",
+    "Test gaps",
+    "Observations",
+    "Coverage",
+    "Criteria coverage",
+    "Notes",
+)
+
+
+def duplicate_report_sections(report: str) -> list[str]:
+    """Return every contract section heading that appears more than once.
+
+    markdown_section resolves the first match, so a repeated heading makes the
+    report ambiguous: quoted prose could shadow the reviewer's real coverage
+    declaration. A free-form provider has no structured payload to fall back
+    on, so an ambiguous report fails closed rather than gating on the wrong
+    section.
+    """
+    counts: dict[str, int] = {}
+    for match in re.finditer(r"(?im)^#[ \t]+(.+?)[ \t]*$", report):
+        key = match.group(1).casefold()
+        counts[key] = counts.get(key, 0) + 1
+    return sorted(
+        section
+        for section in REPORT_SECTIONS
+        if counts.get(section.casefold(), 0) > 1
+    )
 
 
 def parse_json_list_field(section: str, label: str) -> tuple[list[str], str | None]:
@@ -632,6 +661,7 @@ def parse_review_report(
             report, expected_claim_ids
         ),
         "notes": parse_notes(report),
+        "duplicate_sections": duplicate_report_sections(report),
     }
 
 
@@ -642,6 +672,8 @@ def parsed_report_is_invalid(
     if require_coverage and (
         not isinstance(coverage, dict) or not coverage.get("contract_valid")
     ):
+        return True
+    if parsed.get("duplicate_sections"):
         return True
     criteria_coverage = parsed.get("criteria_coverage")
     if not isinstance(criteria_coverage, dict) or not criteria_coverage.get(
