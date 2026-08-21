@@ -1,7 +1,7 @@
 {
   "duration_seconds": 1.25,
   "num_turns": 1,
-  "response": "# Verdict\nPASS_CLEAN\n\n# Findings\nNone.\n\n# Test gaps\nNone.\n\n# Coverage\n- Complete: yes\n- Unreviewed changed paths: []\n- Limitations: []\n\n# Notes\nNone.\n",
+  "response": "# Verdict\nPASS_CLEAN\n\n# Findings\nNone.\n\n# Test gaps\nNone.\n\n# Observations\nNone.\n\n# Coverage\n- Complete: yes\n- Unreviewed changed paths: []\n- Limitations: []\n\n# Criteria coverage\n[]\n\n# Notes\nNone.\n",
   "status": "SUCCESS",
   "usage": {
     "total_tokens": 160

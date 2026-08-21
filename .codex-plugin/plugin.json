@@ -1,7 +1,7 @@
 {
   "name": "multi-model-review",
-  "version": "0.1.0+codex.20260820173437",
-  "description": "Run resumable task-scoped reviews with Claude-to-Codex fallback, provider-allowance controls, mandatory confirmation, and fresh final gates.",
+  "version": "0.1.0+codex.20260821084116",
+  "description": "Run resumable task-scoped reviews with claim-to-evidence assurance, provider-allowance controls, mandatory confirmation, and fresh final gates.",
   "author": {
     "name": "Shoti",
     "url": "https://github.com/shoti"
@@ -20,12 +20,13 @@
   "interface": {
     "displayName": "Multi-Model Review",
     "shortDescription": "Auditable multi-model review",
-    "longDescription": "Codex implements and verifies. Structured Claude, an optional workspace-isolated fresh-session Codex fallback, optional Antigravity, and optional Kimi inspect immutable repository snapshots in read-only sessions. Workflows use provider-allowance and readiness controls, preserve and resume partial results, pin task scope, record typed failures and evidence-backed triage, require confirmation, verify commit-aware freshness, and support commit-and-push GitHub PR handoffs.",
+    "longDescription": "Codex implements and verifies. Structured Claude, an optional workspace-isolated fresh-session Codex fallback, optional Antigravity, and optional Kimi inspect immutable repository snapshots in read-only sessions. Workflows use provider-allowance and readiness controls, preserve and resume partial results, pin task scope and explicit claims, record evidence-backed triage and claim assurance, require confirmation, verify commit-aware freshness, and support commit-and-push GitHub PR handoffs.",
     "developerName": "Shoti",
     "category": "Developer Tools",
     "capabilities": [
       "Read-only external reviews",
       "Auditable finding triage",
+      "Claim-to-evidence assurance",
       "Resumable partial reviews",
       "Freshness-checked final gates",
       "Commit-and-push GitHub PR handoffs"

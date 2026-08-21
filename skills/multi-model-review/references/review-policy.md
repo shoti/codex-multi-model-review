@@ -95,6 +95,23 @@ silently. Either obtain another review or use `--coverage-verification` to
 record concrete Codex inspection of every uncovered path or behavior. A generic
 statement such as "reviewed manually" is not sufficient evidence.
 
+## Claim-to-evidence assurance
+
+When a workflow pins acceptance criteria or critical invariants, treat them as
+an immutable task contract separate from findings and file coverage. Reviewers
+must declare criterion-level coverage, but their `verified` status is advisory
+and never proves a claim by itself. Codex must attach a concrete repository,
+test, artifact, or safe runtime evidence record for every claim against the
+reviewed source fingerprint.
+
+A critical invariant must be `verified` with fresh evidence or finalization
+blocks. A non-critical criterion may be deliberately `deferred` only with
+concrete evidence locating the gap and an explicit rationale; it remains in the
+assurance artifact and limits the result to `PASS_WITH_FINDINGS`. Never infer a
+numeric confidence score or count model agreement as evidence. Contract drift
+requires an explicit linked successor, and legacy artifacts remain honestly
+unassured rather than receiving synthesized claim coverage.
+
 ## Convergence gate
 
 Run another external round when an accepted blocker/high finding caused code to

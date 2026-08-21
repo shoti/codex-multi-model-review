@@ -28,6 +28,7 @@ MM = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MM
 SPEC.loader.exec_module(MM)
 import evidence_memory as EM
+import assurance as AM
 
 
 def run(
@@ -67,6 +68,7 @@ def structured_report(
     coverage_complete: bool = True,
     unreviewed_paths: list[str] | None = None,
     limitations: list[str] | None = None,
+    criteria_coverage: list[dict[str, str]] | None = None,
 ) -> str:
     return (
         f"# Verdict\n{verdict}\n\n"
@@ -78,6 +80,13 @@ def structured_report(
         "- Unreviewed changed paths: "
         f"{json.dumps(unreviewed_paths or [])}\n"
         f"- Limitations: {json.dumps(limitations or [])}\n\n"
+        + (
+            "# Criteria coverage\n"
+            f"{json.dumps(criteria_coverage)}\n\n"
+            if criteria_coverage is not None
+            else ""
+        )
+        +
         "# Notes\nNone.\n"
     )
 
@@ -93,6 +102,7 @@ def structured_payload() -> dict[str, object]:
             "unreviewed_changed_paths": [],
             "limitations": [],
         },
+        "criteria_coverage": [],
         "notes": [],
     }
 
@@ -404,6 +414,12 @@ class FakeProviderHarness:
 
 
 class RunnerUnitTests(unittest.TestCase):
+    def test_codex_output_schema_requires_every_declared_property(self) -> None:
+        self.assertEqual(
+            set(MM.CLAUDE_REVIEW_SCHEMA["required"]),
+            set(MM.CLAUDE_REVIEW_SCHEMA["properties"]),
+        )
+
     def test_runtime_identity_records_exact_bundle_and_runner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "plugin"
@@ -443,7 +459,7 @@ class RunnerUnitTests(unittest.TestCase):
 
     def test_internal_error_diagnostic_omits_exception_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            run_dir = Path(temporary)
+            run_dir = Path(temporary).resolve()
             try:
                 raise TypeError("synthetic-sensitive-value-must-not-persist")
             except TypeError as exc:
@@ -464,6 +480,504 @@ class RunnerUnitTests(unittest.TestCase):
                 connection.execute("SELECT 1").fetchone()
             with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed"):
                 connection.execute("SELECT 1")
+
+    def test_evidence_memory_queries_open_existing_index_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "evidence.sqlite3"
+            with EM._open_database(database):
+                pass
+            original_connect = sqlite3.connect
+            opened: list[str] = []
+
+            def read_only_connect(
+                target: object, *args: object, **kwargs: object
+            ) -> sqlite3.Connection:
+                opened.append(str(target))
+                self.assertTrue(kwargs.get("uri"))
+                self.assertIn("mode=ro", str(target))
+                connection = original_connect(target, *args, **kwargs)
+                connection.set_authorizer(
+                    lambda action, *_: (
+                        sqlite3.SQLITE_DENY
+                        if action
+                        in {
+                            sqlite3.SQLITE_CREATE_INDEX,
+                            sqlite3.SQLITE_CREATE_TABLE,
+                            sqlite3.SQLITE_DELETE,
+                            sqlite3.SQLITE_DROP_INDEX,
+                            sqlite3.SQLITE_DROP_TABLE,
+                            sqlite3.SQLITE_INSERT,
+                            sqlite3.SQLITE_UPDATE,
+                        }
+                        else sqlite3.SQLITE_OK
+                    )
+                )
+                return connection
+
+            with mock.patch.object(
+                EM.sqlite3, "connect", side_effect=read_only_connect
+            ):
+                self.assertEqual(EM.search(database, "anything"), [])
+                self.assertEqual(EM.status(database)["evidence_items"], 0)
+
+            self.assertEqual(len(opened), 2)
+
+    def test_assurance_contract_assigns_stable_sorted_claim_ids(self) -> None:
+        contract = AM.build_contract(
+            ["C2=Second criterion", "C1=First criterion"],
+            ["I1=Critical invariant"],
+        )
+        claims = AM.validate_contract(contract)
+        self.assertEqual([claim["id"] for claim in claims], ["C1", "C2", "I1"])
+        self.assertTrue(claims[-1]["critical"])
+        self.assertEqual(contract, AM.build_contract(
+            ["C1=First criterion", "C2=Second criterion"],
+            ["I1=Critical invariant"],
+        ))
+
+    def test_assurance_contract_drift_and_confirmation_omission_fail(self) -> None:
+        contract = AM.build_contract(["C1=Original behavior"], [])
+        changed = AM.build_contract(["C1=Changed behavior"], [])
+        baseline = (
+            Path("/private/tmp/repair"),
+            {
+                "repository": {"id": "repo-1"},
+                "status": "completed",
+                "round": 1,
+                "created_at": MM.utc_now(),
+                "scope": {
+                    "kind": "uncommitted",
+                    "value": None,
+                    "label": "test",
+                },
+                "path_filters": [],
+                "risks": [],
+                "review_profile": "normal",
+                "task": "Task",
+                "assurance_contract": contract,
+            },
+        )
+        common = {
+            "identifier": "wf-test",
+            "repository_id": "repo-1",
+            "scope": MM.Scope("uncommitted", None, "test"),
+            "path_filters": (),
+            "risks": (),
+            "review_profile": "normal",
+            "task": "Task",
+        }
+        with mock.patch.object(MM, "workflow_runs", return_value=[baseline]):
+            MM.validate_review_contract(**common, assurance_contract=contract)
+            with self.assertRaisesRegex(MM.ReviewError, "assurance_contract"):
+                MM.validate_review_contract(
+                    **common, phase="confirmation", assurance_contract=None
+                )
+            with self.assertRaisesRegex(MM.ReviewError, "linked successor"):
+                MM.validate_review_contract(
+                    **common, assurance_contract=changed
+                )
+
+    def test_critical_unverified_claim_blocks_assurance_gate(self) -> None:
+        contract = AM.build_contract([], ["I1=Fail closed"])
+        document = AM.new_document(
+            run_id="run-one",
+            workflow_id="wf-one",
+            repository_id="repo-one",
+            source_fingerprint="source-one",
+            contract=contract,
+            reviewer_coverage={},
+            created_at=MM.utc_now(),
+        )
+        evaluation = AM.evaluate(
+            document, contract=contract, source_fingerprint="source-one"
+        )
+        self.assertEqual(evaluation["status"], "BLOCK")
+        with self.assertRaisesRegex(AM.AssuranceError, "cannot be deferred"):
+            AM.record(
+                document,
+                claim_id="I1",
+                status="deferred",
+                evidence_kind="repository",
+                evidence="src/guard.py:12 retains the guard",
+                rationale="Later work",
+                source_fingerprint="source-one",
+                recorded_at=MM.utc_now(),
+            )
+
+    def test_noncritical_deferral_is_visible_pass_with_findings(self) -> None:
+        contract = AM.build_contract(["C1=Optional documentation detail"], [])
+        document = AM.new_document(
+            run_id="run-one",
+            workflow_id="wf-one",
+            repository_id="repo-one",
+            source_fingerprint="source-one",
+            contract=contract,
+            reviewer_coverage={},
+            created_at=MM.utc_now(),
+        )
+        AM.record(
+            document,
+            claim_id="C1",
+            status="deferred",
+            evidence_kind="artifact",
+            evidence="review-summary.json records the bounded documentation gap",
+            rationale="Deliberately retained for a later documentation pass.",
+            source_fingerprint="source-one",
+            recorded_at=MM.utc_now(),
+        )
+        evaluation = AM.evaluate(
+            document, contract=contract, source_fingerprint="source-one"
+        )
+        self.assertEqual(evaluation["status"], "PASS_WITH_FINDINGS")
+        self.assertEqual(evaluation["deferred_claim_ids"], ["C1"])
+
+    def test_assurance_evidence_is_source_fingerprint_bound(self) -> None:
+        contract = AM.build_contract(["C1=Behavior"], [])
+        document = AM.new_document(
+            run_id="run-one",
+            workflow_id="wf-one",
+            repository_id="repo-one",
+            source_fingerprint="source-one",
+            contract=contract,
+            reviewer_coverage={},
+            created_at=MM.utc_now(),
+        )
+        AM.record(
+            document,
+            claim_id="C1",
+            status="verified",
+            evidence_kind="test",
+            evidence="test_behavior passes",
+            rationale=None,
+            source_fingerprint="source-one",
+            recorded_at=MM.utc_now(),
+        )
+        self.assertEqual(
+            AM.evaluate(
+                document, contract=contract, source_fingerprint="source-one"
+            )["status"],
+            "PASS_CLEAN",
+        )
+        stale = AM.evaluate(
+            document, contract=contract, source_fingerprint="source-two"
+        )
+        self.assertEqual(stale["status"], "BLOCK")
+        self.assertTrue(any("fingerprint" in issue for issue in stale["issues"]))
+
+    def test_repository_specific_assurance_contracts_remain_distinct(self) -> None:
+        left = AM.build_contract(["API=Backend response remains stable"], [])
+        right = AM.build_contract([], ["ORDER=Never submit an unverified order"])
+        left_document = AM.new_document(
+            run_id="run-left",
+            workflow_id="wf-one",
+            repository_id="backend",
+            source_fingerprint="left-source",
+            contract=left,
+            reviewer_coverage={},
+            created_at=MM.utc_now(),
+        )
+        right_document = AM.new_document(
+            run_id="run-right",
+            workflow_id="wf-one",
+            repository_id="trading",
+            source_fingerprint="right-source",
+            contract=right,
+            reviewer_coverage={},
+            created_at=MM.utc_now(),
+        )
+        self.assertEqual(left_document["repository_id"], "backend")
+        self.assertEqual(right_document["repository_id"], "trading")
+        self.assertNotEqual(left_document["contract_sha256"], right_document["contract_sha256"])
+
+    def test_concurrent_assurance_decisions_do_not_lose_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            contract = AM.build_contract(["C1=One", "C2=Two"], [])
+            metadata = {
+                "status": "completed",
+                "run_id": "run-one",
+                "workflow_id": "wf-one",
+                "repository": {"id": "repo-one"},
+                "source_fingerprint": "source-one",
+                "assurance_contract": contract,
+            }
+            MM.safe_write_json(run_dir / "metadata.json", metadata)
+            document = AM.new_document(
+                run_id="run-one",
+                workflow_id="wf-one",
+                repository_id="repo-one",
+                source_fingerprint="source-one",
+                contract=contract,
+                reviewer_coverage={},
+                created_at=MM.utc_now(),
+            )
+            MM.safe_write_json(run_dir / "assurance.json", document)
+            failures: list[Exception] = []
+
+            def decide(claim_id: str) -> None:
+                try:
+                    MM.assure_command(
+                        argparse.Namespace(
+                            run=str(run_dir),
+                            claim=claim_id,
+                            status="verified",
+                            evidence_kind="test",
+                            evidence=f"test_{claim_id.lower()} passes",
+                            rationale=None,
+                        )
+                    )
+                except Exception as exc:  # pragma: no cover - assertion below
+                    failures.append(exc)
+
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM, "freshness_status", return_value={"fresh": True}
+                ),
+            ):
+                threads = [
+                    threading.Thread(target=decide, args=(claim_id,))
+                    for claim_id in ("C1", "C2")
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+            self.assertEqual(failures, [])
+            saved = MM.read_json(run_dir / "assurance.json")
+            self.assertEqual(
+                {claim["id"]: claim["status"] for claim in saved["claims"]},
+                {"C1": "verified", "C2": "verified"},
+            )
+
+    def test_malformed_or_contradictory_criterion_coverage_fails_closed(self) -> None:
+        report = structured_report(
+            criteria_coverage=[
+                {"claim_id": "C1", "status": "verified", "evidence": "src/a.py"},
+                {"claim_id": "C1", "status": "not_verified", "evidence": "missing"},
+            ]
+        )
+        parsed = MM.parse_review_report(
+            "codex", report, expected_claim_ids=("C1", "C2")
+        )
+        self.assertFalse(parsed["criteria_coverage"]["contract_valid"])
+        self.assertTrue(MM.parsed_report_is_invalid(parsed, require_coverage=True))
+
+    def test_completed_review_writes_minimal_assurance_coverage_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            contract = AM.build_contract(["C1=Behavior is preserved"], [])
+            report = structured_report(
+                criteria_coverage=[
+                    {
+                        "claim_id": "C1",
+                        "status": "verified",
+                        "evidence": "unnecessary provider prose stays in review summary",
+                    }
+                ]
+            )
+            (run_dir / "codex.md").write_text(report, encoding="utf-8")
+            (run_dir / "codex.stderr.log").write_text("", encoding="utf-8")
+            metadata = {
+                "run_id": "run-one",
+                "workflow_id": "wf-one",
+                "repository": {"id": "repo-one"},
+                "source_fingerprint": "source-one",
+                "started_at": MM.utc_now(),
+                "created_at": MM.utc_now(),
+                "risks": [],
+                "coverage_contract_required": True,
+                "assurance_contract": contract,
+                "reviewers": {
+                    "codex": {
+                        "authentication_mode": "subscription",
+                        "usage_resource": "included_plan_allowance",
+                    }
+                },
+            }
+            reviewer = MM.Reviewer(
+                "codex", ("codex",), {}, "default", "codex-test"
+            )
+            result = MM.ReviewResult(
+                "codex",
+                0,
+                run_dir / "codex.md",
+                run_dir / "codex.stderr.log",
+                MM.utc_now(),
+                MM.utc_now(),
+                1.0,
+                False,
+                {"input_tokens": 1},
+            )
+            with mock.patch.object(MM, "refresh_evidence_run"):
+                failed, invalid = MM.persist_review_results(
+                    run_dir=run_dir,
+                    metadata=metadata,
+                    reviewers=[reviewer],
+                    results=[result],
+                )
+            self.assertEqual((failed, invalid), ([], []))
+            assurance = MM.read_json(run_dir / "assurance.json")
+            raw = (run_dir / "assurance.json").read_text(encoding="utf-8")
+            self.assertEqual(
+                assurance["reviewer_coverage"]["codex"][0]["status"],
+                "verified",
+            )
+            self.assertNotIn("unnecessary provider prose", raw)
+            self.assertTrue((run_dir / "assurance.md").is_file())
+
+    def test_legacy_artifacts_remain_trusted_but_unassured(self) -> None:
+        legacy_final = {
+            "schema_version": 11,
+            "codex_verdict": "PASS_CLEAN",
+            "triage_status": "PASS_CLEAN",
+            "triage_sha256s": {"run-one": "a" * 64},
+        }
+        trusted, issues = MM.final_contract_trust(legacy_final)
+        self.assertTrue(trusted, issues)
+        self.assertFalse(
+            MM.final_assurance_is_fresh(
+                Path("/private/tmp/run"), {}, legacy_final
+            )
+        )
+
+    def test_assurance_evidence_rejects_secret_like_content(self) -> None:
+        self.assertTrue(
+            MM.assurance_text_is_sensitive(
+                "api_key='synthetic-sensitive-value-1234567890'"
+            )
+        )
+        self.assertFalse(
+            MM.assurance_text_is_sensitive(
+                "tests/test_guard.py::test_fail_closed passes"
+            )
+        )
+
+    def test_finalize_requires_complete_assurance_and_records_its_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            contract = AM.build_contract([], ["I1=Fail closed"])
+            metadata = {
+                "status": "completed",
+                "run_id": "run-one",
+                "workflow_id": "",
+                "phase": "repair",
+                "round": 1,
+                "repository": {"id": "repo-one"},
+                "source_fingerprint": "source-one",
+                "assurance_contract": contract,
+            }
+            MM.safe_write_json(run_dir / "metadata.json", metadata)
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {"findings": [], "test_gaps": [], "observations": []},
+            )
+            document = AM.new_document(
+                run_id="run-one",
+                workflow_id="",
+                repository_id="repo-one",
+                source_fingerprint="source-one",
+                contract=contract,
+                reviewer_coverage={},
+                created_at=MM.utc_now(),
+            )
+            MM.safe_write_json(run_dir / "assurance.json", document)
+            args = argparse.Namespace(
+                run=str(run_dir),
+                codex_verdict="PASS_CLEAN",
+                codex_review="Verified the exact invariant.",
+                verification=[],
+                coverage_verification=[],
+            )
+            patches = (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM,
+                    "finalization_triage_runs",
+                    return_value=[(run_dir, metadata)],
+                ),
+                mock.patch.object(
+                    MM, "freshness_status", return_value={"fresh": True, "mode": "test"}
+                ),
+            )
+            with patches[0], patches[1], patches[2], self.assertRaisesRegex(
+                MM.ReviewError, "assurance blocks finalization"
+            ):
+                MM.finalize_command(args)
+            AM.record(
+                document,
+                claim_id="I1",
+                status="verified",
+                evidence_kind="test",
+                evidence="test_fail_closed passes",
+                rationale=None,
+                source_fingerprint="source-one",
+                recorded_at=MM.utc_now(),
+            )
+            MM.safe_write_json(run_dir / "assurance.json", document)
+            with patches[0], patches[1], patches[2]:
+                self.assertEqual(MM.finalize_command(args), 0)
+            final = MM.read_json(run_dir / "final.json")
+            self.assertEqual(final["assurance"]["classification"], "claim_aware")
+            self.assertEqual(final["assurance"]["status"], "PASS_CLEAN")
+            self.assertEqual(
+                final["assurance"]["sha256"],
+                MM.sha256_text(
+                    (run_dir / "assurance.json").read_text(encoding="utf-8")
+                ),
+            )
+
+    def test_new_runner_labels_legacy_completed_run_without_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            metadata = {
+                "status": "completed",
+                "run_id": "run-legacy",
+                "workflow_id": "",
+                "phase": "repair",
+                "round": 1,
+                "repository": {"id": "repo-one"},
+                "source_fingerprint": "source-one",
+            }
+            MM.safe_write_json(run_dir / "metadata.json", metadata)
+            MM.safe_write_json(
+                run_dir / "triage.json",
+                {"findings": [], "test_gaps": [], "observations": []},
+            )
+            args = argparse.Namespace(
+                run=str(run_dir),
+                codex_verdict="PASS_CLEAN",
+                codex_review="Legacy evidence remains unchanged.",
+                verification=[],
+                coverage_verification=[],
+            )
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM,
+                    "finalization_triage_runs",
+                    return_value=[(run_dir, metadata)],
+                ),
+                mock.patch.object(
+                    MM, "freshness_status", return_value={"fresh": True, "mode": "test"}
+                ),
+            ):
+                self.assertEqual(MM.finalize_command(args), 0)
+            final = MM.read_json(run_dir / "final.json")
+            self.assertEqual(
+                final["assurance"],
+                {
+                    "artifact": None,
+                    "classification": "legacy_unassured",
+                    "contract_sha256": None,
+                    "counts": {},
+                    "deferred_claim_ids": [],
+                    "sha256": None,
+                    "status": "NOT_EVALUATED",
+                    "summary_artifact": None,
+                },
+            )
 
     def setUp(self) -> None:
         self.health_directory = tempfile.TemporaryDirectory()
@@ -3742,6 +4256,40 @@ None.
         record.assert_called_once()
         self.assertEqual(record.call_args.args[:2], ("codex", "network"))
 
+    def test_non_codex_reviewer_replaces_malformed_output_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_kimi = root / "kimi"
+            fake_kimi.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import sys
+
+                    sys.stdout.buffer.write(b"malformed: \\xff")
+                    sys.stdout.buffer.flush()
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_kimi.chmod(0o755)
+            reviewer = MM.Reviewer(
+                "kimi", (str(fake_kimi),), {}, "fake", "fake-kimi"
+            )
+
+            result = MM.invoke_reviewer(
+                reviewer,
+                repo=root,
+                prompt="Review.",
+                run_dir=root,
+                input_dir=root,
+                timeout_seconds=3,
+            )
+            report = result.report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(report, "malformed: \ufffd")
+
     def test_codex_dns_failure_without_newlines_stops_before_review_timeout(
         self,
     ) -> None:
@@ -6089,6 +6637,11 @@ None.
                     "codex_verdict": "PASS_CLEAN",
                     "triage_status": "PASS_CLEAN",
                     "triage_sha256s": {"run-one": "a" * 64},
+                    "assurance": {
+                        "classification": "legacy_unassured",
+                        "status": "NOT_EVALUATED",
+                        "sha256": None,
+                    },
                 },
             )
             MM.safe_write_json(
@@ -7470,9 +8023,9 @@ None.
             self.assertEqual(
                 EM.upsert_run(database, run_dir, lineage_root="wf-one"), 1
             )
-            original_open = EM._open_database
+            original_open = EM._open_database_read_only
             with mock.patch.object(
-                EM, "_open_database", wraps=original_open
+                EM, "_open_database_read_only", wraps=original_open
             ) as open_database:
                 results = EM.search_many(
                     database,
@@ -8977,6 +9530,164 @@ None.
 
 
 class RunnerEndToEndTests(unittest.TestCase):
+    def test_claim_assurance_persists_through_confirmation_and_stales(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "assurance-repo"
+            repo.mkdir()
+            initialize_repo(repo)
+            feature = repo / "src" / "feature.py"
+            feature.write_text("VALUE = 2\n", encoding="utf-8")
+            harness = FakeProviderHarness(root)
+            coverage = [
+                {
+                    "claim_id": "C1",
+                    "status": "verified",
+                    "evidence": "src/feature.py contains the intended value",
+                },
+                {
+                    "claim_id": "I1",
+                    "status": "verified",
+                    "evidence": "the changed path has no side effect",
+                },
+            ]
+            payload = structured_payload()
+            payload["criteria_coverage"] = coverage
+            harness.queue(
+                "codex",
+                {"structured": payload},
+                {"structured": payload},
+            )
+            workflow = harness.cli(
+                repo,
+                "workflow",
+                "start",
+                "--review-mode",
+                "deep",
+                "--max-provider-attempts",
+                "4",
+            ).stdout.strip()
+            repair = harness.cli(
+                repo,
+                "run",
+                "--uncommitted",
+                "--workflow-id",
+                workflow,
+                "--phase",
+                "repair",
+                "--path",
+                "src/feature.py",
+                "--task",
+                "Change the feature value without adding a side effect.",
+                "--criterion",
+                "C1=The feature value is two",
+                "--critical-invariant",
+                "I1=The change introduces no side effect",
+                "--with-codex",
+                "--without-claude",
+                "--without-antigravity",
+                "--without-kimi",
+                provider_backed=True,
+            )
+            repair_dir = Path(
+                next(
+                    line.split(": ", 1)[1]
+                    for line in repair.stdout.splitlines()
+                    if line.startswith("Review artifacts: ")
+                )
+            )
+            confirmation = harness.cli(
+                repo,
+                "run",
+                "--workflow-id",
+                workflow,
+                "--phase",
+                "confirmation",
+                "--reuse-contract",
+                "--with-codex",
+                "--without-claude",
+                "--without-antigravity",
+                "--without-kimi",
+                provider_backed=True,
+            )
+            confirmation_dir = Path(
+                next(
+                    line.split(": ", 1)[1]
+                    for line in confirmation.stdout.splitlines()
+                    if line.startswith("Review artifacts: ")
+                )
+            )
+            repair_metadata = MM.read_json(repair_dir / "metadata.json")
+            confirmation_metadata = MM.read_json(
+                confirmation_dir / "metadata.json"
+            )
+            self.assertEqual(
+                repair_metadata["assurance_contract"],
+                confirmation_metadata["assurance_contract"],
+            )
+            plan = json.loads(
+                harness.cli(repo, "continue", workflow, check=False).stdout
+            )
+            self.assertEqual(plan["next"], "NEEDS_ASSURANCE")
+            blocked = harness.cli(
+                repo,
+                "finalize",
+                "--run",
+                str(confirmation_dir),
+                "--codex-verdict",
+                "PASS_CLEAN",
+                "--codex-review",
+                "No defect remains.",
+                check=False,
+            )
+            self.assertEqual(blocked.returncode, 2)
+            self.assertIn("assurance blocks finalization", blocked.stderr)
+            for claim, kind, evidence in (
+                ("C1", "repository", "src/feature.py:1 sets VALUE to two"),
+                ("I1", "test", "complete dependency-free suite passes"),
+            ):
+                harness.cli(
+                    repo,
+                    "assure",
+                    "--run",
+                    str(confirmation_dir),
+                    "--claim",
+                    claim,
+                    "--status",
+                    "verified",
+                    "--evidence-kind",
+                    kind,
+                    "--evidence",
+                    evidence,
+                )
+            harness.cli(
+                repo,
+                "finalize",
+                "--run",
+                str(confirmation_dir),
+                "--codex-verdict",
+                "PASS_CLEAN",
+                "--codex-review",
+                "Both pinned claims have concrete source-bound evidence.",
+            )
+            verified = harness.cli(
+                repo, "verify", "--run", str(confirmation_dir)
+            )
+            self.assertTrue(json.loads(verified.stdout)["assurance_fresh"])
+            final = MM.read_json(confirmation_dir / "final.json")
+            self.assertEqual(final["assurance"]["status"], "PASS_CLEAN")
+            self.assertEqual(final["assurance"]["counts"]["verified"], 2)
+            feature.write_text("VALUE = 3\n", encoding="utf-8")
+            stale = harness.cli(
+                repo,
+                "verify",
+                "--run",
+                str(confirmation_dir),
+                check=False,
+            )
+            self.assertEqual(stale.returncode, 3)
+            self.assertFalse(json.loads(stale.stdout)["source_fresh"])
+
     def test_failed_claude_can_be_replaced_by_codex_on_same_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

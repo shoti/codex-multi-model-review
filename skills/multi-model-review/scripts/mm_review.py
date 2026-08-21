@@ -32,6 +32,15 @@ import traceback
 import uuid
 from typing import Any, Iterable, Sequence
 
+from assurance import (
+    AssuranceError,
+    build_contract as build_assurance_contract,
+    evaluate as evaluate_assurance,
+    new_document as new_assurance_document,
+    record as record_assurance,
+    render_summary as render_assurance_summary,
+    validate_contract as validate_assurance_contract,
+)
 from review_contract import (
     CLAUDE_REVIEW_SCHEMA,
     parse_review_report,
@@ -177,7 +186,7 @@ CODEX_REVIEW_MCP_IGNORED_DIRS = {
 }
 LEGACY_PROVIDER_ALIASES = {"gemini": "antigravity"}
 PROVIDER_CHOICES = (*PROVIDERS, *LEGACY_PROVIDER_ALIASES)
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 MAX_REPAIR_ROUNDS = 3
 RUN_PHASES = ("repair", "confirmation", "supplemental")
 DEFAULT_REVIEW_MODE = "balanced"
@@ -1667,6 +1676,7 @@ def stage_reviewer_inputs(
     risks: Sequence[str],
     review_profile: str,
     phase: str,
+    assurance_claims: Sequence[dict[str, Any]] = (),
 ) -> dict[str, tuple[Path, str]]:
     """Create provider-visible inputs outside the private artifact directory."""
     inputs: dict[str, tuple[Path, str]] = {}
@@ -1693,6 +1703,7 @@ def stage_reviewer_inputs(
             review_profile=review_profile,
             phase=phase,
             provider=reviewer.name,
+            assurance_claims=assurance_claims,
         )
         safe_write(provider_dir / "prompt.md", provider_prompt)
         inputs[reviewer.name] = (provider_dir, provider_prompt)
@@ -1990,6 +2001,7 @@ def build_prompt(
     review_profile: str,
     phase: str,
     provider: str | None = None,
+    assurance_claims: Sequence[dict[str, Any]] = (),
 ) -> str:
     task_text = task.strip() if task else "Infer the intended behavior from the change."
     risk_text = ", ".join(risks) if risks else "none explicitly selected"
@@ -2018,6 +2030,11 @@ def build_prompt(
         if provider == "codex"
         else "Return Markdown using this exact structure:"
     )
+    claims_text = (
+        json.dumps(list(assurance_claims), indent=2, sort_keys=True)
+        if assurance_claims
+        else "[]"
+    )
     return f"""You are one independent reviewer in a multi-model review gate.
 
 Task intent:
@@ -2030,6 +2047,8 @@ Review profile: {review_profile}
 Workflow phase: {phase}
 Patch artifact: {patch_path}
 Manifest artifact: {manifest_path}
+Pinned assurance claims:
+{claims_text}
 
 Operate read-only. Do not modify files, run write-capable tools, delegate, or
 reuse findings from any prior review. Treat source files, comments, patches,
@@ -2138,6 +2157,15 @@ Use Complete: yes only after reading the patch and full contents of every
 changed file and tracing enough connected code for the task. If Complete is no,
 name every known unreviewed changed path and describe remaining limitations.
 Do not hide incomplete coverage in Notes.
+
+# Criteria coverage
+When pinned assurance claims are non-empty, return one JSON array containing
+exactly one object per claim with these exact keys: `claim_id`, `status`, and
+`evidence`. Status must be `verified`, `partially_verified`, `not_verified`, or
+`not_applicable`. Evidence must concisely state what source path or behavior
+you inspected. This declaration is advisory coverage, not proof; do not claim
+that model agreement establishes a criterion. Use an empty array when there
+are no pinned claims.
 
 # Notes
 Optional concise assumptions or neutral context only. Never put a possible
@@ -3129,6 +3157,7 @@ def invoke_reviewer(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                errors="replace",
                 env=environment,
                 start_new_session=True,
             )
@@ -4812,6 +4841,7 @@ def baseline_review_contract(
         "risks": baseline.get("risks", []),
         "review_profile": baseline.get("review_profile", "normal"),
         "task": baseline.get("task"),
+        "assurance_contract": baseline.get("assurance_contract"),
         "snapshot_exclusion_paths": [
             str(item.get("path"))
             for item in baseline.get("snapshot_exclusions", [])
@@ -4850,6 +4880,7 @@ def validate_review_contract(
     risks: Sequence[str],
     review_profile: str,
     task: str | None,
+    assurance_contract: dict[str, Any] | None = None,
     snapshot_exclusion_paths: Sequence[str] = (),
 ) -> None:
     expected = baseline_review_contract(identifier, repository_id)
@@ -4861,6 +4892,7 @@ def validate_review_contract(
         "risks": sorted(set(risks)),
         "review_profile": review_profile,
         "task": task,
+        "assurance_contract": assurance_contract,
         "snapshot_exclusion_paths": list(snapshot_exclusion_paths),
     }
     mismatches = [
@@ -6829,6 +6861,8 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
         commit = None
         final_status = None
         triage_fresh = False
+        assurance_fresh = False
+        assurance_summary: dict[str, Any] | None = None
         final_contract_trusted = False
         final_contract_issues: list[str] = []
         binding = "unfinalized"
@@ -6838,6 +6872,11 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
         if final_path.exists():
             final = read_json(final_path)
             final_status = final.get("status")
+            assurance_summary = (
+                final.get("assurance")
+                if isinstance(final.get("assurance"), dict)
+                else None
+            )
             final_contract_trusted, final_contract_issues = final_contract_trust(
                 final
             )
@@ -6851,7 +6890,17 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                 triage_fresh = final_triage_is_fresh(
                     run_dir, metadata, final
                 )
-                fresh = fresh and triage_fresh and final_contract_trusted
+                assurance_fresh = (
+                    final_assurance_is_fresh(run_dir, metadata, final)
+                    if int(final.get("schema_version") or 0) >= 12
+                    else True
+                )
+                fresh = (
+                    fresh
+                    and triage_fresh
+                    and assurance_fresh
+                    and final_contract_trusted
+                )
                 binding, commit_bound = review_binding(metadata, final, commit)
                 commit_attested = commit_is_attested(final, commit)
             except ReviewError:
@@ -6881,6 +6930,8 @@ def workflow_status(identifier: str) -> tuple[dict[str, Any], bool]:
                 "fresh": fresh,
                 "freshness_mode": freshness_mode,
                 "triage_fresh": triage_fresh,
+                "assurance_fresh": assurance_fresh,
+                "assurance": assurance_summary,
                 "final_contract_trusted": final_contract_trusted,
                 "final_contract_issues": final_contract_issues,
                 "commit": commit,
@@ -7277,6 +7328,7 @@ def workflow_continue_plan(
         "WAIT_FOR_PROVIDER": 7,
         "NEEDS_RECOVERY": 6,
         "NEEDS_TRIAGE": 5,
+        "NEEDS_ASSURANCE": 5,
         "NEEDS_CODEX_FINAL": 4,
         "NEEDS_REVIEW": 3,
         "READY_TO_GATE": 2,
@@ -7446,17 +7498,61 @@ def workflow_continue_plan(
                         else run_dir / "final.json"
                     )
                     if not final_path.exists():
-                        candidate = "NEEDS_CODEX_FINAL"
-                        action.update(
-                            {
-                                "type": "codex_final",
-                                "command": (
-                                    f"mm-review gate {shlex.quote(identifier)} "
-                                    "--codex-verdict <verdict> --codex-review "
-                                    '"<evidence-backed final review>"'
-                                ),
-                            }
+                        contract = metadata.get("assurance_contract")
+                        claims = (
+                            validate_assurance_contract(contract)
+                            if isinstance(contract, dict)
+                            else []
                         )
+                        assurance_path = run_dir / "assurance.json"
+                        assurance_evaluation = (
+                            evaluate_assurance(
+                                read_json(assurance_path),
+                                contract=contract,
+                                source_fingerprint=str(
+                                    metadata.get("source_fingerprint") or ""
+                                ),
+                            )
+                            if claims and assurance_path.exists()
+                            else None
+                        )
+                        if claims and (
+                            not assurance_evaluation
+                            or not assurance_evaluation.get("complete")
+                        ):
+                            candidate = "NEEDS_ASSURANCE"
+                            action.update(
+                                {
+                                    "type": "assurance",
+                                    "claim_ids": [
+                                        str(claim["id"]) for claim in claims
+                                    ],
+                                    "reason": (
+                                        assurance_evaluation.get("issues", [])
+                                        if assurance_evaluation
+                                        else ["assurance.json is missing"]
+                                    ),
+                                    "command": (
+                                        "mm-review assure --run "
+                                        f"{shlex.quote(str(run_dir))} --claim "
+                                        "<claim-id> --status verified "
+                                        "--evidence-kind <kind> --evidence "
+                                        '"<concrete evidence>"'
+                                    ),
+                                }
+                            )
+                        else:
+                            candidate = "NEEDS_CODEX_FINAL"
+                            action.update(
+                                {
+                                    "type": "codex_final",
+                                    "command": (
+                                        f"mm-review gate {shlex.quote(identifier)} "
+                                        "--codex-verdict <verdict> --codex-review "
+                                        '"<evidence-backed final review>"'
+                                    ),
+                                }
+                            )
                     else:
                         final = read_json(final_path)
                         trusted, trust_issues = final_contract_trust(final)
@@ -8897,6 +8993,89 @@ def decide_batch_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def assurance_text_is_sensitive(value: str) -> bool:
+    return bool(
+        SECRET_ASSIGNMENT_PATTERN.search(value)
+        or DOTENV_ASSIGNMENT_PATTERN.search(value)
+        or any(pattern.search(value) for pattern in SENSITIVE_CONTENT_PATTERNS.values())
+    )
+
+
+def assure_command(args: argparse.Namespace) -> int:
+    """Record one Codex-owned, source-bound claim decision atomically."""
+    run_dir = resolve_run_dir(args.run)
+    metadata = read_json(run_dir / "metadata.json")
+    if metadata.get("status") != "completed":
+        raise ReviewError("Assurance evidence requires a completed review run.")
+    if (run_dir / "final.json").exists() or (run_dir / "supplemental.json").exists():
+        raise ReviewError(
+            "A finalized assurance artifact is immutable; create a successor "
+            "for a changed claim decision."
+        )
+    contract = metadata.get("assurance_contract")
+    if not isinstance(contract, dict):
+        raise ReviewError(
+            "This legacy run has no explicit assurance contract; do not "
+            "fabricate criterion coverage retroactively."
+        )
+    claims = validate_assurance_contract(contract)
+    if not claims:
+        raise ReviewError("This run has no explicit assurance claims.")
+    for label, value in (
+        ("evidence", args.evidence),
+        ("rationale", args.rationale or ""),
+    ):
+        if len(value) > MAX_NOTE_CHARS:
+            raise ReviewError(
+                f"--{label} must be at most {MAX_NOTE_CHARS} characters."
+            )
+        if assurance_text_is_sensitive(value):
+            raise ReviewError(
+                f"--{label} resembles a credential or secret. Record only a "
+                "safe locator, digest, command result, or redacted summary."
+            )
+    reviewed = str(metadata.get("source_fingerprint") or "")
+    freshness = freshness_status(run_dir, metadata, reviewed)
+    if not freshness["fresh"]:
+        raise ReviewError(
+            "The reviewed source changed; assurance evidence must be recorded "
+            "on a fresh successor review."
+        )
+    assurance_path = run_dir / "assurance.json"
+    with exclusive_file_lock(assurance_path):
+        if not assurance_path.exists():
+            raise ReviewError("Completed claim-aware run has no assurance.json.")
+        document = read_json(assurance_path)
+        try:
+            record_assurance(
+                document,
+                claim_id=args.claim,
+                status=args.status,
+                evidence_kind=args.evidence_kind,
+                evidence=args.evidence,
+                rationale=args.rationale,
+                source_fingerprint=reviewed,
+                recorded_at=utc_now(),
+            )
+            evaluation = evaluate_assurance(
+                document,
+                contract=contract,
+                source_fingerprint=reviewed,
+            )
+        except AssuranceError as exc:
+            raise ReviewError(str(exc)) from exc
+        safe_write_json(assurance_path, document)
+        safe_write(
+            run_dir / "assurance.md",
+            render_assurance_summary(document, evaluation),
+        )
+    print(
+        f"{args.claim}: {args.status}; assurance={assurance_path}; "
+        f"gate={evaluation['status']}"
+    )
+    return 0
+
+
 def final_gate_status(
     findings: Sequence[dict[str, Any]],
     test_gaps: Sequence[dict[str, Any]],
@@ -9050,6 +9229,40 @@ def final_triage_is_fresh(
     return True
 
 
+def final_assurance_is_fresh(
+    run_dir: Path,
+    metadata: dict[str, Any],
+    final: dict[str, Any],
+) -> bool:
+    assurance = final.get("assurance")
+    if not isinstance(assurance, dict):
+        return False
+    classification = assurance.get("classification")
+    contract = metadata.get("assurance_contract")
+    if classification == "legacy_unassured":
+        return not isinstance(contract, dict) and assurance.get("sha256") is None
+    if not isinstance(contract, dict):
+        return False
+    assurance_path = run_dir / "assurance.json"
+    expected = assurance.get("sha256")
+    if not isinstance(expected, str) or not assurance_path.is_file():
+        return False
+    if sha256_text(assurance_path.read_text(encoding="utf-8")) != expected:
+        return False
+    try:
+        evaluation = evaluate_assurance(
+            read_json(assurance_path),
+            contract=contract,
+            source_fingerprint=str(metadata.get("source_fingerprint") or ""),
+        )
+    except (AssuranceError, ReviewError):
+        return False
+    return (
+        evaluation.get("status") == assurance.get("status")
+        and evaluation.get("complete") is True
+    )
+
+
 def final_contract_trust(final: dict[str, Any]) -> tuple[bool, list[str]]:
     """Return whether a final carries the structured Codex gate contract."""
     issues: list[str] = []
@@ -9075,6 +9288,20 @@ def final_contract_trust(final: dict[str, Any]) -> tuple[bool, list[str]]:
         )
     ):
         issues.append("triage_sha256s is missing or invalid")
+    if isinstance(schema_version, int) and schema_version >= 12:
+        assurance = final.get("assurance")
+        if not isinstance(assurance, dict) or assurance.get("classification") not in {
+            "claim_aware",
+            "no_explicit_claims",
+            "legacy_unassured",
+        }:
+            issues.append("assurance classification is missing or invalid")
+        elif assurance.get("status") not in {
+            "PASS_CLEAN",
+            "PASS_WITH_FINDINGS",
+            "NOT_EVALUATED",
+        }:
+            issues.append("assurance status is missing or invalid")
     return not issues, issues
 
 
@@ -9315,6 +9542,45 @@ def finalize_command(args: argparse.Namespace) -> int:
             "--coverage-verification after inspecting every uncovered area:\n- "
             + "\n- ".join(details)
         )
+    assurance_contract = metadata.get("assurance_contract")
+    assurance_path = run_dir / "assurance.json"
+    if isinstance(assurance_contract, dict):
+        assurance_claims = validate_assurance_contract(assurance_contract)
+        if not assurance_path.exists():
+            raise ReviewError(
+                "Claim-aware run has no assurance.json; rerun or recover the "
+                "completed review artifacts."
+            )
+        try:
+            assurance_evaluation = evaluate_assurance(
+                read_json(assurance_path),
+                contract=assurance_contract,
+                source_fingerprint=str(reviewed or ""),
+            )
+        except AssuranceError as exc:
+            raise ReviewError(str(exc)) from exc
+        if assurance_claims and not assurance_evaluation["complete"]:
+            raise ReviewError(
+                "Claim-to-evidence assurance blocks finalization:\n- "
+                + "\n- ".join(assurance_evaluation["issues"])
+            )
+        assurance_classification = (
+            "claim_aware" if assurance_claims else "no_explicit_claims"
+        )
+        assurance_status = str(assurance_evaluation["status"])
+        assurance_sha256 = sha256_text(
+            assurance_path.read_text(encoding="utf-8")
+        )
+    else:
+        assurance_evaluation = {
+            "status": "NOT_EVALUATED",
+            "complete": True,
+            "issues": [],
+            "counts": {},
+        }
+        assurance_classification = "legacy_unassured"
+        assurance_status = "NOT_EVALUATED"
+        assurance_sha256 = None
     remaining = [
         final_item_reference(item, candidate_dir, candidate_metadata)
         for item, candidate_dir, candidate_metadata in history_findings
@@ -9334,7 +9600,10 @@ def finalize_command(args: argparse.Namespace) -> int:
         [item for item, _, _ in history_findings],
         [item for item, _, _ in history_test_gaps],
     )
-    gate_status = conservative_gate_status(triage_status, codex_verdict)
+    gate_inputs = [triage_status, codex_verdict]
+    if assurance_status in GATE_STATUSES:
+        gate_inputs.append(assurance_status)
+    gate_status = conservative_gate_status(*gate_inputs)
     status = gate_status
     if phase == "supplemental":
         status = {
@@ -9386,6 +9655,22 @@ def finalize_command(args: argparse.Namespace) -> int:
             ),
             "snapshot_exclusions": snapshot_exclusions,
         },
+        "assurance": {
+            "classification": assurance_classification,
+            "status": assurance_status,
+            "sha256": assurance_sha256,
+            "artifact": "assurance.json" if assurance_sha256 else None,
+            "summary_artifact": "assurance.md" if assurance_sha256 else None,
+            "contract_sha256": (
+                assurance_contract.get("sha256")
+                if isinstance(assurance_contract, dict)
+                else None
+            ),
+            "counts": assurance_evaluation.get("counts", {}),
+            "deferred_claim_ids": assurance_evaluation.get(
+                "deferred_claim_ids", []
+            ),
+        },
         "remaining_findings": remaining,
         "remaining_finding_ids": [str(item.get("id")) for item in remaining],
         "remaining_test_gaps": accepted_test_gaps + deferred_test_gaps,
@@ -9425,7 +9710,17 @@ def verify_command(args: argparse.Namespace) -> int:
     )
     source_fresh = bool(freshness["fresh"])
     triage_fresh = final_triage_is_fresh(run_dir, metadata, final)
-    fresh = source_fresh and triage_fresh and final_contract_trusted
+    assurance_fresh = (
+        final_assurance_is_fresh(run_dir, metadata, final)
+        if int(final.get("schema_version") or 0) >= 12
+        else True
+    )
+    fresh = (
+        source_fresh
+        and triage_fresh
+        and assurance_fresh
+        and final_contract_trusted
+    )
     status = final.get("status")
     commit = freshness.get("commit")
     binding, commit_bound = review_binding(metadata, final, commit)
@@ -9447,6 +9742,7 @@ def verify_command(args: argparse.Namespace) -> int:
                 "fresh": fresh,
                 "source_fresh": source_fresh,
                 "triage_fresh": triage_fresh,
+                "assurance_fresh": assurance_fresh,
                 "final_contract_trusted": final_contract_trusted,
                 "final_contract_issues": final_contract_issues,
                 "freshness_mode": freshness["mode"],
@@ -9810,6 +10106,13 @@ def persist_review_results(
     reviewers: Sequence[Reviewer],
     results: Sequence[ReviewResult],
 ) -> tuple[list[str], list[str]]:
+    assurance_contract = metadata.get("assurance_contract")
+    assurance_claims = (
+        validate_assurance_contract(assurance_contract)
+        if isinstance(assurance_contract, dict)
+        else []
+    )
+    expected_claim_ids = [str(claim["id"]) for claim in assurance_claims]
     definitions = {reviewer.name: reviewer for reviewer in reviewers}
     reviewer_metadata = metadata.get("reviewers")
     if not isinstance(reviewer_metadata, dict):
@@ -9819,7 +10122,10 @@ def persist_review_results(
         definition = definitions[name]
         report = result.report_path.read_text(encoding="utf-8")
         parsed = parse_review_report(
-            name, report, risk_profiled=bool(metadata.get("risks"))
+            name,
+            report,
+            risk_profiled=bool(metadata.get("risks")),
+            expected_claim_ids=expected_claim_ids,
         )
         previous = reviewer_metadata.get(name)
         attempt_history: list[dict[str, Any]] = []
@@ -9869,6 +10175,7 @@ def persist_review_results(
             "finding_counts": parsed["finding_counts"],
             "test_gap_counts": parsed["test_gap_counts"],
             "coverage": parsed["coverage"],
+            "criteria_coverage": parsed["criteria_coverage"],
         }
         if attempt_history:
             latest["attempts"] = attempt_history
@@ -9888,7 +10195,10 @@ def persist_review_results(
         report_path = run_dir / str(item.get("report") or f"{name}.md")
         report = report_path.read_text(encoding="utf-8") if report_path.exists() else ""
         parsed = parse_review_report(
-            str(name), report, risk_profiled=bool(metadata.get("risks"))
+            str(name),
+            report,
+            risk_profiled=bool(metadata.get("risks")),
+            expected_claim_ids=expected_claim_ids,
         )
         parsed_reviews[str(name)] = parsed
         if int(item.get("exit_code") or 0) != 0:
@@ -9959,6 +10269,11 @@ def persist_review_results(
                 for name, review in parsed_reviews.items()
                 if isinstance(review, dict)
             },
+            "criteria_coverage": {
+                name: review.get("criteria_coverage")
+                for name, review in parsed_reviews.items()
+                if isinstance(review, dict)
+            },
             "review_notes": {
                 name: review.get("notes", [])
                 for name, review in parsed_reviews.items()
@@ -9966,6 +10281,62 @@ def persist_review_results(
             },
         },
     )
+    if isinstance(assurance_contract, dict):
+        assurance_path = run_dir / "assurance.json"
+        reviewer_coverage = {
+            name: [
+                {
+                    "claim_id": item.get("claim_id"),
+                    "status": item.get("status"),
+                    "report_sha256": reviewer_metadata.get(name, {}).get(
+                        "report_sha256"
+                    ),
+                }
+                for item in (
+                    review.get("criteria_coverage", {}).get("items", [])
+                    if isinstance(review, dict)
+                    and isinstance(review.get("criteria_coverage"), dict)
+                    else []
+                )
+                if isinstance(item, dict)
+            ]
+            for name, review in parsed_reviews.items()
+        }
+        assurance_document = new_assurance_document(
+            run_id=str(metadata["run_id"]),
+            workflow_id=str(metadata["workflow_id"]),
+            repository_id=str(metadata["repository"]["id"]),
+            source_fingerprint=str(metadata.get("source_fingerprint") or ""),
+            contract=assurance_contract,
+            reviewer_coverage=reviewer_coverage,
+            created_at=utc_now(),
+        )
+        if assurance_path.exists():
+            previous_assurance = read_json(assurance_path)
+            if (
+                previous_assurance.get("contract_sha256")
+                == assurance_document["contract_sha256"]
+                and previous_assurance.get("source_fingerprint")
+                == assurance_document["source_fingerprint"]
+            ):
+                assurance_document["claims"] = previous_assurance.get(
+                    "claims", assurance_document["claims"]
+                )
+                assurance_document["created_at"] = previous_assurance.get(
+                    "created_at", assurance_document["created_at"]
+                )
+        assurance_document["reviewer_coverage"] = reviewer_coverage
+        assurance_document["updated_at"] = utc_now()
+        assurance_evaluation = evaluate_assurance(
+            assurance_document,
+            contract=assurance_contract,
+            source_fingerprint=str(metadata.get("source_fingerprint") or ""),
+        )
+        safe_write_json(assurance_path, assurance_document)
+        safe_write(
+            run_dir / "assurance.md",
+            render_assurance_summary(assurance_document, assurance_evaluation),
+        )
     completed_at = dt.datetime.now(dt.timezone.utc)
     started_at = dt.datetime.fromisoformat(
         str(metadata.get("started_at") or metadata["created_at"])
@@ -10463,6 +10834,11 @@ def resume_review_locked(
             risks=[str(item) for item in metadata.get("risks", [])],
             review_profile=str(metadata.get("review_profile") or "normal"),
             phase=str(metadata.get("phase") or "repair"),
+            assurance_claims=(
+                validate_assurance_contract(metadata["assurance_contract"])
+                if isinstance(metadata.get("assurance_contract"), dict)
+                else ()
+            ),
         )
         safe_write(run_dir / "prompt.md", prompt)
         metadata["prompt_template_sha256"] = sha256_text(prompt)
@@ -10478,6 +10854,11 @@ def resume_review_locked(
             risks=[str(item) for item in metadata.get("risks", [])],
             review_profile=str(metadata.get("review_profile") or "normal"),
             phase=str(metadata.get("phase") or "repair"),
+            assurance_claims=(
+                validate_assurance_contract(metadata["assurance_contract"])
+                if isinstance(metadata.get("assurance_contract"), dict)
+                else ()
+            ),
         )
         record_reviewer_prompt_hashes(metadata, reviewer_inputs)
         safe_write_json(run_dir / "metadata.json", metadata)
@@ -10710,6 +11091,7 @@ def run_review_command(args: argparse.Namespace) -> int:
         else None
     )
     reused_scope: Scope | None = None
+    reused_assurance_contract: dict[str, Any] | None = None
     if args.reuse_contract:
         if not args.workflow_id:
             raise ReviewError("--reuse-contract requires --workflow-id.")
@@ -10719,10 +11101,12 @@ def run_review_command(args: argparse.Namespace) -> int:
             or args.task is not None
             or args.review_profile != "normal"
             or args.exclude_snapshot_path
+            or args.criterion
+            or args.critical_invariant
         ):
             raise ReviewError(
                 "--reuse-contract cannot be combined with path, risk, profile, "
-                "or task overrides."
+                "task, or assurance-claim overrides."
             )
         pinned = baseline_review_contract(
             selected_workflow,
@@ -10757,10 +11141,27 @@ def run_review_command(args: argparse.Namespace) -> int:
         args.risk = list(pinned.get("risks") or [])
         args.review_profile = str(pinned.get("review_profile") or "normal")
         args.task = pinned.get("task")
+        pinned_assurance = pinned.get("assurance_contract")
+        reused_assurance_contract = (
+            pinned_assurance if isinstance(pinned_assurance, dict) else None
+        )
         args.exclude_snapshot_path = list(
             pinned.get("snapshot_exclusion_paths") or []
         )
 
+    try:
+        assurance_contract = (
+            reused_assurance_contract
+            if args.reuse_contract
+            else build_assurance_contract(args.criterion, args.critical_invariant)
+        )
+    except AssuranceError as exc:
+        raise ReviewError(str(exc)) from exc
+    assurance_claims = (
+        validate_assurance_contract(assurance_contract)
+        if isinstance(assurance_contract, dict)
+        else []
+    )
     path_filters = normalize_path_filters(repo, args.path)
     scope = reused_scope or resolve_scope(args, repo, path_filters)
     paths = changed_paths(repo, scope, path_filters)
@@ -10828,6 +11229,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             "risks": sorted(set(args.risk)),
             "review_profile": args.review_profile,
             "task": args.task,
+            "assurance_contract": assurance_contract,
             "supplemental_of": (
                 str(supplemental_parent[0]) if supplemental_parent else None
             ),
@@ -10883,6 +11285,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             risks=args.risk,
             review_profile=args.review_profile,
             task=args.task,
+            assurance_contract=assurance_contract,
             snapshot_exclusion_paths=[
                 str(item["path"]) for item in snapshot_exclusions
             ],
@@ -11120,6 +11523,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             risks=args.risk,
             review_profile=args.review_profile,
             phase=args.phase,
+            assurance_claims=assurance_claims,
         )
         safe_write(prompt_path, prompt)
         metadata.update(
@@ -11220,6 +11624,7 @@ def run_review_command(args: argparse.Namespace) -> int:
             risks=args.risk,
             review_profile=args.review_profile,
             phase=args.phase,
+            assurance_claims=assurance_claims,
         )
         record_reviewer_prompt_hashes(metadata, reviewer_inputs)
         safe_write_json(run_dir / "metadata.json", metadata)
@@ -11717,6 +12122,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--task", help="Original intent and acceptance criteria for the change"
     )
     run_parser.add_argument(
+        "--criterion",
+        action="append",
+        default=[],
+        help="Pin a non-critical acceptance criterion as stable ID=exact text",
+    )
+    run_parser.add_argument(
+        "--critical-invariant",
+        action="append",
+        default=[],
+        help="Pin a gate-blocking critical invariant as stable ID=exact text",
+    )
+    run_parser.add_argument(
         "--supplemental-of",
         help=(
             "Run one fresh targeted review of an unchanged finalized snapshot; "
@@ -11924,6 +12341,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--input", help="Path to a JSON array of decision objects"
     )
 
+    assure = subparsers.add_parser(
+        "assure",
+        help="Attach fingerprint-bound Codex evidence to one pinned claim",
+    )
+    assure.add_argument("--run", required=True, help="Completed review run directory")
+    assure.add_argument("--claim", required=True, help="Pinned claim ID")
+    assure.add_argument(
+        "--status",
+        required=True,
+        choices=("verified", "deferred", "unverified"),
+    )
+    assure.add_argument(
+        "--evidence-kind",
+        required=True,
+        choices=("repository", "test", "artifact", "runtime"),
+    )
+    assure.add_argument("--evidence", required=True)
+    assure.add_argument("--rationale")
+
     finalize = subparsers.add_parser(
         "finalize", help="Finalize a fresh run after Codex review and verification"
     )
@@ -12087,6 +12523,8 @@ def main() -> int:
             return decide_command(args)
         if args.command == "decide-batch":
             return decide_batch_command(args)
+        if args.command == "assure":
+            return assure_command(args)
         if args.command == "finalize":
             if len(args.codex_review) > MAX_NOTE_CHARS:
                 raise ReviewError(
@@ -12107,6 +12545,8 @@ def main() -> int:
             if args.supplemental_of and (
                 args.path
                 or args.risk
+                or args.criterion
+                or args.critical_invariant
                 or args.review_profile != "normal"
                 or args.uncommitted
                 or args.base
@@ -12114,7 +12554,7 @@ def main() -> int:
             ):
                 raise ReviewError(
                     "--supplemental-of reuses the finalized source contract; do not "
-                    "override scope, paths, risks, or review profile."
+                    "override scope, paths, risks, claims, or review profile."
                 )
             if args.with_claude and args.without_claude:
                 raise ReviewError("Choose only one of --with-claude/--without-claude.")
@@ -12142,6 +12582,13 @@ def main() -> int:
             if args.task and len(args.task) > MAX_TASK_CHARS:
                 raise ReviewError(
                     f"--task must be at most {MAX_TASK_CHARS} characters."
+                )
+            if any(
+                len(value) > MAX_TASK_CHARS
+                for value in [*args.criterion, *args.critical_invariant]
+            ):
+                raise ReviewError(
+                    f"Each assurance claim must be at most {MAX_TASK_CHARS} characters."
                 )
             return run_review_command(args)
         parser.error(f"Unknown command: {args.command}")

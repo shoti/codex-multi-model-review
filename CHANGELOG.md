@@ -7,6 +7,12 @@ All notable user-visible changes are documented here. This project follows
 
 ### Fixed
 
+- Open evidence-memory search and status queries through a true read-only
+  SQLite connection, avoiding schema and permission writes for logical reads.
+- Decode malformed output bytes from non-Codex reviewer processes with
+  replacement handling so an attempt returns auditable diagnostics instead of
+  escaping as an uncaught `UnicodeDecodeError`.
+
 - Support repositories whose `HEAD` has an empty tree but whose review scope
   contains untracked implementation files, instead of failing while opening
   Git's header-only archive.
@@ -50,6 +56,12 @@ All notable user-visible changes are documented here. This project follows
   not buried in successful command diagnostics.
 
 ### Added
+
+- Add a Claim-to-Evidence Assurance Matrix with stable acceptance-criterion and
+  critical-invariant IDs, criterion-level reviewer coverage, atomic Codex-owned
+  evidence decisions, source-fingerprint binding, conservative finalization,
+  machine and human artifacts, successor-enforced contract drift, and honest
+  legacy classification.
 
 - Add an opt-in Codex reviewer adapter that runs an ephemeral, globally
   user-config-isolated, approval-free, schema-constrained `codex exec` session
