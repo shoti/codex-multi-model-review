@@ -145,22 +145,34 @@ CLAUDE_REVIEW_SCHEMA: dict[str, Any] = {
 }
 
 
+def render_field(value: Any) -> str:
+    """Render one provider field value so its content cannot become structure.
+
+    Every anchor this module parses is line-start anchored, so indenting
+    continuation lines keeps provider prose such as a quoted diff, quoted
+    Markdown, or a pasted section of this contract out of the report's own
+    heading and bullet grammar.
+    """
+    return str(value).replace("\n", "\n  ")
+
+
 def render_structured_review(payload: dict[str, Any]) -> str:
     """Render a schema-validated provider result into the audit Markdown format."""
-    lines = ["# Verdict", str(payload["verdict"]), "", "# Findings"]
+    lines = ["# Verdict", render_field(payload["verdict"]), "", "# Findings"]
     findings = payload.get("findings") or []
     if not findings:
         lines.append("None.")
     for item in findings:
         lines.extend(
             [
-                f"## [{item['severity']}] {item['title']}",
-                f"- Location: {item.get('location') or 'Not specified'}",
-                f"- Trigger: {item['trigger']}",
-                f"- Evidence: {item['evidence']}",
-                f"- Impact: {item['impact']}",
-                f"- Smallest fix: {item['smallest_fix']}",
-                f"- Confidence: {item['confidence']}",
+                f"## [{render_field(item['severity'])}] "
+                f"{render_field(item['title'])}",
+                f"- Location: {render_field(item.get('location') or 'Not specified')}",
+                f"- Trigger: {render_field(item['trigger'])}",
+                f"- Evidence: {render_field(item['evidence'])}",
+                f"- Impact: {render_field(item['impact'])}",
+                f"- Smallest fix: {render_field(item['smallest_fix'])}",
+                f"- Confidence: {render_field(item['confidence'])}",
                 "",
             ]
         )
@@ -171,9 +183,10 @@ def render_structured_review(payload: dict[str, Any]) -> str:
     for item in gaps:
         lines.extend(
             [
-                f"## [{item['severity']}] {item['title']}",
-                f"- Needed test: {item['needed_test']}",
-                f"- Risk: {item['risk']}",
+                f"## [{render_field(item['severity'])}] "
+                f"{render_field(item['title'])}",
+                f"- Needed test: {render_field(item['needed_test'])}",
+                f"- Risk: {render_field(item['risk'])}",
                 "",
             ]
         )
@@ -184,10 +197,11 @@ def render_structured_review(payload: dict[str, Any]) -> str:
     for item in observations:
         lines.extend(
             [
-                f"## [low] {item['title']}",
-                f"- Location: {item.get('location') or 'Not specified'}",
-                f"- Evidence: {item['evidence']}",
-                f"- Why non-actionable: {item['why_non_actionable']}",
+                f"## [low] {render_field(item['title'])}",
+                f"- Location: {render_field(item.get('location') or 'Not specified')}",
+                f"- Evidence: {render_field(item['evidence'])}",
+                "- Why non-actionable: "
+                f"{render_field(item['why_non_actionable'])}",
                 "",
             ]
         )
@@ -216,8 +230,55 @@ def render_structured_review(payload: dict[str, Any]) -> str:
     if not notes:
         lines.append("None.")
     else:
-        lines.extend(f"- {note}" for note in notes)
-    return "\n".join(lines).rstrip() + "\n"
+        lines.extend(f"- {render_field(note)}" for note in notes)
+    report = "\n".join(lines).rstrip() + "\n"
+    if not structured_render_is_faithful(payload, report):
+        raise ValueError(
+            "structured review payload does not round-trip into the audit "
+            "report format"
+        )
+    return report
+
+
+def structured_render_is_faithful(payload: dict[str, Any], report: str) -> bool:
+    """Confirm the rendered report reproduces the payload's own item structure.
+
+    Field content must never add, remove, or reclassify an item or change the
+    declared coverage. Callers treat a failure as a malformed provider
+    response, so the attempt fails closed instead of gating on a report whose
+    structure does not match what the provider actually returned.
+    """
+    parsed = parse_review_report("render-check", report)
+    observations = payload.get("observations") or []
+    expected_severities = sorted(
+        [
+            str(item.get("severity"))
+            for item in (payload.get("findings") or [])
+        ]
+        + ["low"] * len(observations)
+    )
+    # Observation promotion moves items between the two sections, so compare
+    # the combined multiset rather than each section in isolation.
+    actual_severities = sorted(
+        str(item.get("severity"))
+        for item in [*parsed["findings"], *parsed["observations"]]
+    )
+    if expected_severities != actual_severities:
+        return False
+    if len(parsed["test_gaps"]) != len(payload.get("test_gaps") or []):
+        return False
+    coverage = payload.get("coverage") or {}
+    parsed_coverage = parsed["coverage"]
+
+    def declared(key: str) -> list[str]:
+        return [str(item).strip() for item in (coverage.get(key) or [])]
+
+    return (
+        parsed_coverage.get("complete") is bool(coverage.get("complete"))
+        and parsed_coverage.get("unreviewed_changed_paths")
+        == declared("unreviewed_changed_paths")
+        and parsed_coverage.get("limitations") == declared("limitations")
+    )
 
 
 SEVERITIES = ("blocker", "high", "medium", "low")

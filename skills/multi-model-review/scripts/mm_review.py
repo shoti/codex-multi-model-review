@@ -1002,6 +1002,16 @@ def normalize_path_filters(repo: Path, requested: Sequence[str]) -> tuple[str, .
             raise ReviewError(
                 f"--path must be a safe repository-relative path: {raw_path}"
             )
+        # Git pathspec magic and glob metacharacters make Git resolve a
+        # different set than matches_path_filters, which silently empties the
+        # reviewed path list while the rendered patch stays populated.
+        if raw_path.startswith(":") or any(
+            character in raw_path for character in "*?[]\\"
+        ):
+            raise ReviewError(
+                "--path must be a literal directory or file path without glob "
+                f"patterns or Git pathspec magic: {raw_path}"
+            )
         value = candidate.as_posix().strip("/")
         if value in {"", "."}:
             continue
@@ -1122,7 +1132,9 @@ def matches_path_filters(path: str, path_filters: Sequence[str]) -> bool:
 
 
 def git_pathspec(path_filters: Sequence[str]) -> list[str]:
-    return ["--", *(path_filters or ())]
+    # Force literal, repository-root-relative matching so Git resolves exactly
+    # the paths matches_path_filters accepts.
+    return ["--", *(f":(literal,top){item}" for item in (path_filters or ()))]
 
 
 def changed_paths(
@@ -1247,6 +1259,21 @@ def excluded_changed_paths(
         return []
     included = set(changed_paths(repo, scope, path_filters))
     return sorted(set(changed_paths(repo, scope)) - included)
+
+
+def require_reviewable_change(
+    scope: Scope, paths: Sequence[str], patch: str
+) -> None:
+    """Reject a scope whose rendered patch and resolved path list disagree."""
+    if not paths and not patch.strip():
+        raise ReviewError(f"No changes found for {scope.label}.")
+    if not paths:
+        raise ReviewError(
+            f"The patch for {scope.label} is not empty but no changed path "
+            "resolved from the task filters, so the private snapshot would "
+            "omit the reviewed content and the source fingerprint would not "
+            "cover it. Use literal directory or file paths in --path."
+        )
 
 
 def render_patch(
@@ -1827,6 +1854,23 @@ def create_snapshot(
                 )
                 with tarfile.open(archive_path) as archive:
                     archive.extractall(snapshot_dir, filter="data")
+            except tarfile.FilterError as exc:
+                # A tracked entry that escapes the snapshot root aborts the
+                # extraction, so it never reaches the post-snapshot containment
+                # guard. Report the same actionable contract instead of an
+                # opaque internal runner failure.
+                tarinfo = getattr(exc, "tarinfo", None)
+                entry = getattr(tarinfo, "name", None) or "unknown path"
+                link = getattr(tarinfo, "linkname", "") or ""
+                detail = f"{entry} -> {link}" if link else entry
+                raise ReviewError(
+                    "Review blocked because a tracked repository entry escapes "
+                    "the private snapshot:\n"
+                    f"- unsafe snapshot entry: {detail}\n"
+                    "This cannot be overridden. Remove the entry from the "
+                    "reviewed revision or replace it with safe in-repository "
+                    "content."
+                ) from exc
             finally:
                 archive_path.unlink(missing_ok=True)
 
@@ -2738,9 +2782,16 @@ def isolated_codex_home(*, workspace_roots: Sequence[Path]) -> Any:
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                 0o600,
             )
+            # os.fdopen takes ownership of each descriptor. Release the raw
+            # numbers before wrapping them so the cleanup below can never close
+            # a descriptor the file objects already closed; reviewers run
+            # concurrently, so that number may belong to another thread.
+            source_raw, target_raw = source_descriptor, target_descriptor
+            source_descriptor = None
+            target_descriptor = None
             with (
-                os.fdopen(source_descriptor, "rb") as source,
-                os.fdopen(target_descriptor, "wb") as target,
+                os.fdopen(source_raw, "rb") as source,
+                os.fdopen(target_raw, "wb") as target,
             ):
                 shutil.copyfileobj(source, target)
         except OSError as exc:
@@ -3556,7 +3607,11 @@ def git_changed_paths_between(
         ],
         cwd=repo,
     ).stdout
-    return sorted(path for path in output.split("\0") if path)
+    return sorted(
+        path
+        for path in output.split("\0")
+        if path and matches_path_filters(path, path_filters)
+    )
 
 
 def freshness_status(
@@ -9927,8 +9982,7 @@ def sensitive_scan_command(args: argparse.Namespace) -> int:
         path_filters=path_filters,
     )
     patch = render_patch(repo, scope, path_filters)
-    if not paths and not patch.strip():
-        raise ReviewError(f"No changes found for {scope.label}.")
+    require_reviewable_change(scope, paths, patch)
     repository = repository_metadata(repo)
     source_fingerprint = fingerprint(repo, scope, paths, path_filters)
     overlay_paths = snapshot_overlay_paths(repo, scope, paths, path_filters)
@@ -11215,8 +11269,7 @@ def run_review_command(args: argparse.Namespace) -> int:
     )
     overlay_paths = snapshot_overlay_paths(repo, scope, paths, path_filters)
     patch = render_patch(repo, scope, path_filters)
-    if not paths and not patch.strip():
-        raise ReviewError(f"No changes found for {scope.label}.")
+    require_reviewable_change(scope, paths, patch)
     excluded_paths = excluded_changed_paths(repo, scope, path_filters)
     if excluded_paths:
         print(
@@ -11508,6 +11561,12 @@ def run_review_command(args: argparse.Namespace) -> int:
         metadata["lineage_sensitive_approval_sources"] = lineage_approval_sources
         metadata["review_snapshot_file_count"] = len(review_paths)
         metadata["review_snapshot_fingerprint"] = review_snapshot_fingerprint
+        metadata["blocked_sensitive_paths"] = blocked_paths
+        metadata["external_snapshot_symlinks"] = external_symlinks
+        # Persist the preflight evidence before any fail-closed block below.
+        # update_terminal_error re-reads this file from disk, so an
+        # in-memory-only record is lost on a preflight_blocked run.
+        safe_write_json(run_dir / "metadata.json", metadata)
         if blocked_paths:
             details = [f"- path: {path}" for path in blocked_paths]
             raise ReviewError(
