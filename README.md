@@ -381,8 +381,24 @@ python3 "$RUNNER" assure \
   --claim SESSION-1 \
   --status verified \
   --evidence-kind test \
-  --evidence "tests/session/test_expiry.py::test_expired_session passes"
+    --evidence "tests/session/test_expiry.py::test_expired_session passes"
 ```
+
+When several claim decisions are already known, record them as one atomic
+batch so a validation failure cannot leave a partially completed assurance
+set:
+
+```bash
+python3 "$RUNNER" assure-batch \
+  --run <run-directory> \
+  --item '{"claim":"SESSION-1","status":"verified","evidence_kind":"test","evidence":"tests/session/test_expiry.py::test_expired_session passes"}' \
+  --item '{"claim":"SESSION-2","status":"verified","evidence_kind":"repository","evidence":"src/session/guard.py retains valid-session authorization"}'
+```
+
+Each `--item` uses the same `claim`, `status`, `evidence_kind`, `evidence`, and
+optional `rationale` fields as `assure`. Duplicate claim IDs are rejected. The
+runner acquires the assurance lock once, validates the complete batch, and
+writes `assurance.json` and `assurance.md` only after every item succeeds.
 
 Claims use stable `ID=TEXT` values and are part of the pinned review contract.
 Adding, changing, or dropping one after a completed review requires an explicit
@@ -564,7 +580,7 @@ evidence for future retrieval tuning without influencing reviewers.
 | `run` | Execute a repair, confirmation, or exact-content supplemental round |
 | `resume` | Retry only failed reviewers from an unchanged partial run |
 | `decide` / `decide-batch` | Persist evidence-backed triage and optional memory-candidate assessments |
-| `assure` | Attach fingerprint-bound Codex evidence to one pinned acceptance criterion or critical invariant |
+| `assure` / `assure-batch` | Attach fingerprint-bound Codex evidence to one pinned claim or atomically to several claims |
 | `finalize` | Produce a final gate, requiring Codex evidence for incomplete confirmation coverage |
 | `verify` | Confirm that the gate still matches current source |
 | `attest-commit` | Bind unchanged reviewed content or a clean reviewed `--base` branch to the checked-out commit |

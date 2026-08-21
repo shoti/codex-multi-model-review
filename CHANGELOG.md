@@ -57,6 +57,10 @@ All notable user-visible changes are documented here. This project follows
 
 ### Added
 
+- Add `assure-batch` to record multiple Claim-to-Evidence Assurance decisions
+  under one artifact lock. The command validates and applies the complete batch
+  in memory before writing, rejects duplicate claim IDs, and leaves both
+  assurance artifacts unchanged when any item fails.
 - Add a Claim-to-Evidence Assurance Matrix with stable acceptance-criterion and
   critical-invariant IDs, criterion-level reviewer coverage, atomic Codex-owned
   evidence decisions, source-fingerprint binding, conservative finalization,

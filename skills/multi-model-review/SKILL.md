@@ -178,6 +178,16 @@ mm-review assure --run <run-dir> --claim RESULT-1 \
   --evidence "tests/feature_test.py::test_result passes"
 ```
 
+When multiple claim decisions are known, prefer one atomic batch. Each item
+uses the same fields and validation rules as `assure`; one invalid item leaves
+both assurance artifacts unchanged:
+
+```bash
+mm-review assure-batch --run <run-dir> \
+  --item '{"claim":"RESULT-1","status":"verified","evidence_kind":"test","evidence":"tests/feature_test.py::test_result passes"}' \
+  --item '{"claim":"RESULT-2","status":"deferred","evidence_kind":"artifact","evidence":"artifact.json records the gap","rationale":"Deferred intentionally"}'
+```
+
 Claim IDs and exact text are pinned with the rest of the review contract.
 Adding, changing, or dropping one requires an explicit linked successor;
 `--reuse-contract` preserves them across repair, confirmation, and successor

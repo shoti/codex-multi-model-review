@@ -37,9 +37,10 @@ from assurance import (
     build_contract as build_assurance_contract,
     evaluate as evaluate_assurance,
     new_document as new_assurance_document,
-    record as record_assurance,
+    record_batch as record_assurance_batch,
     render_summary as render_assurance_summary,
     validate_contract as validate_assurance_contract,
+    validate_decisions as validate_assurance_decisions,
 )
 from review_contract import (
     CLAUDE_REVIEW_SCHEMA,
@@ -9001,9 +9002,14 @@ def assurance_text_is_sensitive(value: str) -> bool:
     )
 
 
-def assure_command(args: argparse.Namespace) -> int:
-    """Record one Codex-owned, source-bound claim decision atomically."""
-    run_dir = resolve_run_dir(args.run)
+def write_assurance_decisions(
+    run_dir: Path, decisions: Sequence[dict[str, Any]]
+) -> tuple[Path, dict[str, Any]]:
+    """Validate and persist one complete assurance transaction."""
+    try:
+        normalized = validate_assurance_decisions(decisions)
+    except AssuranceError as exc:
+        raise ReviewError(str(exc)) from exc
     metadata = read_json(run_dir / "metadata.json")
     if metadata.get("status") != "completed":
         raise ReviewError("Assurance evidence requires a completed review run.")
@@ -9021,19 +9027,20 @@ def assure_command(args: argparse.Namespace) -> int:
     claims = validate_assurance_contract(contract)
     if not claims:
         raise ReviewError("This run has no explicit assurance claims.")
-    for label, value in (
-        ("evidence", args.evidence),
-        ("rationale", args.rationale or ""),
-    ):
-        if len(value) > MAX_NOTE_CHARS:
-            raise ReviewError(
-                f"--{label} must be at most {MAX_NOTE_CHARS} characters."
-            )
-        if assurance_text_is_sensitive(value):
-            raise ReviewError(
-                f"--{label} resembles a credential or secret. Record only a "
-                "safe locator, digest, command result, or redacted summary."
-            )
+    for item in normalized:
+        for label, value in (
+            ("evidence", item["evidence"]),
+            ("rationale", item["rationale"] or ""),
+        ):
+            if len(value) > MAX_NOTE_CHARS:
+                raise ReviewError(
+                    f"--{label} must be at most {MAX_NOTE_CHARS} characters."
+                )
+            if assurance_text_is_sensitive(value):
+                raise ReviewError(
+                    f"--{label} resembles a credential or secret. Record only a "
+                    "safe locator, digest, command result, or redacted summary."
+                )
     reviewed = str(metadata.get("source_fingerprint") or "")
     freshness = freshness_status(run_dir, metadata, reviewed)
     if not freshness["fresh"]:
@@ -9047,31 +9054,66 @@ def assure_command(args: argparse.Namespace) -> int:
             raise ReviewError("Completed claim-aware run has no assurance.json.")
         document = read_json(assurance_path)
         try:
-            record_assurance(
+            candidate = record_assurance_batch(
                 document,
-                claim_id=args.claim,
-                status=args.status,
-                evidence_kind=args.evidence_kind,
-                evidence=args.evidence,
-                rationale=args.rationale,
+                decisions=normalized,
                 source_fingerprint=reviewed,
                 recorded_at=utc_now(),
             )
             evaluation = evaluate_assurance(
-                document,
+                candidate,
                 contract=contract,
                 source_fingerprint=reviewed,
             )
         except AssuranceError as exc:
             raise ReviewError(str(exc)) from exc
-        safe_write_json(assurance_path, document)
+        safe_write_json(assurance_path, candidate)
         safe_write(
             run_dir / "assurance.md",
-            render_assurance_summary(document, evaluation),
+            render_assurance_summary(candidate, evaluation),
         )
+    return assurance_path, evaluation
+
+
+def assure_command(args: argparse.Namespace) -> int:
+    """Record one Codex-owned, source-bound claim decision atomically."""
+    run_dir = resolve_run_dir(args.run)
+    assurance_path, evaluation = write_assurance_decisions(
+        run_dir,
+        [
+            {
+                "claim": args.claim,
+                "status": args.status,
+                "evidence_kind": args.evidence_kind,
+                "evidence": args.evidence,
+                "rationale": args.rationale,
+            }
+        ],
+    )
     print(
         f"{args.claim}: {args.status}; assurance={assurance_path}; "
         f"gate={evaluation['status']}"
+    )
+    return 0
+
+
+def assure_batch_command(args: argparse.Namespace) -> int:
+    """Record multiple Codex-owned claim decisions as one transaction."""
+    raw_items: list[Any] = []
+    for raw in args.item:
+        try:
+            raw_items.append(json.loads(raw))
+        except json.JSONDecodeError as exc:
+            raise ReviewError(f"Invalid --item JSON: {exc}") from exc
+    try:
+        decisions = validate_assurance_decisions(raw_items)
+    except AssuranceError as exc:
+        raise ReviewError(str(exc)) from exc
+    run_dir = resolve_run_dir(args.run)
+    assurance_path, evaluation = write_assurance_decisions(run_dir, decisions)
+    print(
+        f"Recorded {len(decisions)} assurance decisions; "
+        f"assurance={assurance_path}; gate={evaluation['status']}"
     )
     return 0
 
@@ -12360,6 +12402,23 @@ def build_parser() -> argparse.ArgumentParser:
     assure.add_argument("--evidence", required=True)
     assure.add_argument("--rationale")
 
+    assure_batch = subparsers.add_parser(
+        "assure-batch",
+        help="Atomically attach fingerprint-bound Codex evidence to pinned claims",
+    )
+    assure_batch.add_argument(
+        "--run", required=True, help="Completed review run directory"
+    )
+    assure_batch.add_argument(
+        "--item",
+        action="append",
+        required=True,
+        help=(
+            "JSON assurance object with claim, status, evidence_kind, evidence, "
+            "and optional rationale; repeat as needed"
+        ),
+    )
+
     finalize = subparsers.add_parser(
         "finalize", help="Finalize a fresh run after Codex review and verification"
     )
@@ -12525,6 +12584,8 @@ def main() -> int:
             return decide_batch_command(args)
         if args.command == "assure":
             return assure_command(args)
+        if args.command == "assure-batch":
+            return assure_batch_command(args)
         if args.command == "finalize":
             if len(args.codex_review) > MAX_NOTE_CHARS:
                 raise ReviewError(
