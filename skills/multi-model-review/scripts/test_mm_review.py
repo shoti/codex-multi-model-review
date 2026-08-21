@@ -59,6 +59,41 @@ def initialize_repo(root: Path) -> None:
     run(["git", "commit", "-qm", "initial"], cwd=root)
 
 
+def initialize_assurance_artifacts(
+    run_dir: Path,
+    *,
+    criteria: list[str],
+    critical_invariants: list[str] | None = None,
+) -> dict[str, object]:
+    contract = AM.build_contract(criteria, critical_invariants or [])
+    metadata: dict[str, object] = {
+        "status": "completed",
+        "run_id": "run-one",
+        "workflow_id": "wf-one",
+        "repository": {"id": "repo-one"},
+        "source_fingerprint": "source-one",
+        "assurance_contract": contract,
+    }
+    document = AM.new_document(
+        run_id="run-one",
+        workflow_id="wf-one",
+        repository_id="repo-one",
+        source_fingerprint="source-one",
+        contract=contract,
+        reviewer_coverage={},
+        created_at=MM.utc_now(),
+    )
+    evaluation = AM.evaluate(
+        document, contract=contract, source_fingerprint="source-one"
+    )
+    MM.safe_write_json(run_dir / "metadata.json", metadata)
+    MM.safe_write_json(run_dir / "assurance.json", document)
+    MM.safe_write(
+        run_dir / "assurance.md", AM.render_summary(document, evaluation)
+    )
+    return metadata
+
+
 def structured_report(
     *,
     verdict: str = "PASS_CLEAN",
@@ -750,6 +785,486 @@ class RunnerUnitTests(unittest.TestCase):
                 {claim["id"]: claim["status"] for claim in saved["claims"]},
                 {"C1": "verified", "C2": "verified"},
             )
+
+    def test_assure_batch_persists_two_valid_claims_and_reports_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            initialize_assurance_artifacts(
+                run_dir, criteria=["C1=One", "C2=Two"]
+            )
+            args = argparse.Namespace(
+                run=str(run_dir),
+                item=[
+                    json.dumps(
+                        {
+                            "claim": claim,
+                            "status": "verified",
+                            "evidence_kind": "test",
+                            "evidence": f"test_{claim.lower()} passes",
+                        }
+                    )
+                    for claim in ("C1", "C2")
+                ],
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM, "freshness_status", return_value={"fresh": True}
+                ),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(MM.assure_batch_command(args), 0)
+            saved = MM.read_json(run_dir / "assurance.json")
+            self.assertEqual(
+                {claim["id"]: claim["status"] for claim in saved["claims"]},
+                {"C1": "verified", "C2": "verified"},
+            )
+            self.assertIn("Recorded 2 assurance decisions", output.getvalue())
+            self.assertIn("gate=PASS_CLEAN", output.getvalue())
+            self.assertIn("Status: PASS_CLEAN", (run_dir / "assurance.md").read_text())
+
+    def test_assure_batch_invalid_second_item_leaves_artifacts_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            initialize_assurance_artifacts(
+                run_dir, criteria=["C1=One", "C2=Two"]
+            )
+            before = tuple(
+                (run_dir / name).read_bytes()
+                for name in ("assurance.json", "assurance.md")
+            )
+            args = argparse.Namespace(
+                run=str(run_dir),
+                item=[
+                    json.dumps(
+                        {
+                            "claim": "C1",
+                            "status": "verified",
+                            "evidence_kind": "test",
+                            "evidence": "test_c1 passes",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "claim": "C2",
+                            "status": "invalid",
+                            "evidence_kind": "test",
+                            "evidence": "test_c2 passes",
+                        }
+                    ),
+                ],
+            )
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM, "freshness_status", return_value={"fresh": True}
+                ),
+                self.assertRaisesRegex(MM.ReviewError, "Invalid assurance status"),
+            ):
+                MM.assure_batch_command(args)
+            self.assertEqual(
+                before,
+                tuple(
+                    (run_dir / name).read_bytes()
+                    for name in ("assurance.json", "assurance.md")
+                ),
+            )
+
+    def test_assure_batch_duplicate_claims_fail_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            initialize_assurance_artifacts(run_dir, criteria=["C1=One"])
+            before = tuple(
+                (run_dir / name).read_bytes()
+                for name in ("assurance.json", "assurance.md")
+            )
+            item = json.dumps(
+                {
+                    "claim": "C1",
+                    "status": "verified",
+                    "evidence_kind": "test",
+                    "evidence": "test_c1 passes",
+                }
+            )
+            with self.assertRaisesRegex(MM.ReviewError, "Duplicate assurance claim"):
+                MM.assure_batch_command(
+                    argparse.Namespace(run=str(run_dir), item=[item, item])
+                )
+            self.assertEqual(
+                before,
+                tuple(
+                    (run_dir / name).read_bytes()
+                    for name in ("assurance.json", "assurance.md")
+                ),
+            )
+
+    def test_assure_batch_critical_deferral_rolls_back_complete_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            initialize_assurance_artifacts(
+                run_dir,
+                criteria=["C1=One"],
+                critical_invariants=["I1=Fail closed"],
+            )
+            before = tuple(
+                (run_dir / name).read_bytes()
+                for name in ("assurance.json", "assurance.md")
+            )
+            args = argparse.Namespace(
+                run=str(run_dir),
+                item=[
+                    json.dumps(
+                        {
+                            "claim": "C1",
+                            "status": "verified",
+                            "evidence_kind": "test",
+                            "evidence": "test_c1 passes",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "claim": "I1",
+                            "status": "deferred",
+                            "evidence_kind": "artifact",
+                            "evidence": "artifact.json records the gap",
+                            "rationale": "Deferred intentionally",
+                        }
+                    ),
+                ],
+            )
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM, "freshness_status", return_value={"fresh": True}
+                ),
+                self.assertRaisesRegex(MM.ReviewError, "cannot be deferred"),
+            ):
+                MM.assure_batch_command(args)
+            self.assertEqual(
+                before,
+                tuple(
+                    (run_dir / name).read_bytes()
+                    for name in ("assurance.json", "assurance.md")
+                ),
+            )
+
+    def test_assure_batch_secret_like_evidence_rolls_back_complete_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            initialize_assurance_artifacts(
+                run_dir, criteria=["C1=One", "C2=Two"]
+            )
+            before = tuple(
+                (run_dir / name).read_bytes()
+                for name in ("assurance.json", "assurance.md")
+            )
+            args = argparse.Namespace(
+                run=str(run_dir),
+                item=[
+                    json.dumps(
+                        {
+                            "claim": "C1",
+                            "status": "verified",
+                            "evidence_kind": "test",
+                            "evidence": "test_c1 passes",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "claim": "C2",
+                            "status": "verified",
+                            "evidence_kind": "artifact",
+                            "evidence": "api_key='synthetic-sensitive-value-1234567890'",
+                        }
+                    ),
+                ],
+            )
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                self.assertRaisesRegex(MM.ReviewError, "resembles a credential"),
+            ):
+                MM.assure_batch_command(args)
+            self.assertEqual(
+                before,
+                tuple(
+                    (run_dir / name).read_bytes()
+                    for name in ("assurance.json", "assurance.md")
+                ),
+            )
+
+    def test_assure_batch_overlong_evidence_rolls_back_complete_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            initialize_assurance_artifacts(
+                run_dir, criteria=["C1=One", "C2=Two"]
+            )
+            before = tuple(
+                (run_dir / name).read_bytes()
+                for name in ("assurance.json", "assurance.md")
+            )
+            args = argparse.Namespace(
+                run=str(run_dir),
+                item=[
+                    json.dumps(
+                        {
+                            "claim": "C1",
+                            "status": "verified",
+                            "evidence_kind": "test",
+                            "evidence": "test_c1 passes",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "claim": "C2",
+                            "status": "verified",
+                            "evidence_kind": "artifact",
+                            "evidence": "x" * (MM.MAX_NOTE_CHARS + 1),
+                        }
+                    ),
+                ],
+            )
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                self.assertRaisesRegex(MM.ReviewError, "must be at most"),
+            ):
+                MM.assure_batch_command(args)
+            self.assertEqual(
+                before,
+                tuple(
+                    (run_dir / name).read_bytes()
+                    for name in ("assurance.json", "assurance.md")
+                ),
+            )
+
+    def test_assure_batch_unknown_claim_and_malformed_json_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            initialize_assurance_artifacts(run_dir, criteria=["C1=One"])
+            before = tuple(
+                (run_dir / name).read_bytes()
+                for name in ("assurance.json", "assurance.md")
+            )
+            unknown = argparse.Namespace(
+                run=str(run_dir),
+                item=[
+                    json.dumps(
+                        {
+                            "claim": "C2",
+                            "status": "verified",
+                            "evidence_kind": "test",
+                            "evidence": "test_c2 passes",
+                        }
+                    )
+                ],
+            )
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM, "freshness_status", return_value={"fresh": True}
+                ),
+                self.assertRaisesRegex(MM.ReviewError, "Unknown assurance claim"),
+            ):
+                MM.assure_batch_command(unknown)
+            with self.assertRaisesRegex(MM.ReviewError, "Invalid --item JSON"):
+                MM.assure_batch_command(
+                    argparse.Namespace(run=str(run_dir), item=["{"])
+                )
+            self.assertEqual(
+                before,
+                tuple(
+                    (run_dir / name).read_bytes()
+                    for name in ("assurance.json", "assurance.md")
+                ),
+            )
+
+    def test_assure_batch_rejects_stale_finalized_and_legacy_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for case in ("stale", "finalized", "legacy"):
+                with self.subTest(case=case):
+                    run_dir = root / case
+                    run_dir.mkdir()
+                    metadata = initialize_assurance_artifacts(
+                        run_dir, criteria=["C1=One"]
+                    )
+                    if case == "finalized":
+                        MM.safe_write_json(run_dir / "final.json", {})
+                    elif case == "legacy":
+                        metadata.pop("assurance_contract")
+                        MM.safe_write_json(run_dir / "metadata.json", metadata)
+                    before = tuple(
+                        (run_dir / name).read_bytes()
+                        for name in ("assurance.json", "assurance.md")
+                    )
+                    args = argparse.Namespace(
+                        run=str(run_dir),
+                        item=[
+                            json.dumps(
+                                {
+                                    "claim": "C1",
+                                    "status": "verified",
+                                    "evidence_kind": "test",
+                                    "evidence": "test_c1 passes",
+                                }
+                            )
+                        ],
+                    )
+                    expected = {
+                        "stale": "reviewed source changed",
+                        "finalized": "artifact is immutable",
+                        "legacy": "legacy run",
+                    }[case]
+                    freshness = {"fresh": case != "stale"}
+                    with (
+                        mock.patch.object(
+                            MM, "resolve_run_dir", return_value=run_dir
+                        ),
+                        mock.patch.object(
+                            MM, "freshness_status", return_value=freshness
+                        ),
+                        self.assertRaisesRegex(MM.ReviewError, expected),
+                    ):
+                        MM.assure_batch_command(args)
+                    self.assertEqual(
+                        before,
+                        tuple(
+                            (run_dir / name).read_bytes()
+                            for name in ("assurance.json", "assurance.md")
+                        ),
+                    )
+
+    def test_concurrent_assure_and_assure_batch_do_not_lose_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary).resolve()
+            initialize_assurance_artifacts(
+                run_dir, criteria=["C1=One", "C2=Two", "C3=Three"]
+            )
+            failures: list[Exception] = []
+
+            def record_single() -> None:
+                try:
+                    MM.assure_command(
+                        argparse.Namespace(
+                            run=str(run_dir),
+                            claim="C3",
+                            status="verified",
+                            evidence_kind="test",
+                            evidence="test_c3 passes",
+                            rationale=None,
+                        )
+                    )
+                except Exception as exc:  # pragma: no cover - assertion below
+                    failures.append(exc)
+
+            def record_batch() -> None:
+                try:
+                    MM.assure_batch_command(
+                        argparse.Namespace(
+                            run=str(run_dir),
+                            item=[
+                                json.dumps(
+                                    {
+                                        "claim": claim,
+                                        "status": "verified",
+                                        "evidence_kind": "test",
+                                        "evidence": f"test_{claim.lower()} passes",
+                                    }
+                                )
+                                for claim in ("C1", "C2")
+                            ],
+                        )
+                    )
+                except Exception as exc:  # pragma: no cover - assertion below
+                    failures.append(exc)
+
+            with (
+                mock.patch.object(MM, "resolve_run_dir", return_value=run_dir),
+                mock.patch.object(
+                    MM, "freshness_status", return_value={"fresh": True}
+                ),
+            ):
+                threads = [
+                    threading.Thread(target=record_single),
+                    threading.Thread(target=record_batch),
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+            self.assertEqual(failures, [])
+            saved = MM.read_json(run_dir / "assurance.json")
+            self.assertEqual(
+                {claim["id"]: claim["status"] for claim in saved["claims"]},
+                {"C1": "verified", "C2": "verified", "C3": "verified"},
+            )
+
+    def test_assure_batch_evaluation_distinguishes_all_gate_states(self) -> None:
+        contract = AM.build_contract(["C1=One", "C2=Two"], [])
+        base = AM.new_document(
+            run_id="run-one",
+            workflow_id="wf-one",
+            repository_id="repo-one",
+            source_fingerprint="source-one",
+            contract=contract,
+            reviewer_coverage={},
+            created_at=MM.utc_now(),
+        )
+        verified = {
+            "claim": "C1",
+            "status": "verified",
+            "evidence_kind": "test",
+            "evidence": "test_c1 passes",
+        }
+        deferred = {
+            "claim": "C2",
+            "status": "deferred",
+            "evidence_kind": "artifact",
+            "evidence": "artifact.json records the gap",
+            "rationale": "Deferred intentionally",
+        }
+        pass_with_findings = AM.record_batch(
+            base,
+            decisions=[verified, deferred],
+            source_fingerprint="source-one",
+            recorded_at=MM.utc_now(),
+        )
+        self.assertEqual(
+            AM.evaluate(
+                pass_with_findings,
+                contract=contract,
+                source_fingerprint="source-one",
+            )["status"],
+            "PASS_WITH_FINDINGS",
+        )
+        pass_clean = AM.record_batch(
+            base,
+            decisions=[
+                verified,
+                {
+                    "claim": "C2",
+                    "status": "verified",
+                    "evidence_kind": "test",
+                    "evidence": "test_c2 passes",
+                },
+            ],
+            source_fingerprint="source-one",
+            recorded_at=MM.utc_now(),
+        )
+        self.assertEqual(
+            AM.evaluate(
+                pass_clean,
+                contract=contract,
+                source_fingerprint="source-one",
+            )["status"],
+            "PASS_CLEAN",
+        )
+        self.assertEqual(
+            AM.evaluate(
+                base, contract=contract, source_fingerprint="source-one"
+            )["status"],
+            "BLOCK",
+        )
 
     def test_malformed_or_contradictory_criterion_coverage_fails_closed(self) -> None:
         report = structured_report(
@@ -9642,24 +10157,32 @@ class RunnerEndToEndTests(unittest.TestCase):
             )
             self.assertEqual(blocked.returncode, 2)
             self.assertIn("assurance blocks finalization", blocked.stderr)
-            for claim, kind, evidence in (
-                ("C1", "repository", "src/feature.py:1 sets VALUE to two"),
-                ("I1", "test", "complete dependency-free suite passes"),
-            ):
-                harness.cli(
-                    repo,
-                    "assure",
-                    "--run",
-                    str(confirmation_dir),
-                    "--claim",
-                    claim,
-                    "--status",
-                    "verified",
-                    "--evidence-kind",
-                    kind,
-                    "--evidence",
-                    evidence,
-                )
+            batch = harness.cli(
+                repo,
+                "assure-batch",
+                "--run",
+                str(confirmation_dir),
+                "--item",
+                json.dumps(
+                    {
+                        "claim": "C1",
+                        "status": "verified",
+                        "evidence_kind": "repository",
+                        "evidence": "src/feature.py:1 sets VALUE to two",
+                    }
+                ),
+                "--item",
+                json.dumps(
+                    {
+                        "claim": "I1",
+                        "status": "verified",
+                        "evidence_kind": "test",
+                        "evidence": "complete dependency-free suite passes",
+                    }
+                ),
+            )
+            self.assertIn("Recorded 2 assurance decisions", batch.stdout)
+            self.assertIn("gate=PASS_CLEAN", batch.stdout)
             harness.cli(
                 repo,
                 "finalize",
@@ -9677,6 +10200,14 @@ class RunnerEndToEndTests(unittest.TestCase):
             final = MM.read_json(confirmation_dir / "final.json")
             self.assertEqual(final["assurance"]["status"], "PASS_CLEAN")
             self.assertEqual(final["assurance"]["counts"]["verified"], 2)
+            self.assertEqual(
+                final["assurance"]["sha256"],
+                MM.sha256_text(
+                    (confirmation_dir / "assurance.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+            )
             feature.write_text("VALUE = 3\n", encoding="utf-8")
             stale = harness.cli(
                 repo,

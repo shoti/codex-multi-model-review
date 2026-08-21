@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -12,6 +13,14 @@ ASSURANCE_SCHEMA_VERSION = 1
 CLAIM_ID_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 CLAIM_STATUSES = {"verified", "deferred", "unverified"}
 EVIDENCE_KINDS = {"repository", "test", "artifact", "runtime"}
+ASSURANCE_DECISION_FIELDS = {
+    "claim",
+    "status",
+    "evidence_kind",
+    "evidence",
+    "rationale",
+}
+REQUIRED_ASSURANCE_DECISION_FIELDS = ASSURANCE_DECISION_FIELDS - {"rationale"}
 
 
 class AssuranceError(ValueError):
@@ -195,6 +204,79 @@ def record(
     target["rationale"] = (rationale or "").strip() or None
     document["updated_at"] = recorded_at
     return document
+
+
+def validate_decisions(decisions: Sequence[Any]) -> list[dict[str, Any]]:
+    """Validate and normalize one atomic assurance decision batch."""
+    if not decisions:
+        raise AssuranceError("Provide at least one assurance decision object.")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(decisions, start=1):
+        if not isinstance(raw, dict):
+            raise AssuranceError(f"Assurance item {index} must be a JSON object.")
+        missing = sorted(REQUIRED_ASSURANCE_DECISION_FIELDS - raw.keys())
+        if missing:
+            raise AssuranceError(
+                f"Assurance item {index} is missing required fields: "
+                + ", ".join(missing)
+            )
+        unexpected = sorted(raw.keys() - ASSURANCE_DECISION_FIELDS)
+        if unexpected:
+            raise AssuranceError(
+                f"Assurance item {index} has unexpected fields: "
+                + ", ".join(unexpected)
+            )
+        for field in REQUIRED_ASSURANCE_DECISION_FIELDS:
+            if not isinstance(raw.get(field), str):
+                raise AssuranceError(
+                    f"Assurance item {index} field {field} must be a string."
+                )
+        rationale = raw.get("rationale")
+        if rationale is not None and not isinstance(rationale, str):
+            raise AssuranceError(
+                f"Assurance item {index} field rationale must be a string or null."
+            )
+        claim_id = str(raw["claim"])
+        if claim_id in seen:
+            raise AssuranceError(
+                f"Duplicate assurance claim in one batch: {claim_id}"
+            )
+        seen.add(claim_id)
+        normalized.append(
+            {
+                "claim": claim_id,
+                "status": raw["status"],
+                "evidence_kind": raw["evidence_kind"],
+                "evidence": raw["evidence"],
+                "rationale": rationale,
+            }
+        )
+    return normalized
+
+
+def record_batch(
+    document: dict[str, Any],
+    *,
+    decisions: Sequence[Any],
+    source_fingerprint: str,
+    recorded_at: str,
+) -> dict[str, Any]:
+    """Apply a complete validated batch to a copy of an assurance document."""
+    normalized = validate_decisions(decisions)
+    candidate = copy.deepcopy(document)
+    for decision in normalized:
+        record(
+            candidate,
+            claim_id=decision["claim"],
+            status=decision["status"],
+            evidence_kind=decision["evidence_kind"],
+            evidence=decision["evidence"],
+            rationale=decision["rationale"],
+            source_fingerprint=source_fingerprint,
+            recorded_at=recorded_at,
+        )
+    return candidate
 
 
 def evaluate(

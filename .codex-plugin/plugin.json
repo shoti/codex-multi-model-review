@@ -1,6 +1,6 @@
 {
   "name": "multi-model-review",
-  "version": "0.1.0+codex.20260821084116",
+  "version": "0.1.0+codex.20260821091720",
   "description": "Run resumable task-scoped reviews with claim-to-evidence assurance, provider-allowance controls, mandatory confirmation, and fresh final gates.",
   "author": {
     "name": "Shoti",
